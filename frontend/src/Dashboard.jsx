@@ -1006,6 +1006,167 @@ function VolumeProfile({ data, dataByPeriod, currentPrice, period, setPeriod, po
   )
 }
 
+// ── Stochastic Oscillator Panel ───────────────────────────────────────
+function StochasticPanel({ stochastics, timeframe, setTimeframe }) {
+  const timeframes = ['1m', '5m', '15m', '1h', '4h']
+  const tfLabels = { '1m': '1min', '5m': '5min', '15m': '15min', '1h': '1 hora', '4h': '4 horas' }
+
+  const current = (stochastics || {})[timeframe] || {}
+  const slow = current.slow
+  const fast = current.fast
+
+  const zone = (k, d) => {
+    if (k == null || d == null) return { label: '—', color: '#4a5980', bgColor: 'transparent' }
+    if (k >= 80 && d >= 80) return { label: 'OVERBOUGHT', color: '#ef4444', bgColor: 'rgba(239, 68, 68, 0.08)' }
+    if (k <= 20 && d <= 20) return { label: 'OVERSOLD', color: '#22c55e', bgColor: 'rgba(34, 197, 94, 0.08)' }
+    if (k >= 70) return { label: 'CERCA OB', color: '#f59e0b', bgColor: 'rgba(245, 158, 11, 0.06)' }
+    if (k <= 30) return { label: 'CERCA OS', color: '#38bdf8', bgColor: 'rgba(56, 189, 248, 0.06)' }
+    return { label: 'NEUTRAL', color: '#6a7aa0', bgColor: 'transparent' }
+  }
+
+  const cross = (k, d, kPrev, dPrev) => {
+    if (k == null || d == null || kPrev == null || dPrev == null) return null
+    if (kPrev <= dPrev && k > d) return { dir: 'up', label: '▲ Cross alcista' }
+    if (kPrev >= dPrev && k < d) return { dir: 'down', label: '▼ Cross bajista' }
+    return null
+  }
+
+  const renderSpark = (kHist, dHist) => {
+    const W = 280, H = 80, PAD = 4
+    const hist = (kHist || []).filter(v => v != null)
+    const dhist = (dHist || []).filter(v => v != null)
+    if (hist.length < 2) {
+      return <div style={{ color: '#3a4a6a', fontSize: 10, textAlign: 'center', padding: 20 }}>Sin historia suficiente</div>
+    }
+    const n = Math.max(hist.length, dhist.length)
+    const xStep = (W - PAD * 2) / (n - 1)
+    const yScale = v => PAD + (H - PAD * 2) * (1 - v / 100)
+    const kPath = hist.map((v, i) => `${i === 0 ? 'M' : 'L'} ${(PAD + i * xStep).toFixed(1)} ${yScale(v).toFixed(1)}`).join(' ')
+    const dPath = dhist.map((v, i) => `${i === 0 ? 'M' : 'L'} ${(PAD + i * xStep).toFixed(1)} ${yScale(v).toFixed(1)}`).join(' ')
+    const y80 = yScale(80)
+    const y20 = yScale(20)
+    const y50 = yScale(50)
+    return (
+      <svg width="100%" height={H} viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
+        {/* OB zone */}
+        <rect x={PAD} y={PAD} width={W - PAD * 2} height={y80 - PAD} fill="rgba(239, 68, 68, 0.08)" />
+        {/* OS zone */}
+        <rect x={PAD} y={y20} width={W - PAD * 2} height={H - PAD - y20} fill="rgba(34, 197, 94, 0.08)" />
+        {/* grid lines */}
+        <line x1={PAD} y1={y80} x2={W - PAD} y2={y80} stroke="#ef4444" strokeWidth="0.5" strokeDasharray="2 3" opacity="0.5" />
+        <line x1={PAD} y1={y50} x2={W - PAD} y2={y50} stroke="#2a3550" strokeWidth="0.5" strokeDasharray="2 3" />
+        <line x1={PAD} y1={y20} x2={W - PAD} y2={y20} stroke="#22c55e" strokeWidth="0.5" strokeDasharray="2 3" opacity="0.5" />
+        {/* %D (orange/red) */}
+        <path d={dPath} stroke="#f59e0b" strokeWidth="1.2" fill="none" opacity="0.85" />
+        {/* %K (blue) */}
+        <path d={kPath} stroke="#38bdf8" strokeWidth="1.5" fill="none" />
+        {/* Labels */}
+        <text x={W - PAD - 2} y={y80 - 2} fontSize="8" fill="#ef4444" textAnchor="end" opacity="0.7">80</text>
+        <text x={W - PAD - 2} y={y20 + 9} fontSize="8" fill="#22c55e" textAnchor="end" opacity="0.7">20</text>
+      </svg>
+    )
+  }
+
+  const renderStoch = (st, label, sublabel) => {
+    if (!st || st.k == null || st.d == null) {
+      return (
+        <div style={{ flex: 1, background: '#0a1020', borderRadius: 6, padding: 12, border: '1px solid #1a2544' }}>
+          <div style={{ ...S.label, marginBottom: 4 }}>{label}</div>
+          <div style={{ fontSize: 10, color: '#4a5980', marginBottom: 8 }}>{sublabel}</div>
+          <div style={{ color: '#4a5980', fontSize: 11, padding: 20, textAlign: 'center' }}>Calculando...</div>
+        </div>
+      )
+    }
+    const z = zone(st.k, st.d)
+    // detect recent cross using last 2 history points
+    const kh = st.kHistory || []
+    const dh = st.dHistory || []
+    const kPrev = kh.length >= 2 ? kh[kh.length - 2] : null
+    const dPrev = dh.length >= 2 ? dh[dh.length - 2] : null
+    const cr = cross(st.k, st.d, kPrev, dPrev)
+
+    return (
+      <div style={{ flex: 1, background: z.bgColor || '#0a1020', borderRadius: 6, padding: 12, border: `1px solid ${z.color === '#6a7aa0' ? '#1a2544' : z.color}40` }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+          <div style={S.label}>{label}</div>
+          <div style={{ fontSize: 9, color: z.color, fontWeight: 700, background: '#0a1020', padding: '2px 6px', borderRadius: 3, letterSpacing: 0.5 }}>{z.label}</div>
+        </div>
+        <div style={{ fontSize: 10, color: '#4a5980', marginBottom: 8 }}>{sublabel}</div>
+        <div style={{ display: 'flex', gap: 16, marginBottom: 8 }}>
+          <div>
+            <div style={{ ...S.label, color: '#38bdf8' }}>%K</div>
+            <div style={{ ...S.mono, fontSize: 18, fontWeight: 700, color: z.color }}>{st.k.toFixed(1)}</div>
+          </div>
+          <div>
+            <div style={{ ...S.label, color: '#f59e0b' }}>%D</div>
+            <div style={{ ...S.mono, fontSize: 18, fontWeight: 700, color: '#f59e0b' }}>{st.d.toFixed(1)}</div>
+          </div>
+          {cr && (
+            <div style={{ alignSelf: 'flex-end' }}>
+              <div style={{ fontSize: 10, color: cr.dir === 'up' ? '#22c55e' : '#ef4444', fontWeight: 700 }}>{cr.label}</div>
+            </div>
+          )}
+        </div>
+        {renderSpark(st.kHistory, st.dHistory)}
+      </div>
+    )
+  }
+
+  // Combined read
+  let signal = null
+  if (slow && fast && slow.k != null && fast.k != null) {
+    const slowOB = slow.k >= 80 && slow.d >= 80
+    const slowOS = slow.k <= 20 && slow.d <= 20
+    const kh = fast.kHistory || []; const dh = fast.dHistory || []
+    const kPrev = kh.length >= 2 ? kh[kh.length - 2] : null
+    const dPrev = dh.length >= 2 ? dh[dh.length - 2] : null
+    const fastCrossUp = kPrev != null && dPrev != null && kPrev <= dPrev && fast.k > fast.d && fast.k < 30
+    const fastCrossDn = kPrev != null && dPrev != null && kPrev >= dPrev && fast.k < fast.d && fast.k > 70
+    if (slowOS && fastCrossUp) signal = { level: 'bullish', text: `Slow OS + Fast cross alcista en ${timeframe} — setup de rebote fuerte` }
+    else if (slowOB && fastCrossDn) signal = { level: 'bearish', text: `Slow OB + Fast cross bajista en ${timeframe} — setup de techo fuerte` }
+    else if (slowOS) signal = { level: 'bullish', text: `Slow Stoch ${timeframe} en OS — régimen sobrevendido, esperar confirmación fast` }
+    else if (slowOB) signal = { level: 'bearish', text: `Slow Stoch ${timeframe} en OB — régimen sobrecomprado, esperar confirmación fast` }
+    else if (fastCrossUp) signal = { level: 'caution', text: `Fast cross alcista en OS (${timeframe}) — rebote sin confirmación de régimen` }
+    else if (fastCrossDn) signal = { level: 'caution', text: `Fast cross bajista en OB (${timeframe}) — techo sin confirmación de régimen` }
+    else signal = { level: 'neutral', text: `Sin setup claro de estocásticos en ${timeframe}` }
+  }
+
+  return (
+    <div>
+      {/* Timeframe selector */}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 12, flexWrap: 'wrap', alignItems: 'center' }}>
+        <span style={{ ...S.label, marginRight: 6 }}>TF</span>
+        {timeframes.map(tf => (
+          <button key={tf} onClick={() => setTimeframe(tf)} style={{
+            padding: '3px 10px', borderRadius: 5, border: `1px solid ${timeframe === tf ? '#38bdf8' : '#1a2544'}`,
+            background: timeframe === tf ? '#081624' : 'transparent', color: timeframe === tf ? '#38bdf8' : '#4a5980',
+            cursor: 'pointer', fontSize: 10, fontFamily: "'IBM Plex Mono', monospace", fontWeight: timeframe === tf ? 700 : 400,
+          }}>{tf}</button>
+        ))}
+        <span style={{ ...S.mono, fontSize: 9, color: '#3a4a6a', marginLeft: 4 }}>
+          {tfLabels[timeframe]} — alimenta el score de la señal
+        </span>
+      </div>
+
+      {signal && (
+        <div style={{ marginBottom: 10 }}>
+          <Signal level={signal.level} text={signal.text} />
+        </div>
+      )}
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 10 }}>
+        {renderStoch(slow, 'SLOW STOCH', '400,40,10 — régimen de fondo')}
+        {renderStoch(fast, 'FAST STOCH', '100,10,4 — timing de entrada')}
+      </div>
+
+      <div style={{ marginTop: 10, fontSize: 10, color: '#4a5980', lineHeight: 1.6 }}>
+        <span style={{ color: '#38bdf8' }}>%K</span> (azul) cruzando <span style={{ color: '#f59e0b' }}>%D</span> (naranja) al alza en zona OS = señal de compra ·
+        Al revés en zona OB = señal de venta · Lectura combinada: slow define régimen, fast da el timing.
+      </div>
+    </div>
+  )
+}
+
 // ── Long/Short Ratio Panel (multi-period) ─────────────────────────────
 function LongShortPanel({ longShort, signal }) {
   const [period, setPeriod] = useState('1h')
@@ -1581,7 +1742,7 @@ function KeyLevelsPanel({ data }) {
 }
 
 // ── Signals Logic ────────────────────────────────────────────────────
-function computeSignals(data, period = '1h') {
+function computeSignals(data, period = '1h', stochTf = '1h') {
   if (!data) return { funding: null, oi: null, taker: null, divergence: null, marketState: null }
 
   const bn   = data.binance       || {}
@@ -1686,13 +1847,13 @@ function computeSignals(data, period = '1h') {
   //   swing (12h,1d): funding=ALTO, OI=ALTO, taker=MEDIO, L/S=ALTO, opciones=ALTO, ethbtc=MEDIO, VP=ALTO
   //   macro (15d):    funding=ALTO, OI=ALTO, taker=BAJO, opciones=ALTO, ethbtc=ALTO, ivrv=ALTO, VP=ALTO
   const W = {
-    '5m':  { funding: 0, oi: 0, oiPrice: 0, taker: 2, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 0, vp: 1 },
-    '15m': { funding: 0, oi: 0, oiPrice: 0, taker: 2, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 0, vp: 1 },
-    '1h':  { funding: 1, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 1, vp: 1 },
-    '4h':  { funding: 1, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 0, ethBtc: 1, gamma: 1, vp: 1 },
-    '12h': { funding: 2, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 1, ethBtc: 1, gamma: 1, vp: 1 },
-    '1d':  { funding: 2, oi: 2, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 1, ethBtc: 1, gamma: 2, vp: 1 },
-    '15d': { funding: 2, oi: 2, oiPrice: 1, taker: 0, ls: 1, vol: 1, ivRv: 2, ethBtc: 2, gamma: 2, vp: 1 },
+    '5m':  { funding: 0, oi: 0, oiPrice: 0, taker: 2, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 0, vp: 1, stoch: 1 },
+    '15m': { funding: 0, oi: 0, oiPrice: 0, taker: 2, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 0, vp: 1, stoch: 1 },
+    '1h':  { funding: 1, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 1, vp: 1, stoch: 1 },
+    '4h':  { funding: 1, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 0, ethBtc: 1, gamma: 1, vp: 1, stoch: 2 },
+    '12h': { funding: 2, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 1, ethBtc: 1, gamma: 1, vp: 1, stoch: 2 },
+    '1d':  { funding: 2, oi: 2, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 1, ethBtc: 1, gamma: 2, vp: 1, stoch: 2 },
+    '15d': { funding: 2, oi: 2, oiPrice: 1, taker: 0, ls: 1, vol: 1, ivRv: 2, ethBtc: 2, gamma: 2, vp: 1, stoch: 2 },
   }
   const w = W[period] || W['1h']
 
@@ -1829,6 +1990,45 @@ function computeSignals(data, period = '1h') {
     }
   }
 
+  // ── 10. Stochastics (peso: w.stoch, TF elegido por usuario) ──
+  // Slow stoch (400,40,10) = sesgo de régimen; Fast stoch (100,10,4) = timing
+  // OB (>80) = agotamiento alcista → bearish bias
+  // OS (<20) = agotamiento bajista → bullish bias
+  // Cross %K sobre %D en zona extrema = confirmación de vuelta
+  const stochByTf = data.stochastics || {}
+  const stochCurrent = stochByTf[stochTf] || null
+  if (stochCurrent && w.stoch > 0) {
+    const slow = stochCurrent.slow
+    const fast = stochCurrent.fast
+    // Slow stoch = régimen
+    if (slow && slow.k != null && slow.d != null) {
+      if (slow.k >= 80 && slow.d >= 80) {
+        states.push(`Slow Stoch ${stochTf} OB (${slow.k.toFixed(0)}/${slow.d.toFixed(0)}) (×${w.stoch})`)
+        score -= w.stoch
+      } else if (slow.k <= 20 && slow.d <= 20) {
+        states.push(`Slow Stoch ${stochTf} OS (${slow.k.toFixed(0)}/${slow.d.toFixed(0)}) (×${w.stoch})`)
+        score += w.stoch
+      } else if (slow.k >= 70) {
+        states.push(`Slow Stoch ${stochTf} cerca OB (${slow.k.toFixed(0)})`)
+      } else if (slow.k <= 30) {
+        states.push(`Slow Stoch ${stochTf} cerca OS (${slow.k.toFixed(0)})`)
+      }
+    }
+    // Fast stoch = timing confirmation
+    if (fast && fast.k != null && fast.d != null && slow && slow.k != null) {
+      // Bullish cross in OS zone = timing de rebote
+      if (fast.k > fast.d && fast.k < 30 && slow.k < 40) {
+        states.push(`Fast Stoch cruzando al alza en OS — timing rebote (×${Math.ceil(w.stoch / 2)})`)
+        score += Math.ceil(w.stoch / 2)
+      }
+      // Bearish cross in OB zone = timing de techo
+      else if (fast.k < fast.d && fast.k > 70 && slow.k > 60) {
+        states.push(`Fast Stoch cruzando a la baja en OB — timing techo (×${Math.ceil(w.stoch / 2)})`)
+        score -= Math.ceil(w.stoch / 2)
+      }
+    }
+  }
+
   // ── Conclusión ──
   const volFavorable    = volPct != null && volPct <= 30
   const volDesfavorable = volPct != null && volPct >= 75
@@ -1913,7 +2113,8 @@ function computeSignals(data, period = '1h') {
 export default function Dashboard({ data, depth, depthHistory, error, lastUpdate }) {
   const [statePeriod, setStatePeriod] = useState('1h')
   const [vpPeriod, setVpPeriod] = useState('8d')
-  const signals = useMemo(() => computeSignals(data, statePeriod), [data, statePeriod])
+  const [stochTf, setStochTf] = useState('1h')
+  const signals = useMemo(() => computeSignals(data, statePeriod, stochTf), [data, statePeriod, stochTf])
   const bn = data?.binance || {}
   const okx = data?.okx || {}
   const bybit = data?.bybit || {}
@@ -2077,6 +2278,12 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
           </div>
         )
       })()}
+
+      {/* STOCHASTICS */}
+      <div style={{ ...S.card, marginBottom: 10 }}>
+        <div style={S.sectionTitle}>Osciladores Estocásticos · Slow (400,40,10) + Fast (100,10,4)</div>
+        <StochasticPanel stochastics={data?.stochastics} timeframe={stochTf} setTimeframe={setStochTf} />
+      </div>
 
       {/* GRID — 4 cards */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(270px, 1fr))', gap: 10 }}>

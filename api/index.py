@@ -217,6 +217,67 @@ def calculate_volume_profile(klines: list, cluster_size: float = 5.0) -> dict:
     }
 
 
+def stochastic(klines: list, k_period: int, k_smooth: int, d_smooth: int, history_len: int = 60) -> Optional[dict]:
+    """Stochastic oscillator with K smoothing. Returns {k, d, kHistory, dHistory} or None."""
+    required = k_period + k_smooth + d_smooth - 2
+    if not klines or len(klines) < required:
+        return None
+    try:
+        highs = [float(k[2]) for k in klines]
+        lows = [float(k[3]) for k in klines]
+        closes = [float(k[4]) for k in klines]
+    except (IndexError, ValueError, TypeError):
+        return None
+    n = len(closes)
+    raw_k = [None] * n
+    for i in range(k_period - 1, n):
+        window_h = max(highs[i - k_period + 1: i + 1])
+        window_l = min(lows[i - k_period + 1: i + 1])
+        rng = window_h - window_l
+        raw_k[i] = 50.0 if rng == 0 else (closes[i] - window_l) / rng * 100
+    smooth_k = [None] * n
+    for i in range(n):
+        start = i - k_smooth + 1
+        if start < 0:
+            continue
+        window = raw_k[start:i + 1]
+        if any(v is None for v in window):
+            continue
+        smooth_k[i] = sum(window) / k_smooth
+    d_vals = [None] * n
+    for i in range(n):
+        start = i - d_smooth + 1
+        if start < 0:
+            continue
+        window = smooth_k[start:i + 1]
+        if any(v is None for v in window):
+            continue
+        d_vals[i] = sum(window) / d_smooth
+    k_hist = [round(v, 2) if v is not None else None for v in smooth_k[-history_len:]]
+    d_hist = [round(v, 2) if v is not None else None for v in d_vals[-history_len:]]
+    latest_k = smooth_k[-1]
+    latest_d = d_vals[-1]
+    return {
+        "k": round(latest_k, 2) if latest_k is not None else None,
+        "d": round(latest_d, 2) if latest_d is not None else None,
+        "kHistory": k_hist,
+        "dHistory": d_hist,
+    }
+
+
+def compute_stochastics_multi(klines_by_tf: dict) -> dict:
+    """Compute both slow (400,40,10) and fast (100,10,4) stochastics for each timeframe."""
+    out = {}
+    for tf, klines in klines_by_tf.items():
+        if not klines:
+            continue
+        slow = stochastic(klines, 400, 40, 10)
+        fast = stochastic(klines, 100, 10, 4)
+        if slow or fast:
+            out[tf] = {"slow": slow, "fast": fast}
+    return out
+
+
 def bs_gamma(S: float, K: float, T: float, sigma: float, r: float = 0.0) -> float:
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
@@ -653,6 +714,14 @@ async def fetch_all_data() -> dict:
                        {"symbol": "ETHBTC"}),
             fetch_json(client, f"{BYBIT_API}/v5/market/open-interest",
                        {"category": "linear", "symbol": "ETHUSDT", "intervalTime": "1h", "limit": 1}),
+            fetch_json(client, f"{BINANCE_FAPI}/fapi/v1/klines",
+                       {"symbol": "ETHUSDT", "interval": "1m", "limit": 500}),
+            fetch_json(client, f"{BINANCE_FAPI}/fapi/v1/klines",
+                       {"symbol": "ETHUSDT", "interval": "15m", "limit": 500}),
+            fetch_json(client, f"{BINANCE_FAPI}/fapi/v1/klines",
+                       {"symbol": "ETHUSDT", "interval": "4h", "limit": 500}),
+            fetch_json(client, f"{BINANCE_FAPI}/fapi/v1/klines",
+                       {"symbol": "ETHUSDT", "interval": "5m", "limit": 500}),
             return_exceptions=True,
         )
 
@@ -672,6 +741,7 @@ async def fetch_all_data() -> dict:
         bn_spot_ticker, bybit_perp_ticker, okx_perp_ticker,
         bybit_funding_hist_raw, hyperliquid_raw,
         ethbtc_ticker, bybit_oi_raw,
+        kl_1m, kl_15m, kl_4h_stoch, kl_5m_stoch,
     ) = results
 
     def safe_float(obj, key, default=None):
@@ -1051,6 +1121,14 @@ async def fetch_all_data() -> dict:
     hl_oi_val = hl_oi or 0
     total_oi_usd = bn_oi_val + okx_oi_val + bybit_oi_val + hl_oi_val
 
+    stochastics_data = compute_stochastics_multi({
+        "1m":  kl_1m if isinstance(kl_1m, list) else [],
+        "5m":  kl_5m_stoch if isinstance(kl_5m_stoch, list) else [],
+        "15m": kl_15m if isinstance(kl_15m, list) else [],
+        "1h":  bn_klines_vol if isinstance(bn_klines_vol, list) else [],
+        "4h":  kl_4h_stoch if isinstance(kl_4h_stoch, list) else [],
+    })
+
     liq_map = estimate_liquidation_map(
         total_oi_usd, spot or 0,
         funding_rate=bn_fund_rate or 0
@@ -1163,6 +1241,7 @@ async def fetch_all_data() -> dict:
         "ivRvSpread": iv_rv_spread,
         "ivTermStructure": iv_term_structure,
         "liquidationMap": liq_map_data,
+        "stochastics": stochastics_data,
     }
 
     cache = data
