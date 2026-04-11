@@ -1010,7 +1010,8 @@ function VolumeProfile({ data, dataByPeriod, currentPrice, period, setPeriod, po
 function MoneyQualityPanel({ moneyQuality }) {
   const mq = moneyQuality || {}
   const byWindow = mq.byWindow || {}
-  const windows = ['1h', '4h', '12h', '24h']
+  // 4 intraday windows + 3 multi-day windows (horizons for slow stochs on higher TFs)
+  const windows = ['1h', '4h', '12h', '24h', '3d', '7d', '14d']
   const verdict = mq.verdict || '—'
   const score = mq.score
   const fundingCtx = mq.fundingContext
@@ -1060,7 +1061,11 @@ function MoneyQualityPanel({ moneyQuality }) {
         )}
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6 }}>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))',
+        gap: 6,
+      }}>
         {windows.map(w => {
           const info = byWindow[w]
           if (!info) {
@@ -1134,17 +1139,104 @@ function MoneyQualityPanel({ moneyQuality }) {
 }
 
 // ── Setup Detector (stoch alignment + threshold breach + MQ filter) ────
-// Map each stoch TF to its most relevant MQ window
-const STOCH_TO_MQ_WINDOW = { '1m': '1h', '5m': '1h', '15m': '1h', '1h': '4h', '4h': '12h' }
+// Map each stoch TF to TWO MQ windows:
+//   fast = horizon del Fast stoch (100 × TF_duration)
+//   slow = horizon del Slow stoch (400 × TF_duration)
+// The fast window tells us about recent capital pressure on the entry; the
+// slow window tells us if the range (lookback) was built on stable capital.
+// Ambos filtros se combinan en analyzeSetup para producir la calidad final.
+const STOCH_TO_MQ_WINDOWS = {
+  // TF → { fast: window-for-fast-horizon, slow: window-for-slow-horizon }
+  // 1m:  fast≈100min≈1.7h, slow≈400min≈6.7h   → fast=1h, slow=12h
+  '1m':  { fast: '1h',  slow: '12h' },
+  // 5m:  fast≈8h,         slow≈33h             → fast=12h, slow=24h
+  '5m':  { fast: '12h', slow: '24h' },
+  // 15m: fast≈25h,        slow≈100h≈4d         → fast=24h, slow='3d'
+  '15m': { fast: '24h', slow: '3d'  },
+  // 1h:  fast≈100h≈4d,    slow≈400h≈17d        → fast=3d,  slow=14d
+  '1h':  { fast: '3d',  slow: '14d' },
+  // 4h:  fast≈400h≈17d,   slow≈1600h≈67d       → fast=14d (clamp), slow=14d
+  '4h':  { fast: '14d', slow: '14d' },
+}
+// Legacy single-window map kept for any stale references / fallbacks
+const STOCH_TO_MQ_WINDOW = {
+  '1m': '1h', '5m': '12h', '15m': '24h', '1h': '3d', '4h': '14d'
+}
+
+/**
+ * Grade a single MQ window against a setup direction.
+ *  - direction: 'short' | 'long'
+ *  - mqInfo:    the MQ window info ({ ratio, direction, label, quality })
+ * Returns:
+ *  { verdict, note, tier }
+ *    verdict: 'BLOCK' | 'NEUTRAL' | 'UPGRADE'
+ *    tier:    -1 (block) | 0 (neutral) | +1 (covering) | +2 (squeeze)
+ */
+function gradeMqForDirection(direction, mqInfo) {
+  if (!mqInfo) return { verdict: 'NEUTRAL', note: null, tier: 0 }
+  const r = mqInfo.ratio
+  const mqDir = mqInfo.direction
+  if (r == null) return { verdict: 'NEUTRAL', note: 'Sin ratio', tier: 0 }
+
+  // BLOCK: ratio <1 en misma dirección del movimiento = tendencia real confirmada
+  if (direction === 'short' && r < 1 && mqDir === 'bullish') {
+    return {
+      verdict: 'BLOCK',
+      note: `Acumulación real (r ${r.toFixed(2)}) — alcista real`,
+      tier: -1,
+    }
+  }
+  if (direction === 'long' && r < 1 && mqDir === 'bearish') {
+    return {
+      verdict: 'BLOCK',
+      note: `Distribución real (r ${r.toFixed(2)}) — bajista real`,
+      tier: -1,
+    }
+  }
+  // UPGRADE: ratio ≥2 contrario = covering/liquidation = rally/drop débil
+  if (direction === 'short' && r >= 2 && mqDir === 'bullish') {
+    const tier = r >= 5 ? 2 : 1
+    return {
+      verdict: 'UPGRADE',
+      note: r >= 5
+        ? `Squeeze puro (r ${r.toFixed(2)})`
+        : `Covering dominante (r ${r.toFixed(2)})`,
+      tier,
+    }
+  }
+  if (direction === 'long' && r >= 2 && mqDir === 'bearish') {
+    const tier = r >= 5 ? 2 : 1
+    return {
+      verdict: 'UPGRADE',
+      note: r >= 5
+        ? `Long squeeze puro (r ${r.toFixed(2)})`
+        : `Liquidation dominante (r ${r.toFixed(2)})`,
+      tier,
+    }
+  }
+  // Balanceado
+  if (r >= 1 && r < 2) {
+    return {
+      verdict: 'NEUTRAL',
+      note: `Balanceado (r ${r.toFixed(2)})`,
+      tier: 0,
+    }
+  }
+  return { verdict: 'NEUTRAL', note: `r ${r.toFixed(2)}`, tier: 0 }
+}
 
 /**
  * Analyze stochastic setup per TF according to user's strategy:
  *  - Slow %K + %D both in same extreme zone (OB ≥80 or OS ≤20)
  *  - Fast %K + %D both in same zone (persistence ≥2 bars)
  *  - Trigger: Fast %K crosses the threshold (exits the zone)
- *  - Filter: MQ must not be in "real accumulation/distribution" same side
+ *  - Filter: DUAL MQ (fast horizon + slow horizon) combined
+ *      * Any BLOCK → BLOCKED
+ *      * Both UPGRADE ≥1 → A++ (cuanto mayor tier, mejor)
+ *      * One UPGRADE → A+
+ *      * Both NEUTRAL → A
  */
-function analyzeSetup(stochData, mqInfo) {
+function analyzeSetup(stochData, mqFastInfo, mqSlowInfo) {
   if (!stochData || !stochData.slow || !stochData.fast) return null
   const slow = stochData.slow
   const fast = stochData.fast
@@ -1180,23 +1272,19 @@ function analyzeSetup(stochData, mqInfo) {
   // SHORT setup: slow OB + fast OB (armed) + possible trigger
   if (slowOB && fastOB) {
     direction = 'short'
-    // still fully inside zone, waiting for cross
     state = 'ARMED'
     if (justCrossedDown80) { state = 'TRIGGERED'; trigger = 'standard' }
     else if (justCrossedDown75) { state = 'TRIGGERED'; trigger = 'strict' }
   }
-  // Fast just left OB but slow still OB (trigger moment even if fast<80 now)
   else if (slowOB && persistOB && kPrev >= 80 && kNow < 80) {
     direction = 'short'
     state = 'TRIGGERED'
     trigger = kNow < 75 ? 'strict' : 'standard'
   }
-  // Fast already well below 80 — late entry
   else if ((slowOB || slowCerca80) && kPrev != null && kPrev < 80 && kNow < 70 && persistOB) {
     direction = 'short'
     state = 'LATE'
   }
-  // LONG setup: slow OS + fast OS
   else if (slowOS && fastOS) {
     direction = 'long'
     state = 'ARMED'
@@ -1213,38 +1301,40 @@ function analyzeSetup(stochData, mqInfo) {
     state = 'LATE'
   }
 
-  // ── Apply MQ filter ──────────────────────────────────────────────
-  let quality = null       // 'A' | 'A+' | 'A++' | 'BLOCKED' | null
+  // ── Dual MQ filter ──────────────────────────────────────────────
+  let quality = null          // 'A' | 'A+' | 'A++' | 'BLOCKED' | null
   let blockedReason = null
   let qualityNote = null
+  let mqFastGrade = null
+  let mqSlowGrade = null
 
   if (direction && (state === 'ARMED' || state === 'TRIGGERED')) {
-    quality = 'A'  // default if no MQ info or neutral
-    if (mqInfo) {
-      const r = mqInfo.ratio
-      const mqDir = mqInfo.direction
-      // Tesis: ratio <1 en dirección del precio = tendencia confirmada = NO OPERAR reversión
-      if (direction === 'short' && r != null && r < 1 && mqDir === 'bullish') {
-        quality = 'BLOCKED'
-        blockedReason = `Acumulación real (ratio ${r.toFixed(2)}) — tendencia alcista confirmada`
-      } else if (direction === 'long' && r != null && r < 1 && mqDir === 'bearish') {
-        quality = 'BLOCKED'
-        blockedReason = `Distribución real (ratio ${r.toFixed(2)}) — tendencia bajista confirmada`
+    mqFastGrade = gradeMqForDirection(direction, mqFastInfo)
+    mqSlowGrade = gradeMqForDirection(direction, mqSlowInfo)
+
+    const fV = mqFastGrade.verdict
+    const sV = mqSlowGrade.verdict
+
+    if (fV === 'BLOCK' || sV === 'BLOCK') {
+      quality = 'BLOCKED'
+      const blocks = []
+      if (fV === 'BLOCK') blocks.push(`fast: ${mqFastGrade.note}`)
+      if (sV === 'BLOCK') blocks.push(`slow: ${mqSlowGrade.note}`)
+      blockedReason = blocks.join(' · ')
+    } else {
+      const upCount = (fV === 'UPGRADE' ? 1 : 0) + (sV === 'UPGRADE' ? 1 : 0)
+      const tierSum = (mqFastGrade.tier || 0) + (mqSlowGrade.tier || 0)
+      if (upCount === 2 || tierSum >= 3) {
+        quality = 'A++'
+      } else if (upCount === 1) {
+        quality = 'A+'
+      } else {
+        quality = 'A'
       }
-      // Upgrade: ratio >2 contrario = covering/liquidation dominante = reversión más confiable
-      else if (direction === 'short' && r != null && r >= 2 && mqDir === 'bullish') {
-        quality = r >= 5 ? 'A++' : 'A+'
-        qualityNote = r >= 5
-          ? `Squeeze puro (ratio ${r.toFixed(2)}) — rally sin combustible`
-          : `Covering dominante (ratio ${r.toFixed(2)}) — rally débil`
-      } else if (direction === 'long' && r != null && r >= 2 && mqDir === 'bearish') {
-        quality = r >= 5 ? 'A++' : 'A+'
-        qualityNote = r >= 5
-          ? `Long squeeze puro (ratio ${r.toFixed(2)}) — caída sin combustible`
-          : `Liquidation dominante (ratio ${r.toFixed(2)}) — caída débil`
-      } else if (r != null && r >= 1 && r < 2) {
-        qualityNote = `Balanceado (ratio ${r.toFixed(2)}) — setup estándar`
-      }
+      const notes = []
+      if (mqFastGrade.note) notes.push(`fast: ${mqFastGrade.note}`)
+      if (mqSlowGrade.note) notes.push(`slow: ${mqSlowGrade.note}`)
+      qualityNote = notes.join(' · ')
     }
   }
 
@@ -1257,10 +1347,23 @@ function analyzeSetup(stochData, mqInfo) {
     fastKPrev: kPrev,
     slowOB, slowOS, fastOB, fastOS,
     persistOB, persistOS,
-    mqRatio: mqInfo?.ratio ?? null,
-    mqLabel: mqInfo?.label ?? null,
-    mqDirection: mqInfo?.direction ?? null,
-    mqQuality: mqInfo?.quality ?? null,
+    // Dual MQ exposed for UI readout
+    mqFast: mqFastInfo ? {
+      ratio: mqFastInfo.ratio ?? null,
+      label: mqFastInfo.label ?? null,
+      direction: mqFastInfo.direction ?? null,
+      quality: mqFastInfo.quality ?? null,
+      verdict: mqFastGrade?.verdict ?? null,
+      note: mqFastGrade?.note ?? null,
+    } : null,
+    mqSlow: mqSlowInfo ? {
+      ratio: mqSlowInfo.ratio ?? null,
+      label: mqSlowInfo.label ?? null,
+      direction: mqSlowInfo.direction ?? null,
+      quality: mqSlowInfo.quality ?? null,
+      verdict: mqSlowGrade?.verdict ?? null,
+      note: mqSlowGrade?.note ?? null,
+    } : null,
     blockedReason,
     qualityNote,
   }
@@ -1270,15 +1373,17 @@ function SetupPanel({ stochastics, moneyQuality, stochTf, setStochTf }) {
   const timeframes = ['1m', '5m', '15m', '1h', '4h']
   const mqByWindow = (moneyQuality || {}).byWindow || {}
 
-  // Analyze all TFs
+  // Analyze all TFs with DUAL MQ filter (fast horizon + slow horizon)
   const analysisByTf = {}
   timeframes.forEach(tf => {
-    const mqKey = STOCH_TO_MQ_WINDOW[tf] || '4h'
-    const mqInfo = mqByWindow[mqKey]
-    analysisByTf[tf] = analyzeSetup((stochastics || {})[tf], mqInfo)
+    const windows = STOCH_TO_MQ_WINDOWS[tf] || { fast: '4h', slow: '24h' }
+    const mqFast = mqByWindow[windows.fast]
+    const mqSlow = mqByWindow[windows.slow]
+    analysisByTf[tf] = analyzeSetup((stochastics || {})[tf], mqFast, mqSlow)
   })
 
   const current = analysisByTf[stochTf]
+  const currentWindows = STOCH_TO_MQ_WINDOWS[stochTf] || { fast: '4h', slow: '24h' }
 
   const stateLabel = {
     'INACTIVE':  'Sin setup',
@@ -1444,23 +1549,66 @@ function SetupPanel({ stochastics, moneyQuality, stochTf, setStochTf }) {
             </div>
           </div>
 
-          {/* MQ filter row */}
-          {current.mqLabel && (
-            <div style={{
-              padding: '6px 10px',
-              background: current.quality === 'BLOCKED' ? 'rgba(239,68,68,0.08)' : '#0a1020',
-              borderRadius: 5,
-              borderLeft: `3px solid ${current.quality === 'BLOCKED' ? '#ef4444' : current.quality === 'A+' || current.quality === 'A++' ? '#22c55e' : '#8a9ac0'}`,
-              marginBottom: 10,
-            }}>
-              <div style={{ fontSize: 9, color: '#5a6a8a', marginBottom: 2 }}>
-                FILTRO MQ ({STOCH_TO_MQ_WINDOW[stochTf] || '4h'})
+          {/* DUAL MQ filter row — fast horizon + slow horizon */}
+          {(current.mqFast || current.mqSlow) && (
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ fontSize: 9, color: '#5a6a8a', marginBottom: 4, letterSpacing: 0.4 }}>
+                FILTRO MQ DUAL · fast={currentWindows.fast} (horizonte stoch 100) · slow={currentWindows.slow} (horizonte stoch 400)
               </div>
-              <div style={{ fontSize: 11, color: '#e2e8f0', ...S.mono }}>
-                {current.mqLabel} · ratio {current.mqRatio != null ? current.mqRatio.toFixed(2) : '—'}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                {[
+                  { key: 'fast', label: 'FAST MQ', info: current.mqFast, window: currentWindows.fast },
+                  { key: 'slow', label: 'SLOW MQ', info: current.mqSlow, window: currentWindows.slow },
+                ].map(({ key, label, info, window }) => {
+                  if (!info) {
+                    return (
+                      <div key={key} style={{
+                        padding: '6px 10px', background: '#0a1020', borderRadius: 5,
+                        borderLeft: '3px solid #1a2544',
+                      }}>
+                        <div style={{ fontSize: 9, color: '#4a5980' }}>{label} · {window}</div>
+                        <div style={{ fontSize: 10, color: '#4a5980', ...S.mono }}>sin datos</div>
+                      </div>
+                    )
+                  }
+                  const verdictColor = info.verdict === 'BLOCK' ? '#ef4444'
+                                    : info.verdict === 'UPGRADE' ? '#22c55e'
+                                    : '#8a9ac0'
+                  const bgColor = info.verdict === 'BLOCK' ? 'rgba(239,68,68,0.08)'
+                                : info.verdict === 'UPGRADE' ? 'rgba(34,197,94,0.06)'
+                                : '#0a1020'
+                  const tag = info.verdict === 'BLOCK' ? '✗ BLOQUEA'
+                            : info.verdict === 'UPGRADE' ? '✓ UPGRADE'
+                            : '◦ NEUTRAL'
+                  return (
+                    <div key={key} style={{
+                      padding: '6px 10px', background: bgColor, borderRadius: 5,
+                      borderLeft: `3px solid ${verdictColor}`,
+                    }}>
+                      <div style={{
+                        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                        fontSize: 9, color: '#5a6a8a', marginBottom: 2,
+                      }}>
+                        <span>{label} · {window}</span>
+                        <span style={{ color: verdictColor, fontWeight: 700, letterSpacing: 0.4 }}>{tag}</span>
+                      </div>
+                      <div style={{ fontSize: 10, color: '#e2e8f0', ...S.mono }}>
+                        {info.label || '—'}
+                      </div>
+                      <div style={{ fontSize: 9, color: '#6a7aa0', ...S.mono, marginTop: 1 }}>
+                        ratio {info.ratio != null ? info.ratio.toFixed(2) : '—'}
+                        {info.direction && info.direction !== 'neutral' ? ` · ${info.direction}` : ''}
+                      </div>
+                    </div>
+                  )
+                })}
               </div>
               {(current.qualityNote || current.blockedReason) && (
-                <div style={{ fontSize: 9, color: current.quality === 'BLOCKED' ? '#fca5a5' : '#86efac', marginTop: 3 }}>
+                <div style={{
+                  fontSize: 9,
+                  color: current.quality === 'BLOCKED' ? '#fca5a5' : '#86efac',
+                  marginTop: 4, paddingLeft: 4,
+                }}>
                   → {current.blockedReason || current.qualityNote}
                 </div>
               )}
@@ -1496,7 +1644,7 @@ function SetupPanel({ stochastics, moneyQuality, stochTf, setStochTf }) {
       )}
 
       <div style={{ padding: '6px 8px', background: '#0a1020', borderRadius: 5, fontSize: 9, color: '#5a6a8a', lineHeight: 1.5 }}>
-        <b style={{ color: '#8a9ac0' }}>Regla</b>: Slow (400,40,10) y Fast (100,10,4) ambos en mismo extremo (OB≥80 / OS≤20). <b>Trigger</b>: Fast %K cruza el umbral (sale de la zona). <b>Filtro MQ</b>: si ratio &lt;1 en la misma dirección del precio = NO operar (tendencia confirmada por plata nueva).
+        <b style={{ color: '#8a9ac0' }}>Regla</b>: Slow (400,40,10) y Fast (100,10,4) ambos en mismo extremo (OB≥80 / OS≤20). <b>Trigger</b>: Fast %K cruza el umbral (sale de la zona). <b>Filtro MQ dual</b>: FAST (100 × TF) + SLOW (400 × TF). Si alguno marca <i>acumulación/distribución real</i> (ratio &lt;1 en dirección del precio) → BLOQUEADO. Si los dos marcan <i>covering/squeeze</i> (ratio ≥2 contrario) → A++. Si uno solo → A+. Ambos neutros → A.
       </div>
     </div>
   )
@@ -2528,8 +2676,8 @@ function computeSignals(data, period = '1h', stochTf = '1h') {
   // ── 11. Money Quality: plata nueva vs short covering (peso: w.mq) ──
   const mq = data.moneyQuality || {}
   const mqByWindow = mq.byWindow || {}
-  // Map period to the most relevant MQ window
-  const mqPeriodMap = { '5m': '1h', '15m': '1h', '1h': '4h', '4h': '4h', '12h': '12h', '1d': '24h', '15d': '24h' }
+  // Map period to the most relevant MQ window (now supports multi-day windows)
+  const mqPeriodMap = { '5m': '1h', '15m': '4h', '1h': '12h', '4h': '24h', '12h': '3d', '1d': '7d', '15d': '14d' }
   const mqKey = mqPeriodMap[period] || '4h'
   const mqInfo = mqByWindow[mqKey]
   if (mqInfo && w.mq > 0) {
@@ -2562,13 +2710,15 @@ function computeSignals(data, period = '1h', stochTf = '1h') {
     }
   }
 
-  // ── 12. SETUP DETECTOR: stoch alignment + MQ regime filter (peso: w.setup) ──
-  // Implements user's strategy: slow+fast aligned in extreme + fast %K cross
-  // filtered by MQ (covering = valid reversion, accumulation = trend → blocked)
+  // ── 12. SETUP DETECTOR: stoch alignment + DUAL MQ regime filter (peso: w.setup) ──
+  // Stoch alineado en extremo + fast %K cruza umbral.
+  // Filtrado por DOS ventanas MQ: fast horizon (100 × TF) + slow horizon (400 × TF).
+  //   Any BLOCK → BLOCKED.  Both UPGRADE → A++.  One UPGRADE → A+.  Both neutral → A.
   if (w.setup > 0 && data.stochastics) {
-    const mqWindowForStoch = STOCH_TO_MQ_WINDOW[stochTf] || '4h'
-    const mqForSetup = mqByWindow[mqWindowForStoch]
-    const setupAnalysis = analyzeSetup(data.stochastics[stochTf], mqForSetup)
+    const windows = STOCH_TO_MQ_WINDOWS[stochTf] || { fast: '4h', slow: '24h' }
+    const mqFastForSetup = mqByWindow[windows.fast]
+    const mqSlowForSetup = mqByWindow[windows.slow]
+    const setupAnalysis = analyzeSetup(data.stochastics[stochTf], mqFastForSetup, mqSlowForSetup)
     if (setupAnalysis && setupAnalysis.direction && setupAnalysis.state !== 'INACTIVE') {
       const qMult = {
         'A++':     1.5,

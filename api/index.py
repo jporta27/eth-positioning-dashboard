@@ -368,14 +368,42 @@ def estimate_liquidation_map(oi_value: float, spot_price: float, funding_rate: f
     return clusters
 
 
-def compute_money_quality(oi_hist: list, perp_flow: dict, funding_rate: Optional[float] = None) -> dict:
-    """Classify movement quality: new money vs short covering via OI/Price ratio."""
+def compute_money_quality(
+    oi_hist: list,
+    perp_flow: dict,
+    funding_rate: Optional[float] = None,
+    klines_1h: Optional[list] = None,
+) -> dict:
+    """Classify movement quality: new money vs short covering via OI/Price ratio.
+    Intraday windows use perp_flow; multi-day windows source price from klines_1h."""
     if not oi_hist or len(oi_hist) < 2:
         return {}
     current_oi = oi_hist[-1].get("oi")
     if current_oi is None:
         return {}
-    windows = {"1h": 1, "4h": 4, "12h": 12, "24h": 24}
+    windows = {
+        "1h":  1,
+        "4h":  4,
+        "12h": 12,
+        "24h": 24,
+        "3d":  72,
+        "7d":  168,
+        "14d": 336,
+    }
+    long_windows = {"3d", "7d", "14d"}
+
+    def price_chg_from_klines(hours: int) -> Optional[float]:
+        if not klines_1h or len(klines_1h) <= hours:
+            return None
+        try:
+            price_now  = float(klines_1h[-1][4])
+            price_past = float(klines_1h[-1 - hours][4])
+            if price_past <= 0:
+                return None
+            return round((price_now - price_past) / price_past * 100, 3)
+        except (IndexError, ValueError, TypeError):
+            return None
+
     by_window: dict = {}
     for wname, hours in windows.items():
         if len(oi_hist) <= hours:
@@ -385,10 +413,15 @@ def compute_money_quality(oi_hist: list, perp_flow: dict, funding_rate: Optional
             continue
         oi_delta = current_oi - past_oi
         oi_delta_pct = (oi_delta / past_oi) * 100
-        flow = (perp_flow or {}).get(wname, {}) or {}
-        price_chg_pct = flow.get("priceChgPct")
-        delta_vs_vol = flow.get("deltaVsVol")
-        taker_ratio = flow.get("ratio")
+        if wname in long_windows:
+            price_chg_pct = price_chg_from_klines(hours)
+            delta_vs_vol = None
+            taker_ratio = None
+        else:
+            flow = (perp_flow or {}).get(wname, {}) or {}
+            price_chg_pct = flow.get("priceChgPct")
+            delta_vs_vol = flow.get("deltaVsVol")
+            taker_ratio = flow.get("ratio")
         if price_chg_pct is None:
             continue
         ratio = None
@@ -445,7 +478,15 @@ def compute_money_quality(oi_hist: list, perp_flow: dict, funding_rate: Optional
             "deltaVsVol": delta_vs_vol,
             "takerRatio": taker_ratio,
         }
-    weights = {"1h": 1.0, "4h": 2.0, "12h": 2.0, "24h": 1.5}
+    weights = {
+        "1h":  1.0,
+        "4h":  2.0,
+        "12h": 2.0,
+        "24h": 1.5,
+        "3d":  1.2,
+        "7d":  1.0,
+        "14d": 0.8,
+    }
     score = 0.0
     total_w = 0.0
     for w, info in by_window.items():
@@ -760,7 +801,7 @@ async def fetch_all_data() -> dict:
             fetch_json(client, f"{BINANCE_FAPI}/fapi/v1/premiumIndex", {"symbol": "ETHUSDT"}),
             fetch_json(client, f"{BINANCE_FAPI}/fapi/v1/openInterest", {"symbol": "ETHUSDT"}),
             fetch_json(client, f"{BINANCE_FAPI}/futures/data/openInterestHist",
-                       {"symbol": "ETHUSDT", "period": "1h", "limit": 48}),
+                       {"symbol": "ETHUSDT", "period": "1h", "limit": 500}),
             fetch_json(client, f"{BINANCE_FAPI}/futures/data/globalLongShortAccountRatio",
                        {"symbol": "ETHUSDT", "period": "1h", "limit": 24}),
             fetch_json(client, f"{BINANCE_FAPI}/futures/data/topLongShortPositionRatio",
@@ -988,7 +1029,9 @@ async def fetch_all_data() -> dict:
 
     oi_change = None
     if len(oi_hist) >= 2:
-        oi_change = ((oi_hist[-1]["value"] - oi_hist[0]["value"]) / oi_hist[0]["value"]) * 100
+        oi_48h_start = oi_hist[-49] if len(oi_hist) >= 49 else oi_hist[0]
+        if oi_48h_start.get("value"):
+            oi_change = ((oi_hist[-1]["value"] - oi_48h_start["value"]) / oi_48h_start["value"]) * 100
 
     retail_ratio = safe_float(latest_ls, "longShortRatio")
     top_ratio = safe_float(latest_top_ls, "longShortRatio")
@@ -1242,7 +1285,12 @@ async def fetch_all_data() -> dict:
         "4h":  kl_4h_stoch if isinstance(kl_4h_stoch, list) else [],
     })
 
-    money_quality = compute_money_quality(oi_hist, perp_flow, funding_rate=bn_fund_rate)
+    money_quality = compute_money_quality(
+        oi_hist,
+        perp_flow,
+        funding_rate=bn_fund_rate,
+        klines_1h=bn_klines_vol if isinstance(bn_klines_vol, list) else None,
+    )
 
     liq_map = estimate_liquidation_map(
         total_oi_usd, spot or 0,

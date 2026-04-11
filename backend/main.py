@@ -425,18 +425,19 @@ def estimate_liquidation_map(oi_value: float, spot_price: float, funding_rate: f
     return clusters
 
 
-def compute_money_quality(oi_hist: list, perp_flow: dict, funding_rate: Optional[float] = None) -> dict:
+def compute_money_quality(
+    oi_hist: list,
+    perp_flow: dict,
+    funding_rate: Optional[float] = None,
+    klines_1h: Optional[list] = None,
+) -> dict:
     """
     Classify price movement quality by comparing price change vs OI change per window.
     This distinguishes NEW MONEY entering from SHORT COVERING / ROTATION.
 
-    Logic (per window 1h / 4h / 12h / 24h):
-      - Price up  + OI up    → Nuevos longs entrando (nueva plata bullish)
-      - Price up  + OI flat  → Short covering puro (sin nueva plata)
-      - Price up  + OI down  → Cierre cruzado / distribución arriba
-      - Price dn  + OI up    → Nuevos shorts entrando (nueva plata bearish)
-      - Price dn  + OI flat  → Long liquidation light
-      - Price dn  + OI down  → Long capitulation (longs cerrando fuerte)
+    Short windows (1h/4h/12h/24h) source price change from perp_flow (5m klines).
+    Long windows  (3d/7d/14d)       source price change from klines_1h klines[4]=close.
+    OI deltas use the hourly openInterestHist (oi_hist), newest last.
 
     Ratio = |ΔPrice%| / |ΔOI%|
       < 1   → Acumulación real (mucha plata nueva por poco movimiento)
@@ -452,7 +453,31 @@ def compute_money_quality(oi_hist: list, perp_flow: dict, funding_rate: Optional
     if current_oi is None:
         return {}
 
-    windows = {"1h": 1, "4h": 4, "12h": 12, "24h": 24}
+    # Intraday windows sourced from perp_flow, multi-day windows sourced from klines_1h
+    windows = {
+        "1h":  1,
+        "4h":  4,
+        "12h": 12,
+        "24h": 24,
+        "3d":  72,
+        "7d":  168,
+        "14d": 336,
+    }
+    long_windows = {"3d", "7d", "14d"}
+
+    # Helper: compute priceChgPct for a window from 1h klines list (Binance kline format)
+    def price_chg_from_klines(hours: int) -> Optional[float]:
+        if not klines_1h or len(klines_1h) <= hours:
+            return None
+        try:
+            price_now  = float(klines_1h[-1][4])
+            price_past = float(klines_1h[-1 - hours][4])
+            if price_past <= 0:
+                return None
+            return round((price_now - price_past) / price_past * 100, 3)
+        except (IndexError, ValueError, TypeError):
+            return None
+
     by_window: dict = {}
 
     for wname, hours in windows.items():
@@ -464,10 +489,15 @@ def compute_money_quality(oi_hist: list, perp_flow: dict, funding_rate: Optional
         oi_delta     = current_oi - past_oi
         oi_delta_pct = (oi_delta / past_oi) * 100
 
-        flow = (perp_flow or {}).get(wname, {}) or {}
-        price_chg_pct = flow.get("priceChgPct")
-        delta_vs_vol  = flow.get("deltaVsVol")   # taker buy-sell delta as % of total vol
-        taker_ratio   = flow.get("ratio")
+        if wname in long_windows:
+            price_chg_pct = price_chg_from_klines(hours)
+            delta_vs_vol  = None
+            taker_ratio   = None
+        else:
+            flow = (perp_flow or {}).get(wname, {}) or {}
+            price_chg_pct = flow.get("priceChgPct")
+            delta_vs_vol  = flow.get("deltaVsVol")
+            taker_ratio   = flow.get("ratio")
 
         if price_chg_pct is None:
             continue
@@ -557,8 +587,16 @@ def compute_money_quality(oi_hist: list, perp_flow: dict, funding_rate: Optional
             "takerRatio":   taker_ratio,
         }
 
-    # ── Overall verdict weighted by window (shorter = more weight for timing) ──
-    weights = {"1h": 1.0, "4h": 2.0, "12h": 2.0, "24h": 1.5}
+    # ── Overall verdict weighted by window (4-24h carries timing weight) ──
+    weights = {
+        "1h":  1.0,
+        "4h":  2.0,
+        "12h": 2.0,
+        "24h": 1.5,
+        "3d":  1.2,
+        "7d":  1.0,
+        "14d": 0.8,
+    }
     score = 0.0
     total_w = 0.0
     for w, info in by_window.items():
@@ -929,7 +967,7 @@ async def fetch_all_data() -> dict:
             fetch_json(client, f"{BINANCE_FAPI}/fapi/v1/premiumIndex", {"symbol": "ETHUSDT"}),
             fetch_json(client, f"{BINANCE_FAPI}/fapi/v1/openInterest", {"symbol": "ETHUSDT"}),
             fetch_json(client, f"{BINANCE_FAPI}/futures/data/openInterestHist",
-                       {"symbol": "ETHUSDT", "period": "1h", "limit": 48}),
+                       {"symbol": "ETHUSDT", "period": "1h", "limit": 500}),
             fetch_json(client, f"{BINANCE_FAPI}/futures/data/globalLongShortAccountRatio",
                        {"symbol": "ETHUSDT", "period": "1h", "limit": 24}),
             fetch_json(client, f"{BINANCE_FAPI}/futures/data/topLongShortPositionRatio",
@@ -1178,7 +1216,10 @@ async def fetch_all_data() -> dict:
 
     oi_change = None
     if len(oi_hist) >= 2:
-        oi_change = ((oi_hist[-1]["value"] - oi_hist[0]["value"]) / oi_hist[0]["value"]) * 100
+        # Keep "change48h" semantic: use last 48 hourly entries (or full history if shorter)
+        oi_48h_start = oi_hist[-49] if len(oi_hist) >= 49 else oi_hist[0]
+        if oi_48h_start.get("value"):
+            oi_change = ((oi_hist[-1]["value"] - oi_48h_start["value"]) / oi_48h_start["value"]) * 100
 
     retail_ratio = safe_float(latest_ls, "longShortRatio")
     top_ratio = safe_float(latest_top_ls, "longShortRatio")
@@ -1453,7 +1494,12 @@ async def fetch_all_data() -> dict:
     total_oi_usd = bn_oi_val + okx_oi_val + bybit_oi_val + hl_oi_val
 
     # ── Money Quality: plata nueva vs short covering (OI vs Price) ──
-    money_quality = compute_money_quality(oi_hist, perp_flow, funding_rate=bn_fund_rate)
+    money_quality = compute_money_quality(
+        oi_hist,
+        perp_flow,
+        funding_rate=bn_fund_rate,
+        klines_1h=bn_klines_vol if isinstance(bn_klines_vol, list) else None,
+    )
 
     # ── Stochastics multi-timeframe ──────────────────────────────────
     stochastics_data = compute_stochastics_multi({
