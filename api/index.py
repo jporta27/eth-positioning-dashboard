@@ -217,7 +217,7 @@ def calculate_volume_profile(klines: list, cluster_size: float = 5.0) -> dict:
     }
 
 
-def stochastic(klines: list, k_period: int, k_smooth: int, d_smooth: int, history_len: int = 60) -> Optional[dict]:
+def stochastic(klines: list, k_period: int, k_smooth: int, d_smooth: int, history_len: int = 300) -> Optional[dict]:
     """Stochastic oscillator with K smoothing. Returns {k, d, kHistory, dHistory} or None."""
     required = k_period + k_smooth + d_smooth - 2
     if not klines or len(klines) < required:
@@ -520,6 +520,191 @@ def compute_money_quality(
         "score": round(norm_score, 3),
         "fundingContext": funding_context,
     }
+
+
+def compute_cut_anchored_mq(
+    klines_by_tf: dict,
+    oi_hist_1h: list,
+    oi_hist_5m: list,
+) -> dict:
+    """
+    For each stoch TF, find the most recent bar where Fast %K (100,10) crossed
+    INTO the OB (≥80) or OS (≤20) zone, and compute OI/Price evolution from
+    that anchor to now. Returns dict tf -> {direction, anchorBars, ratio,
+    label, quality, ...}.
+    """
+    tf_minutes = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240}
+    K_PERIOD = 100
+    K_SMOOTH = 10
+    OI_FLAT_THRESHOLD = 0.10
+    out: dict = {}
+    if not klines_by_tf:
+        return out
+
+    def lookup_oi_pair(oi_series: list, minutes_back: int, granularity_min: int):
+        if not oi_series or len(oi_series) < 2:
+            return None, None
+        steps_back = max(0, round(minutes_back / granularity_min))
+        now_idx = len(oi_series) - 1
+        past_idx = now_idx - steps_back
+        if past_idx < 0:
+            return None, None
+        try:
+            return float(oi_series[past_idx]["oi"]), float(oi_series[now_idx]["oi"])
+        except (KeyError, ValueError, TypeError):
+            return None, None
+
+    for tf, klines in klines_by_tf.items():
+        if tf not in tf_minutes or not klines:
+            continue
+        n = len(klines)
+        if n < K_PERIOD + K_SMOOTH:
+            continue
+        try:
+            highs  = [float(k[2]) for k in klines]
+            lows   = [float(k[3]) for k in klines]
+            closes = [float(k[4]) for k in klines]
+            ts     = [int(k[0])   for k in klines]
+        except (IndexError, ValueError, TypeError):
+            continue
+
+        raw_k = [None] * n
+        for i in range(K_PERIOD - 1, n):
+            wh = max(highs[i - K_PERIOD + 1: i + 1])
+            wl = min(lows[i - K_PERIOD + 1: i + 1])
+            rng = wh - wl
+            raw_k[i] = 50.0 if rng == 0 else (closes[i] - wl) / rng * 100
+        smooth_k: list = [None] * n
+        for i in range(n):
+            start = i - K_SMOOTH + 1
+            if start < 0:
+                continue
+            window = raw_k[start: i + 1]
+            if any(v is None for v in window):
+                continue
+            smooth_k[i] = sum(window) / K_SMOOTH
+
+        latest_k = smooth_k[-1]
+        if latest_k is None:
+            continue
+        if latest_k >= 80:
+            target_dir = "short"
+            in_zone = lambda v: v is not None and v >= 80
+        elif latest_k <= 20:
+            target_dir = "long"
+            in_zone = lambda v: v is not None and v <= 20
+        else:
+            continue
+
+        anchor_idx = None
+        anchor_capped = False
+        for i in range(n - 1, 0, -1):
+            if not in_zone(smooth_k[i]):
+                break
+            if not in_zone(smooth_k[i - 1]):
+                anchor_idx = i - 1
+                break
+        if anchor_idx is None:
+            for i in range(n):
+                if smooth_k[i] is not None:
+                    anchor_idx = i
+                    anchor_capped = True
+                    break
+            if anchor_idx is None:
+                continue
+
+        anchor_bars = (n - 1) - anchor_idx
+        anchor_ts = ts[anchor_idx]
+        anchor_price = closes[anchor_idx]
+        current_price = closes[-1]
+        if anchor_price <= 0:
+            continue
+        price_chg_pct = (current_price - anchor_price) / anchor_price * 100
+
+        anchor_minutes_back = anchor_bars * tf_minutes[tf]
+        oi_source = None
+        anchor_oi = None
+        current_oi = None
+        if tf in ("1m", "5m", "15m"):
+            anchor_oi, current_oi = lookup_oi_pair(oi_hist_5m, anchor_minutes_back, 5)
+            oi_source = "5m"
+            if anchor_oi is None:
+                anchor_oi, current_oi = lookup_oi_pair(oi_hist_1h, anchor_minutes_back, 60)
+                oi_source = "1h-fallback"
+        else:
+            anchor_oi, current_oi = lookup_oi_pair(oi_hist_1h, anchor_minutes_back, 60)
+            oi_source = "1h"
+
+        if anchor_oi is None or current_oi is None or anchor_oi <= 0:
+            out[tf] = {
+                "direction":      target_dir,
+                "anchorBars":     anchor_bars,
+                "anchorTs":       anchor_ts,
+                "anchorIsCapped": anchor_capped,
+                "priceChgPct":    round(price_chg_pct, 3),
+                "oiDelta":        None,
+                "oiDeltaPct":     None,
+                "ratio":          None,
+                "label":          "OI no disponible para el corte",
+                "quality":        None,
+                "oiSource":       oi_source,
+            }
+            continue
+
+        oi_delta = current_oi - anchor_oi
+        oi_delta_pct = (oi_delta / anchor_oi) * 100
+        ratio = abs(price_chg_pct) / abs(oi_delta_pct) if abs(oi_delta_pct) > 0.01 else None
+
+        oi_up   = oi_delta_pct >  OI_FLAT_THRESHOLD
+        oi_dn   = oi_delta_pct < -OI_FLAT_THRESHOLD
+        oi_flat = not oi_up and not oi_dn
+
+        label = "Sin clasificar"
+        quality = "neutral"
+        if target_dir == "short":
+            if oi_up:
+                if ratio is not None and ratio < 1:
+                    label, quality = "Acumulación real (longs nuevos)", "block"
+                elif ratio is not None and ratio < 2:
+                    label, quality = "Balanceado (longs mixto)", "neutral"
+                elif ratio is not None and ratio < 5:
+                    label, quality = "Covering dominante", "upgrade-mid"
+                else:
+                    label, quality = "Squeeze puro", "upgrade-high"
+            elif oi_flat:
+                label, quality = "Short covering (OI plano)", "upgrade-mid"
+            else:
+                label, quality = "Distribución arriba (OI cae)", "upgrade-high"
+        else:
+            if oi_up:
+                if ratio is not None and ratio < 1:
+                    label, quality = "Distribución real (shorts nuevos)", "block"
+                elif ratio is not None and ratio < 2:
+                    label, quality = "Balanceado (shorts mixto)", "neutral"
+                elif ratio is not None and ratio < 5:
+                    label, quality = "Liquidation dominante", "upgrade-mid"
+                else:
+                    label, quality = "Long squeeze puro", "upgrade-high"
+            elif oi_flat:
+                label, quality = "Long cerrando (OI plano)", "upgrade-mid"
+            else:
+                label, quality = "Long capitulation", "upgrade-high"
+
+        out[tf] = {
+            "direction":      target_dir,
+            "anchorBars":     anchor_bars,
+            "anchorTs":       anchor_ts,
+            "anchorIsCapped": anchor_capped,
+            "priceChgPct":    round(price_chg_pct, 3),
+            "oiDelta":        round(oi_delta, 2),
+            "oiDeltaPct":     round(oi_delta_pct, 3),
+            "ratio":          round(ratio, 2) if ratio is not None else None,
+            "label":          label,
+            "quality":        quality,
+            "oiSource":       oi_source,
+        }
+
+    return out
 
 
 def calculate_options_analytics(instruments: list, spot_price: float) -> dict:
@@ -876,6 +1061,9 @@ async def fetch_all_data() -> dict:
                        {"symbol": "ETHUSDT", "interval": "4h", "limit": 500}),
             fetch_json(client, f"{BINANCE_FAPI}/fapi/v1/klines",
                        {"symbol": "ETHUSDT", "interval": "5m", "limit": 500}),
+            # 5m OI history for cut-anchored MQ on 1m/5m/15m TFs (~41h coverage)
+            fetch_json(client, f"{BINANCE_FAPI}/futures/data/openInterestHist",
+                       {"symbol": "ETHUSDT", "period": "5m", "limit": 500}),
             return_exceptions=True,
         )
 
@@ -896,6 +1084,7 @@ async def fetch_all_data() -> dict:
         bybit_funding_hist_raw, hyperliquid_raw,
         ethbtc_ticker, bybit_oi_raw,
         kl_1m, kl_15m, kl_4h_stoch, kl_5m_stoch,
+        bn_oi_hist_5m,
     ) = results
 
     def safe_float(obj, key, default=None):
@@ -911,6 +1100,17 @@ async def fetch_all_data() -> dict:
     for d in safe_list(bn_oi_hist):
         try:
             oi_hist.append({
+                "ts": d["timestamp"],
+                "value": float(d["sumOpenInterestValue"]),
+                "oi": float(d["sumOpenInterest"]),
+            })
+        except (KeyError, ValueError):
+            continue
+
+    oi_hist_5m: list = []
+    for d in safe_list(bn_oi_hist_5m):
+        try:
+            oi_hist_5m.append({
                 "ts": d["timestamp"],
                 "value": float(d["sumOpenInterestValue"]),
                 "oi": float(d["sumOpenInterest"]),
@@ -1277,13 +1477,20 @@ async def fetch_all_data() -> dict:
     hl_oi_val = hl_oi or 0
     total_oi_usd = bn_oi_val + okx_oi_val + bybit_oi_val + hl_oi_val
 
-    stochastics_data = compute_stochastics_multi({
+    klines_for_stoch = {
         "1m":  kl_1m if isinstance(kl_1m, list) else [],
         "5m":  kl_5m_stoch if isinstance(kl_5m_stoch, list) else [],
         "15m": kl_15m if isinstance(kl_15m, list) else [],
         "1h":  bn_klines_vol if isinstance(bn_klines_vol, list) else [],
         "4h":  kl_4h_stoch if isinstance(kl_4h_stoch, list) else [],
-    })
+    }
+    stochastics_data = compute_stochastics_multi(klines_for_stoch)
+
+    cut_anchored_mq = compute_cut_anchored_mq(
+        klines_for_stoch,
+        oi_hist_1h=oi_hist,
+        oi_hist_5m=oi_hist_5m,
+    )
 
     money_quality = compute_money_quality(
         oi_hist,
@@ -1406,6 +1613,7 @@ async def fetch_all_data() -> dict:
         "liquidationMap": liq_map_data,
         "stochastics": stochastics_data,
         "moneyQuality": money_quality,
+        "cutAnchoredMq": cut_anchored_mq,
     }
 
     cache = data

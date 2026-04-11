@@ -1226,17 +1226,42 @@ function gradeMqForDirection(direction, mqInfo) {
 }
 
 /**
- * Analyze stochastic setup per TF according to user's strategy:
+ * Map cut-anchored MQ quality to setup grade and tier.
+ *   block        → BLOCKED
+ *   neutral      → A
+ *   upgrade-mid  → A+
+ *   upgrade-high → A++
+ */
+function cutQualityToGrade(cutQuality) {
+  switch (cutQuality) {
+    case 'block':        return { grade: 'BLOCKED', tier: -1 }
+    case 'upgrade-high': return { grade: 'A++',     tier: 2 }
+    case 'upgrade-mid':  return { grade: 'A+',      tier: 1 }
+    case 'neutral':      return { grade: 'A',       tier: 0 }
+    default:             return { grade: null,      tier: 0 }
+  }
+}
+
+/**
+ * Analyze stochastic setup per TF according to user's strategy.
+ *
+ * PRIMARY FILTER: cut-anchored MQ.
+ *   Measures the OI/Price evolution from the moment Fast %K entered the OB/OS
+ *   zone up to now. This is the IMPULSE filter — it answers "is the move that
+ *   put the stoch into the extreme being powered by NEW MONEY (trend → BLOCK)
+ *   or by COVERING (squeeze → UPGRADE)?". This is what determines the quality
+ *   grade (BLOCKED / A / A+ / A++).
+ *
+ * SECONDARY (informative): dual regime MQ (fast horizon + slow horizon).
+ *   Tells us about the multi-day capital base under the rolling stoch range.
+ *   Shown as context but does NOT gate the trade.
+ *
+ * Stoch alignment rules:
  *  - Slow %K + %D both in same extreme zone (OB ≥80 or OS ≤20)
  *  - Fast %K + %D both in same zone (persistence ≥2 bars)
  *  - Trigger: Fast %K crosses the threshold (exits the zone)
- *  - Filter: DUAL MQ (fast horizon + slow horizon) combined
- *      * Any BLOCK → BLOCKED
- *      * Both UPGRADE ≥1 → A++ (cuanto mayor tier, mejor)
- *      * One UPGRADE → A+
- *      * Both NEUTRAL → A
  */
-function analyzeSetup(stochData, mqFastInfo, mqSlowInfo) {
+function analyzeSetup(stochData, mqFastInfo, mqSlowInfo, cutInfo) {
   if (!stochData || !stochData.slow || !stochData.fast) return null
   const slow = stochData.slow
   const fast = stochData.fast
@@ -1301,7 +1326,9 @@ function analyzeSetup(stochData, mqFastInfo, mqSlowInfo) {
     state = 'LATE'
   }
 
-  // ── Dual MQ filter ──────────────────────────────────────────────
+  // ── Quality grading ──────────────────────────────────────────────
+  // PRIMARY: cut-anchored MQ (the impulse from the moment fast %K entered zone)
+  // SECONDARY (informative only): dual regime MQ (fast horizon + slow horizon)
   let quality = null          // 'A' | 'A+' | 'A++' | 'BLOCKED' | null
   let blockedReason = null
   let qualityNote = null
@@ -1309,32 +1336,29 @@ function analyzeSetup(stochData, mqFastInfo, mqSlowInfo) {
   let mqSlowGrade = null
 
   if (direction && (state === 'ARMED' || state === 'TRIGGERED')) {
+    // Compute regime grades for context (not gating)
     mqFastGrade = gradeMqForDirection(direction, mqFastInfo)
     mqSlowGrade = gradeMqForDirection(direction, mqSlowInfo)
 
-    const fV = mqFastGrade.verdict
-    const sV = mqSlowGrade.verdict
-
-    if (fV === 'BLOCK' || sV === 'BLOCK') {
-      quality = 'BLOCKED'
-      const blocks = []
-      if (fV === 'BLOCK') blocks.push(`fast: ${mqFastGrade.note}`)
-      if (sV === 'BLOCK') blocks.push(`slow: ${mqSlowGrade.note}`)
-      blockedReason = blocks.join(' · ')
-    } else {
-      const upCount = (fV === 'UPGRADE' ? 1 : 0) + (sV === 'UPGRADE' ? 1 : 0)
-      const tierSum = (mqFastGrade.tier || 0) + (mqSlowGrade.tier || 0)
-      if (upCount === 2 || tierSum >= 3) {
-        quality = 'A++'
-      } else if (upCount === 1) {
-        quality = 'A+'
+    // PRIMARY: cut-anchored quality determines the grade
+    if (cutInfo && cutInfo.direction === direction && cutInfo.quality) {
+      const { grade } = cutQualityToGrade(cutInfo.quality)
+      quality = grade
+      if (grade === 'BLOCKED') {
+        const ratioStr = cutInfo.ratio != null ? cutInfo.ratio.toFixed(2) : '—'
+        blockedReason = `${cutInfo.label} (r ${ratioStr}, ${cutInfo.anchorBars} bars desde el corte)`
       } else {
-        quality = 'A'
+        const ratioStr = cutInfo.ratio != null ? cutInfo.ratio.toFixed(2) : '—'
+        qualityNote = `desde el corte (${cutInfo.anchorBars} bars): ${cutInfo.label} · r ${ratioStr}`
       }
-      const notes = []
-      if (mqFastGrade.note) notes.push(`fast: ${mqFastGrade.note}`)
-      if (mqSlowGrade.note) notes.push(`slow: ${mqSlowGrade.note}`)
-      qualityNote = notes.join(' · ')
+    } else if (cutInfo && cutInfo.direction === direction && cutInfo.quality === null) {
+      // Cut info present but OI lookup failed — fall back to default A
+      quality = 'A'
+      qualityNote = `desde el corte (${cutInfo.anchorBars} bars): ${cutInfo.label}`
+    } else {
+      // No cut data — use default A so we don't silently block valid setups
+      quality = 'A'
+      qualityNote = 'sin filtro de corte (sin datos)'
     }
   }
 
@@ -1347,7 +1371,18 @@ function analyzeSetup(stochData, mqFastInfo, mqSlowInfo) {
     fastKPrev: kPrev,
     slowOB, slowOS, fastOB, fastOS,
     persistOB, persistOS,
-    // Dual MQ exposed for UI readout
+    // PRIMARY filter (cut-anchored)
+    cut: cutInfo && cutInfo.direction === direction ? {
+      anchorBars:     cutInfo.anchorBars,
+      anchorIsCapped: cutInfo.anchorIsCapped,
+      priceChgPct:    cutInfo.priceChgPct,
+      oiDeltaPct:     cutInfo.oiDeltaPct,
+      ratio:          cutInfo.ratio,
+      label:          cutInfo.label,
+      quality:        cutInfo.quality,
+      oiSource:       cutInfo.oiSource,
+    } : null,
+    // SECONDARY filter (regime, informative)
     mqFast: mqFastInfo ? {
       ratio: mqFastInfo.ratio ?? null,
       label: mqFastInfo.label ?? null,
@@ -1369,17 +1404,19 @@ function analyzeSetup(stochData, mqFastInfo, mqSlowInfo) {
   }
 }
 
-function SetupPanel({ stochastics, moneyQuality, stochTf, setStochTf }) {
+function SetupPanel({ stochastics, moneyQuality, cutAnchoredMq, stochTf, setStochTf }) {
   const timeframes = ['1m', '5m', '15m', '1h', '4h']
   const mqByWindow = (moneyQuality || {}).byWindow || {}
+  const cutByTf = cutAnchoredMq || {}
 
-  // Analyze all TFs with DUAL MQ filter (fast horizon + slow horizon)
+  // Analyze all TFs: primary = cut-anchored MQ; secondary = dual regime MQ
   const analysisByTf = {}
   timeframes.forEach(tf => {
     const windows = STOCH_TO_MQ_WINDOWS[tf] || { fast: '4h', slow: '24h' }
     const mqFast = mqByWindow[windows.fast]
     const mqSlow = mqByWindow[windows.slow]
-    analysisByTf[tf] = analyzeSetup((stochastics || {})[tf], mqFast, mqSlow)
+    const cutInfo = cutByTf[tf]
+    analysisByTf[tf] = analyzeSetup((stochastics || {})[tf], mqFast, mqSlow, cutInfo)
   })
 
   const current = analysisByTf[stochTf]
@@ -1549,11 +1586,79 @@ function SetupPanel({ stochastics, moneyQuality, stochTf, setStochTf }) {
             </div>
           </div>
 
-          {/* DUAL MQ filter row — fast horizon + slow horizon */}
+          {/* PRIMARY: cut-anchored MQ — measures impulse FROM the moment Fast %K entered the zone */}
+          {current.cut && (() => {
+            const cut = current.cut
+            const cutQ = cut.quality
+            const cutColor = cutQ === 'block' ? '#ef4444'
+                           : cutQ === 'upgrade-high' ? '#22c55e'
+                           : cutQ === 'upgrade-mid'  ? '#86efac'
+                           : '#fbbf24'
+            const cutBg    = cutQ === 'block' ? 'rgba(239,68,68,0.10)'
+                           : cutQ === 'upgrade-high' ? 'rgba(34,197,94,0.10)'
+                           : cutQ === 'upgrade-mid'  ? 'rgba(34,197,94,0.06)'
+                           : 'rgba(251,191,36,0.06)'
+            const cutTag   = cutQ === 'block' ? '✗ BLOQUEA'
+                           : cutQ === 'upgrade-high' ? '✓✓ A++'
+                           : cutQ === 'upgrade-mid'  ? '✓ A+'
+                           : '◦ A'
+            const fmtPct   = (v) => v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + '%'
+            const ratioStr = cut.ratio != null ? cut.ratio.toFixed(2) : '—'
+            const tfMin    = { '1m':1, '5m':5, '15m':15, '1h':60, '4h':240 }[stochTf] || 1
+            const ageMin   = cut.anchorBars != null ? cut.anchorBars * tfMin : null
+            const ageStr   = ageMin == null ? '—'
+                           : ageMin >= 1440 ? `${(ageMin/1440).toFixed(1)}d`
+                           : ageMin >= 60   ? `${(ageMin/60).toFixed(1)}h`
+                           : `${ageMin}m`
+            return (
+              <div style={{
+                marginBottom: 10,
+                padding: '8px 11px',
+                background: cutBg,
+                borderRadius: 6,
+                border: `1px solid ${cutColor}55`,
+                borderLeft: `4px solid ${cutColor}`,
+              }}>
+                <div style={{
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                  fontSize: 10, color: '#8a9ac0', marginBottom: 5, letterSpacing: 0.4, fontWeight: 600,
+                }}>
+                  <span>★ MQ DESDE EL CORTE · PRIMARY FILTER · OI {cut.oiSource || '—'}</span>
+                  <span style={{ color: cutColor, fontWeight: 700, letterSpacing: 0.6 }}>{cutTag}</span>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginBottom: 4 }}>
+                  <div>
+                    <div style={{ fontSize: 9, color: '#5a6a8a' }}>ANCHOR</div>
+                    <div style={{ fontSize: 11, color: '#e2e8f0', ...S.mono }}>
+                      {cut.anchorBars} bars · {ageStr}
+                      {cut.anchorIsCapped && <span style={{ color: '#fbbf24', fontSize: 9 }}> ⚠cap</span>}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 9, color: '#5a6a8a' }}>ΔPRECIO / ΔOI</div>
+                    <div style={{ fontSize: 11, color: '#e2e8f0', ...S.mono }}>
+                      {fmtPct(cut.priceChgPct)} / {fmtPct(cut.oiDeltaPct)}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 9, color: '#5a6a8a' }}>RATIO |ΔP|/|ΔOI|</div>
+                    <div style={{ fontSize: 11, color: cutColor, ...S.mono, fontWeight: 700 }}>
+                      {ratioStr}
+                    </div>
+                  </div>
+                </div>
+                <div style={{ fontSize: 11, color: '#e2e8f0', ...S.mono, fontWeight: 600 }}>
+                  → {cut.label || '—'}
+                </div>
+              </div>
+            )
+          })()}
+
+          {/* SECONDARY (informative): dual MQ regime — fast horizon + slow horizon */}
           {(current.mqFast || current.mqSlow) && (
-            <div style={{ marginBottom: 10 }}>
+            <div style={{ marginBottom: 10, opacity: 0.85 }}>
               <div style={{ fontSize: 9, color: '#5a6a8a', marginBottom: 4, letterSpacing: 0.4 }}>
-                FILTRO MQ DUAL · fast={currentWindows.fast} (horizonte stoch 100) · slow={currentWindows.slow} (horizonte stoch 400)
+                CONTEXTO · FILTRO MQ DUAL (régimen) · fast={currentWindows.fast} · slow={currentWindows.slow}
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
                 {[
@@ -1644,7 +1749,11 @@ function SetupPanel({ stochastics, moneyQuality, stochTf, setStochTf }) {
       )}
 
       <div style={{ padding: '6px 8px', background: '#0a1020', borderRadius: 5, fontSize: 9, color: '#5a6a8a', lineHeight: 1.5 }}>
-        <b style={{ color: '#8a9ac0' }}>Regla</b>: Slow (400,40,10) y Fast (100,10,4) ambos en mismo extremo (OB≥80 / OS≤20). <b>Trigger</b>: Fast %K cruza el umbral (sale de la zona). <b>Filtro MQ dual</b>: FAST (100 × TF) + SLOW (400 × TF). Si alguno marca <i>acumulación/distribución real</i> (ratio &lt;1 en dirección del precio) → BLOQUEADO. Si los dos marcan <i>covering/squeeze</i> (ratio ≥2 contrario) → A++. Si uno solo → A+. Ambos neutros → A.
+        <b style={{ color: '#8a9ac0' }}>Regla</b>: Slow (400,40,10) y Fast (100,10,4) ambos en mismo extremo (OB≥80 / OS≤20). <b>Trigger</b>: Fast %K cruza el umbral (sale de la zona).
+        <br />
+        <b style={{ color: '#fbbf24' }}>★ Filtro PRIMARY (cut-anchored)</b>: mide |ΔP|/|ΔOI| desde el bar exacto en que Fast %K (100,10) entró a la zona OB/OS hasta ahora. <i>OI subiendo + ratio &lt;1 en dirección</i> = acumulación/distribución real → <b>BLOQUEADO</b>. <i>OI cayendo o ratio ≥5 contrario</i> = squeeze/capitulación → <b>A++</b>. <i>Ratio 2-5 contrario</i> = covering/liquidation → <b>A+</b>. Resto → A.
+        <br />
+        <b style={{ color: '#5a6a8a' }}>Contexto (régimen)</b>: filtro MQ dual sobre 100×TF + 400×TF — informativo, no gatea la operación.
       </div>
     </div>
   )
@@ -2710,15 +2819,18 @@ function computeSignals(data, period = '1h', stochTf = '1h') {
     }
   }
 
-  // ── 12. SETUP DETECTOR: stoch alignment + DUAL MQ regime filter (peso: w.setup) ──
+  // ── 12. SETUP DETECTOR: stoch alignment + cut-anchored MQ filter (peso: w.setup) ──
   // Stoch alineado en extremo + fast %K cruza umbral.
-  // Filtrado por DOS ventanas MQ: fast horizon (100 × TF) + slow horizon (400 × TF).
-  //   Any BLOCK → BLOCKED.  Both UPGRADE → A++.  One UPGRADE → A+.  Both neutral → A.
+  // PRIMARY filter: cut-anchored MQ (impulso desde el corte). Mide |ΔP|/|ΔOI|
+  //   desde el bar exacto en que Fast %K (100,10) entró a la zona OB/OS.
+  //   block → BLOQUEADO. upgrade-high → A++. upgrade-mid → A+. neutral → A.
+  // SECONDARY (informativo): dual regime MQ (no gatea, solo contexto).
   if (w.setup > 0 && data.stochastics) {
     const windows = STOCH_TO_MQ_WINDOWS[stochTf] || { fast: '4h', slow: '24h' }
     const mqFastForSetup = mqByWindow[windows.fast]
     const mqSlowForSetup = mqByWindow[windows.slow]
-    const setupAnalysis = analyzeSetup(data.stochastics[stochTf], mqFastForSetup, mqSlowForSetup)
+    const cutInfoForSetup = (data.cutAnchoredMq || {})[stochTf]
+    const setupAnalysis = analyzeSetup(data.stochastics[stochTf], mqFastForSetup, mqSlowForSetup, cutInfoForSetup)
     if (setupAnalysis && setupAnalysis.direction && setupAnalysis.state !== 'INACTIVE') {
       const qMult = {
         'A++':     1.5,
@@ -3010,6 +3122,7 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
         <SetupPanel
           stochastics={data?.stochastics}
           moneyQuality={data?.moneyQuality}
+          cutAnchoredMq={data?.cutAnchoredMq}
           stochTf={stochTf}
           setStochTf={setStochTf}
         />
