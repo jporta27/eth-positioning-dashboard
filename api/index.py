@@ -406,27 +406,27 @@ def compute_money_quality(oi_hist: list, perp_flow: dict, funding_rate: Optional
             if ratio is not None and ratio < 1:
                 label, quality = "Acumulación real", "high"
             elif ratio is not None and ratio < 2:
-                label, quality = "Nuevos longs", "medium"
+                label, quality = "Balanceado (longs mixto)", "medium"
             elif ratio is not None and ratio < 5:
-                label, quality = "Short covering + longs", "medium"
+                label, quality = "Covering dominante", "low"
             else:
-                label, quality = "Short squeeze", "low"
+                label, quality = "Squeeze puro", "low"
         elif price_up and not oi_up and not oi_dn:
-            label, direction, quality = "Short covering puro", "bullish", "low"
+            label, direction, quality = "Short covering (OI plano)", "bullish", "low"
         elif price_up and oi_dn:
-            label, direction, quality = "Distribución arriba", "neutral", "low"
+            label, direction, quality = "Distribución arriba (OI cae)", "neutral", "low"
         elif price_dn and oi_up:
             direction = "bearish"
             if ratio is not None and ratio < 1:
                 label, quality = "Distribución real", "high"
             elif ratio is not None and ratio < 2:
-                label, quality = "Nuevos shorts", "medium"
+                label, quality = "Balanceado (shorts mixto)", "medium"
             elif ratio is not None and ratio < 5:
-                label, quality = "Long liquidation + shorts", "medium"
+                label, quality = "Liquidation dominante", "low"
             else:
-                label, quality = "Long squeeze", "low"
+                label, quality = "Long squeeze puro", "low"
         elif price_dn and not oi_up and not oi_dn:
-            label, direction, quality = "Longs cerrando", "bearish", "low"
+            label, direction, quality = "Long cerrando (OI plano)", "bearish", "low"
         elif price_dn and oi_dn:
             label, direction, quality = "Long capitulation", "bearish", "high"
         elif not price_up and not price_dn:

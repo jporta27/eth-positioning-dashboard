@@ -493,20 +493,20 @@ def compute_money_quality(oi_hist: list, perp_flow: dict, funding_rate: Optional
                 label = "Acumulación real"
                 quality = "high"
             elif ratio is not None and ratio < 2:
-                label = "Nuevos longs"
+                label = "Balanceado (longs mixto)"
                 quality = "medium"
             elif ratio is not None and ratio < 5:
-                label = "Short covering + longs"
-                quality = "medium"
+                label = "Covering dominante"
+                quality = "low"
             else:
-                label = "Short squeeze"
+                label = "Squeeze puro"
                 quality = "low"
         elif price_up and not oi_up and not oi_dn:
-            label = "Short covering puro"
+            label = "Short covering (OI plano)"
             direction = "bullish"
             quality = "low"
         elif price_up and oi_dn:
-            label = "Distribución arriba"
+            label = "Distribución arriba (OI cae)"
             direction = "neutral"
             quality = "low"
         elif price_dn and oi_up:
@@ -515,16 +515,16 @@ def compute_money_quality(oi_hist: list, perp_flow: dict, funding_rate: Optional
                 label = "Distribución real"
                 quality = "high"
             elif ratio is not None and ratio < 2:
-                label = "Nuevos shorts"
+                label = "Balanceado (shorts mixto)"
                 quality = "medium"
             elif ratio is not None and ratio < 5:
-                label = "Long liquidation + shorts"
-                quality = "medium"
+                label = "Liquidation dominante"
+                quality = "low"
             else:
-                label = "Long squeeze"
+                label = "Long squeeze puro"
                 quality = "low"
         elif price_dn and not oi_up and not oi_dn:
-            label = "Longs cerrando"
+            label = "Long cerrando (OI plano)"
             direction = "bearish"
             quality = "low"
         elif price_dn and oi_dn:
