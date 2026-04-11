@@ -1133,6 +1133,375 @@ function MoneyQualityPanel({ moneyQuality }) {
   )
 }
 
+// ── Setup Detector (stoch alignment + threshold breach + MQ filter) ────
+// Map each stoch TF to its most relevant MQ window
+const STOCH_TO_MQ_WINDOW = { '1m': '1h', '5m': '1h', '15m': '1h', '1h': '4h', '4h': '12h' }
+
+/**
+ * Analyze stochastic setup per TF according to user's strategy:
+ *  - Slow %K + %D both in same extreme zone (OB ≥80 or OS ≤20)
+ *  - Fast %K + %D both in same zone (persistence ≥2 bars)
+ *  - Trigger: Fast %K crosses the threshold (exits the zone)
+ *  - Filter: MQ must not be in "real accumulation/distribution" same side
+ */
+function analyzeSetup(stochData, mqInfo) {
+  if (!stochData || !stochData.slow || !stochData.fast) return null
+  const slow = stochData.slow
+  const fast = stochData.fast
+  if (slow.k == null || slow.d == null || fast.k == null || fast.d == null) return null
+
+  const slowOB = slow.k >= 80 && slow.d >= 80
+  const slowOS = slow.k <= 20 && slow.d <= 20
+  const fastOB = fast.k >= 80 && fast.d >= 80
+  const fastOS = fast.k <= 20 && fast.d <= 20
+  const slowCerca80 = slow.k >= 75                // strict confirmation band
+  const slowCerca20 = slow.k <= 25
+
+  const fkh = (fast.kHistory || []).filter(v => v != null)
+  const kPrev = fkh.length >= 2 ? fkh[fkh.length - 2] : null
+  const kPrev2 = fkh.length >= 3 ? fkh[fkh.length - 3] : null
+  const kNow = fast.k
+
+  // Persistence: fast %K was in zone for ≥2 consecutive previous bars
+  const persistOB = kPrev != null && kPrev2 != null && kPrev >= 80 && kPrev2 >= 80
+  const persistOS = kPrev != null && kPrev2 != null && kPrev <= 20 && kPrev2 <= 20
+
+  // Cross detection on %K (threshold breach) — trigger condition
+  const justCrossedDown80 = kPrev != null && kPrev >= 80 && kNow < 80
+  const justCrossedDown75 = kPrev != null && kPrev >= 75 && kNow < 75
+  const justCrossedUp20   = kPrev != null && kPrev <= 20 && kNow > 20
+  const justCrossedUp25   = kPrev != null && kPrev <= 25 && kNow > 25
+
+  // Determine setup state and direction
+  let state = 'INACTIVE'
+  let direction = null
+  let trigger = null  // 'standard' (80/20) | 'strict' (75/25) | null
+
+  // SHORT setup: slow OB + fast OB (armed) + possible trigger
+  if (slowOB && fastOB) {
+    direction = 'short'
+    // still fully inside zone, waiting for cross
+    state = 'ARMED'
+    if (justCrossedDown80) { state = 'TRIGGERED'; trigger = 'standard' }
+    else if (justCrossedDown75) { state = 'TRIGGERED'; trigger = 'strict' }
+  }
+  // Fast just left OB but slow still OB (trigger moment even if fast<80 now)
+  else if (slowOB && persistOB && kPrev >= 80 && kNow < 80) {
+    direction = 'short'
+    state = 'TRIGGERED'
+    trigger = kNow < 75 ? 'strict' : 'standard'
+  }
+  // Fast already well below 80 — late entry
+  else if ((slowOB || slowCerca80) && kPrev != null && kPrev < 80 && kNow < 70 && persistOB) {
+    direction = 'short'
+    state = 'LATE'
+  }
+  // LONG setup: slow OS + fast OS
+  else if (slowOS && fastOS) {
+    direction = 'long'
+    state = 'ARMED'
+    if (justCrossedUp20) { state = 'TRIGGERED'; trigger = 'standard' }
+    else if (justCrossedUp25) { state = 'TRIGGERED'; trigger = 'strict' }
+  }
+  else if (slowOS && persistOS && kPrev <= 20 && kNow > 20) {
+    direction = 'long'
+    state = 'TRIGGERED'
+    trigger = kNow > 25 ? 'strict' : 'standard'
+  }
+  else if ((slowOS || slowCerca20) && kPrev != null && kPrev > 20 && kNow > 30 && persistOS) {
+    direction = 'long'
+    state = 'LATE'
+  }
+
+  // ── Apply MQ filter ──────────────────────────────────────────────
+  let quality = null       // 'A' | 'A+' | 'A++' | 'BLOCKED' | null
+  let blockedReason = null
+  let qualityNote = null
+
+  if (direction && (state === 'ARMED' || state === 'TRIGGERED')) {
+    quality = 'A'  // default if no MQ info or neutral
+    if (mqInfo) {
+      const r = mqInfo.ratio
+      const mqDir = mqInfo.direction
+      // Tesis: ratio <1 en dirección del precio = tendencia confirmada = NO OPERAR reversión
+      if (direction === 'short' && r != null && r < 1 && mqDir === 'bullish') {
+        quality = 'BLOCKED'
+        blockedReason = `Acumulación real (ratio ${r.toFixed(2)}) — tendencia alcista confirmada`
+      } else if (direction === 'long' && r != null && r < 1 && mqDir === 'bearish') {
+        quality = 'BLOCKED'
+        blockedReason = `Distribución real (ratio ${r.toFixed(2)}) — tendencia bajista confirmada`
+      }
+      // Upgrade: ratio >2 contrario = covering/liquidation dominante = reversión más confiable
+      else if (direction === 'short' && r != null && r >= 2 && mqDir === 'bullish') {
+        quality = r >= 5 ? 'A++' : 'A+'
+        qualityNote = r >= 5
+          ? `Squeeze puro (ratio ${r.toFixed(2)}) — rally sin combustible`
+          : `Covering dominante (ratio ${r.toFixed(2)}) — rally débil`
+      } else if (direction === 'long' && r != null && r >= 2 && mqDir === 'bearish') {
+        quality = r >= 5 ? 'A++' : 'A+'
+        qualityNote = r >= 5
+          ? `Long squeeze puro (ratio ${r.toFixed(2)}) — caída sin combustible`
+          : `Liquidation dominante (ratio ${r.toFixed(2)}) — caída débil`
+      } else if (r != null && r >= 1 && r < 2) {
+        qualityNote = `Balanceado (ratio ${r.toFixed(2)}) — setup estándar`
+      }
+    }
+  }
+
+  return {
+    state,
+    direction,
+    trigger,
+    quality,
+    slowK: slow.k, slowD: slow.d, fastK: fast.k, fastD: fast.d,
+    fastKPrev: kPrev,
+    slowOB, slowOS, fastOB, fastOS,
+    persistOB, persistOS,
+    mqRatio: mqInfo?.ratio ?? null,
+    mqLabel: mqInfo?.label ?? null,
+    mqDirection: mqInfo?.direction ?? null,
+    mqQuality: mqInfo?.quality ?? null,
+    blockedReason,
+    qualityNote,
+  }
+}
+
+function SetupPanel({ stochastics, moneyQuality, stochTf, setStochTf }) {
+  const timeframes = ['1m', '5m', '15m', '1h', '4h']
+  const mqByWindow = (moneyQuality || {}).byWindow || {}
+
+  // Analyze all TFs
+  const analysisByTf = {}
+  timeframes.forEach(tf => {
+    const mqKey = STOCH_TO_MQ_WINDOW[tf] || '4h'
+    const mqInfo = mqByWindow[mqKey]
+    analysisByTf[tf] = analyzeSetup((stochastics || {})[tf], mqInfo)
+  })
+
+  const current = analysisByTf[stochTf]
+
+  const stateLabel = {
+    'INACTIVE':  'Sin setup',
+    'ARMED':     'ARMADO — esperando trigger',
+    'TRIGGERED': 'DISPARADO — entrada ahora',
+    'LATE':      'TARDE — cruce ya pasó',
+  }
+
+  const dirColor = (d) => d === 'short' ? '#ef4444' : d === 'long' ? '#22c55e' : '#6a7aa0'
+  const dirLabel = (d) => d === 'short' ? 'SHORT' : d === 'long' ? 'LONG' : '—'
+
+  const stateColor = (st) => {
+    if (st === 'TRIGGERED') return '#22c55e'
+    if (st === 'ARMED') return '#f59e0b'
+    if (st === 'LATE') return '#6a7aa0'
+    return '#4a5980'
+  }
+
+  const qualityBadge = (q) => {
+    if (q === 'A++')     return { text: 'A++', color: '#22c55e', bg: 'rgba(34,197,94,0.15)' }
+    if (q === 'A+')      return { text: 'A+',  color: '#86efac', bg: 'rgba(34,197,94,0.10)' }
+    if (q === 'A')       return { text: 'A',   color: '#fbbf24', bg: 'rgba(251,191,36,0.10)' }
+    if (q === 'BLOCKED') return { text: '✗ BLOQUEADO', color: '#ef4444', bg: 'rgba(239,68,68,0.12)' }
+    return { text: '—', color: '#4a5980', bg: 'transparent' }
+  }
+
+  // Action text based on state
+  const getActionText = (a) => {
+    if (!a || a.state === 'INACTIVE') return 'Sin acción — esperar setup'
+    if (a.quality === 'BLOCKED') return `NO OPERAR — ${a.blockedReason}`
+    if (a.state === 'ARMED') {
+      if (a.direction === 'short') return `Esperar Fast %K cruce <80 (trigger 75 estricto) · ahora en ${a.fastK.toFixed(1)}`
+      return `Esperar Fast %K cruce >20 (trigger 25 estricto) · ahora en ${a.fastK.toFixed(1)}`
+    }
+    if (a.state === 'TRIGGERED') {
+      const trig = a.trigger === 'strict' ? 'estricto (75/25)' : 'estándar (80/20)'
+      if (a.direction === 'short') return `🔴 ENTRAR SHORT AHORA — trigger ${trig} · Fast %K=${a.fastK.toFixed(1)}`
+      return `🟢 ENTRAR LONG AHORA — trigger ${trig} · Fast %K=${a.fastK.toFixed(1)}`
+    }
+    if (a.state === 'LATE') return `Setup ${dirLabel(a.direction)} activo hace varias velas — esperar próximo ciclo`
+    return '—'
+  }
+
+  const pillForTf = (tf) => {
+    const a = analysisByTf[tf]
+    if (!a || a.state === 'INACTIVE') {
+      return { color: '#4a5980', bg: '#0a1020', text: '○' }
+    }
+    if (a.quality === 'BLOCKED') {
+      return { color: '#ef4444', bg: 'rgba(239,68,68,0.10)', text: '✗' }
+    }
+    if (a.state === 'TRIGGERED') {
+      return { color: dirColor(a.direction), bg: `${dirColor(a.direction)}22`, text: a.direction === 'short' ? '▼' : '▲' }
+    }
+    if (a.state === 'ARMED') {
+      return { color: '#f59e0b', bg: 'rgba(245,158,11,0.10)', text: '●' }
+    }
+    if (a.state === 'LATE') {
+      return { color: '#6a7aa0', bg: '#0a1020', text: '~' }
+    }
+    return { color: '#4a5980', bg: '#0a1020', text: '○' }
+  }
+
+  // Aligned TFs (triggered or armed in same direction as current)
+  const aligned = timeframes.filter(tf => {
+    const a = analysisByTf[tf]
+    return a && current && a.direction === current.direction && (a.state === 'ARMED' || a.state === 'TRIGGERED') && a.quality !== 'BLOCKED'
+  })
+
+  const qb = qualityBadge(current?.quality)
+  const activeStateColor = current ? stateColor(current.state) : '#4a5980'
+
+  return (
+    <div>
+      <div style={{ ...S.sectionTitle, marginBottom: 10, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span>SETUP DEL MOMENTO · Stoch Alignment + MQ Filter</span>
+        <span style={{
+          fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 4,
+          color: qb.color, background: qb.bg, letterSpacing: 0.5,
+        }}>{qb.text}</span>
+      </div>
+
+      {/* TF selector row */}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+        <span style={{ ...S.label, marginRight: 4 }}>TF</span>
+        {timeframes.map(tf => {
+          const p = pillForTf(tf)
+          const isSelected = tf === stochTf
+          return (
+            <button key={tf} onClick={() => setStochTf && setStochTf(tf)} style={{
+              padding: '3px 9px', borderRadius: 5,
+              border: `1px solid ${isSelected ? '#38bdf8' : '#1a2544'}`,
+              background: isSelected ? '#081624' : p.bg,
+              color: isSelected ? '#38bdf8' : p.color,
+              fontSize: 11, fontWeight: 700, cursor: 'pointer',
+              display: 'flex', gap: 5, alignItems: 'center',
+              ...S.mono,
+            }}>
+              <span>{tf}</span>
+              <span style={{ fontSize: 10 }}>{p.text}</span>
+            </button>
+          )
+        })}
+        <span style={{ ...S.label, marginLeft: 8, color: '#6a7aa0', fontSize: 9 }}>
+          ● ARMED · ▼ SHORT · ▲ LONG · ✗ BLOQUEADO · ~ TARDE · ○ inactivo
+        </span>
+      </div>
+
+      {current ? (
+        <div style={{
+          padding: 14, borderRadius: 8,
+          border: `1px solid ${activeStateColor}66`,
+          background: `${activeStateColor}0c`,
+          marginBottom: 10,
+        }}>
+          {/* Top: direction + state */}
+          <div style={{ display: 'flex', gap: 14, marginBottom: 10, alignItems: 'center' }}>
+            <div>
+              <div style={S.label}>DIRECCIÓN</div>
+              <div style={{
+                fontSize: 16, fontWeight: 700, color: dirColor(current.direction), ...S.mono,
+              }}>
+                {current.direction ? (current.direction === 'short' ? '🔴 SHORT' : '🟢 LONG') : '—'}
+              </div>
+            </div>
+            <div style={{ borderLeft: '1px solid #1a2544', paddingLeft: 14 }}>
+              <div style={S.label}>ESTADO</div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: activeStateColor, ...S.mono }}>
+                {stateLabel[current.state] || '—'}
+              </div>
+            </div>
+          </div>
+
+          {/* Middle: stoch details */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 10 }}>
+            <div style={{ padding: 8, background: '#0a1020', borderRadius: 5 }}>
+              <div style={{ ...S.label, fontSize: 9, marginBottom: 3 }}>SLOW (400,40,10)</div>
+              <div style={{ ...S.mono, fontSize: 12, color: '#e2e8f0' }}>
+                K <b style={{ color: current.slowOB ? '#ef4444' : current.slowOS ? '#22c55e' : '#8a9ac0' }}>{current.slowK.toFixed(1)}</b>
+                {' · '}
+                D <b style={{ color: current.slowOB ? '#ef4444' : current.slowOS ? '#22c55e' : '#8a9ac0' }}>{current.slowD.toFixed(1)}</b>
+              </div>
+              <div style={{ fontSize: 9, color: '#5a6a8a', marginTop: 2 }}>
+                {current.slowOB ? '✓ OB (régimen alcista agotado)' : current.slowOS ? '✓ OS (régimen bajista agotado)' : 'Neutral — sin régimen extremo'}
+              </div>
+            </div>
+            <div style={{ padding: 8, background: '#0a1020', borderRadius: 5 }}>
+              <div style={{ ...S.label, fontSize: 9, marginBottom: 3 }}>FAST (100,10,4)</div>
+              <div style={{ ...S.mono, fontSize: 12, color: '#e2e8f0' }}>
+                K <b style={{ color: current.fastOB ? '#ef4444' : current.fastOS ? '#22c55e' : '#8a9ac0' }}>{current.fastK.toFixed(1)}</b>
+                {' · '}
+                D <b style={{ color: current.fastOB ? '#ef4444' : current.fastOS ? '#22c55e' : '#8a9ac0' }}>{current.fastD.toFixed(1)}</b>
+                {current.fastKPrev != null && (
+                  <span style={{ fontSize: 9, color: '#5a6a8a' }}> (prev {current.fastKPrev.toFixed(1)})</span>
+                )}
+              </div>
+              <div style={{ fontSize: 9, color: '#5a6a8a', marginTop: 2 }}>
+                {current.fastOB && current.persistOB ? '✓ OB persistente (≥2 velas)' :
+                 current.fastOS && current.persistOS ? '✓ OS persistente (≥2 velas)' :
+                 current.fastOB ? 'OB reciente (persistencia insuficiente)' :
+                 current.fastOS ? 'OS reciente (persistencia insuficiente)' : 'Neutral'}
+              </div>
+            </div>
+          </div>
+
+          {/* MQ filter row */}
+          {current.mqLabel && (
+            <div style={{
+              padding: '6px 10px',
+              background: current.quality === 'BLOCKED' ? 'rgba(239,68,68,0.08)' : '#0a1020',
+              borderRadius: 5,
+              borderLeft: `3px solid ${current.quality === 'BLOCKED' ? '#ef4444' : current.quality === 'A+' || current.quality === 'A++' ? '#22c55e' : '#8a9ac0'}`,
+              marginBottom: 10,
+            }}>
+              <div style={{ fontSize: 9, color: '#5a6a8a', marginBottom: 2 }}>
+                FILTRO MQ ({STOCH_TO_MQ_WINDOW[stochTf] || '4h'})
+              </div>
+              <div style={{ fontSize: 11, color: '#e2e8f0', ...S.mono }}>
+                {current.mqLabel} · ratio {current.mqRatio != null ? current.mqRatio.toFixed(2) : '—'}
+              </div>
+              {(current.qualityNote || current.blockedReason) && (
+                <div style={{ fontSize: 9, color: current.quality === 'BLOCKED' ? '#fca5a5' : '#86efac', marginTop: 3 }}>
+                  → {current.blockedReason || current.qualityNote}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Action box */}
+          <div style={{
+            padding: '10px 12px',
+            background: activeStateColor === '#22c55e' ? 'rgba(34,197,94,0.08)' :
+                        activeStateColor === '#f59e0b' ? 'rgba(245,158,11,0.06)' : '#0a1020',
+            borderRadius: 5,
+            border: `1px dashed ${activeStateColor}55`,
+          }}>
+            <div style={{ fontSize: 9, color: '#5a6a8a', marginBottom: 3 }}>ACCIÓN</div>
+            <div style={{ fontSize: 12, fontWeight: 600, color: current.quality === 'BLOCKED' ? '#fca5a5' : '#e2e8f0', ...S.mono }}>
+              {getActionText(current)}
+            </div>
+            {aligned.length >= 2 && current.quality !== 'BLOCKED' && current.state !== 'INACTIVE' && (
+              <div style={{ fontSize: 10, color: '#86efac', marginTop: 4, fontWeight: 600 }}>
+                ⚡ Multi-TF alineado en {aligned.length} timeframes: {aligned.join(', ')}
+              </div>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div style={{
+          padding: 14, textAlign: 'center', color: '#4a5980', fontSize: 11,
+          background: '#0a1020', borderRadius: 6, marginBottom: 10,
+        }}>
+          Sin datos de estocásticos para {stochTf}
+        </div>
+      )}
+
+      <div style={{ padding: '6px 8px', background: '#0a1020', borderRadius: 5, fontSize: 9, color: '#5a6a8a', lineHeight: 1.5 }}>
+        <b style={{ color: '#8a9ac0' }}>Regla</b>: Slow (400,40,10) y Fast (100,10,4) ambos en mismo extremo (OB≥80 / OS≤20). <b>Trigger</b>: Fast %K cruza el umbral (sale de la zona). <b>Filtro MQ</b>: si ratio &lt;1 en la misma dirección del precio = NO operar (tendencia confirmada por plata nueva).
+      </div>
+    </div>
+  )
+}
+
 // ── Stochastic Oscillator Panel ───────────────────────────────────────
 function StochasticPanel({ stochastics, timeframe, setTimeframe }) {
   const timeframes = ['1m', '5m', '15m', '1h', '4h']
@@ -1974,13 +2343,13 @@ function computeSignals(data, period = '1h', stochTf = '1h') {
   //   swing (12h,1d): funding=ALTO, OI=ALTO, taker=MEDIO, L/S=ALTO, opciones=ALTO, ethbtc=MEDIO, VP=ALTO
   //   macro (15d):    funding=ALTO, OI=ALTO, taker=BAJO, opciones=ALTO, ethbtc=ALTO, ivrv=ALTO, VP=ALTO
   const W = {
-    '5m':  { funding: 0, oi: 0, oiPrice: 0, taker: 2, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 0, vp: 1, stoch: 1, mq: 1 },
-    '15m': { funding: 0, oi: 0, oiPrice: 0, taker: 2, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 0, vp: 1, stoch: 1, mq: 1 },
-    '1h':  { funding: 1, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 1, vp: 1, stoch: 1, mq: 2 },
-    '4h':  { funding: 1, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 0, ethBtc: 1, gamma: 1, vp: 1, stoch: 2, mq: 2 },
-    '12h': { funding: 2, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 1, ethBtc: 1, gamma: 1, vp: 1, stoch: 2, mq: 2 },
-    '1d':  { funding: 2, oi: 2, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 1, ethBtc: 1, gamma: 2, vp: 1, stoch: 2, mq: 1 },
-    '15d': { funding: 2, oi: 2, oiPrice: 1, taker: 0, ls: 1, vol: 1, ivRv: 2, ethBtc: 2, gamma: 2, vp: 1, stoch: 2, mq: 0 },
+    '5m':  { funding: 0, oi: 0, oiPrice: 0, taker: 2, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 0, vp: 1, stoch: 1, mq: 1, setup: 3 },
+    '15m': { funding: 0, oi: 0, oiPrice: 0, taker: 2, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 0, vp: 1, stoch: 1, mq: 1, setup: 3 },
+    '1h':  { funding: 1, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 1, vp: 1, stoch: 1, mq: 2, setup: 3 },
+    '4h':  { funding: 1, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 0, ethBtc: 1, gamma: 1, vp: 1, stoch: 2, mq: 2, setup: 4 },
+    '12h': { funding: 2, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 1, ethBtc: 1, gamma: 1, vp: 1, stoch: 2, mq: 2, setup: 3 },
+    '1d':  { funding: 2, oi: 2, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 1, ethBtc: 1, gamma: 2, vp: 1, stoch: 2, mq: 1, setup: 2 },
+    '15d': { funding: 2, oi: 2, oiPrice: 1, taker: 0, ls: 1, vol: 1, ivRv: 2, ethBtc: 2, gamma: 2, vp: 1, stoch: 2, mq: 0, setup: 0 },
   }
   const w = W[period] || W['1h']
 
@@ -2190,6 +2559,44 @@ function computeSignals(data, period = '1h', stochTf = '1h') {
     } else if (mq.verdict.startsWith('BAJISTA') && w.mq > 0) {
       states.push(`Plata nueva bearish (${mq.verdict})`)
       score -= 1
+    }
+  }
+
+  // ── 12. SETUP DETECTOR: stoch alignment + MQ regime filter (peso: w.setup) ──
+  // Implements user's strategy: slow+fast aligned in extreme + fast %K cross
+  // filtered by MQ (covering = valid reversion, accumulation = trend → blocked)
+  if (w.setup > 0 && data.stochastics) {
+    const mqWindowForStoch = STOCH_TO_MQ_WINDOW[stochTf] || '4h'
+    const mqForSetup = mqByWindow[mqWindowForStoch]
+    const setupAnalysis = analyzeSetup(data.stochastics[stochTf], mqForSetup)
+    if (setupAnalysis && setupAnalysis.direction && setupAnalysis.state !== 'INACTIVE') {
+      const qMult = {
+        'A++':     1.5,
+        'A+':      1.25,
+        'A':       1.0,
+        'BLOCKED': 0,
+      }[setupAnalysis.quality] || 0
+      const stateMult = {
+        'TRIGGERED': 1.0,
+        'ARMED':     0.6,   // esperando gatillo, peso reducido
+        'LATE':      0.2,
+      }[setupAnalysis.state] || 0
+      const basePoints = w.setup * qMult * stateMult
+      const points = Math.round(basePoints)
+
+      if (setupAnalysis.quality === 'BLOCKED') {
+        states.push(`Setup ${setupAnalysis.direction === 'short' ? 'SHORT' : 'LONG'} ${stochTf} BLOQUEADO — ${setupAnalysis.blockedReason}`)
+      } else if (points > 0) {
+        const tag = setupAnalysis.quality
+        const st = setupAnalysis.state === 'TRIGGERED' ? 'DISPARADO' : setupAnalysis.state === 'ARMED' ? 'ARMADO' : 'TARDE'
+        if (setupAnalysis.direction === 'short') {
+          states.push(`Setup SHORT ${tag} ${st} ${stochTf} (×${points})`)
+          score -= points
+        } else if (setupAnalysis.direction === 'long') {
+          states.push(`Setup LONG ${tag} ${st} ${stochTf} (×${points})`)
+          score += points
+        }
+      }
     }
   }
 
@@ -2446,6 +2853,16 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
       {/* MONEY QUALITY — Plata Nueva vs Short Covering */}
       <div style={{ ...S.card, marginBottom: 10 }}>
         <MoneyQualityPanel moneyQuality={data?.moneyQuality} />
+      </div>
+
+      {/* SETUP DEL MOMENTO — stoch alignment + MQ filter */}
+      <div style={{ ...S.card, marginBottom: 10 }}>
+        <SetupPanel
+          stochastics={data?.stochastics}
+          moneyQuality={data?.moneyQuality}
+          stochTf={stochTf}
+          setStochTf={setStochTf}
+        />
       </div>
 
       {/* STOCHASTICS */}
