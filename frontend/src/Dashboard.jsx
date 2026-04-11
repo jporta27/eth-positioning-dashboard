@@ -1006,6 +1006,208 @@ function VolumeProfile({ data, dataByPeriod, currentPrice, period, setPeriod, po
   )
 }
 
+// ── CEX Netflows Panel (spot exchange pressure via Dune) ────────────
+function CexNetflowsPanel({ cexNetflows }) {
+  const cn = cexNetflows || {}
+  const aggs = cn.aggregates || {}
+  const byEx = cn.byExchange24h || []
+  const hourly = cn.hourly || []
+  const bias = cn.bias || 'NEUTRAL'
+  const lastUpdate = cn.lastUpdate
+
+  const hasData = byEx.length > 0 && Object.keys(aggs).length > 0
+
+  // Bias styling
+  const biasMeta = {
+    BULLISH:      { label: 'BULLISH',       color: '#22c55e', bg: 'rgba(34,197,94,0.12)',  desc: 'Salida fuerte de ETH de exchanges → presión de retiro / HODL' },
+    BULLISH_MILD: { label: 'BULLISH MILD',  color: '#86efac', bg: 'rgba(34,197,94,0.08)',  desc: 'Net withdrawal moderado · ligero sesgo comprador' },
+    NEUTRAL:      { label: 'NEUTRAL',       color: '#8a9ac0', bg: 'rgba(138,154,192,0.1)', desc: 'Flujos balanceados · sin presión clara' },
+    BEARISH_MILD: { label: 'BEARISH MILD',  color: '#fca5a5', bg: 'rgba(239,68,68,0.08)',  desc: 'Net deposit moderado · ligero sesgo vendedor' },
+    BEARISH:      { label: 'BEARISH',       color: '#ef4444', bg: 'rgba(239,68,68,0.12)',  desc: 'Entrada fuerte de ETH a exchanges → presión vendedora' },
+  }
+  const bm = biasMeta[bias] || biasMeta.NEUTRAL
+
+  // Color helper: negative net = bullish (green), positive = bearish (red)
+  const netColor = (v) => {
+    if (v == null) return '#8a9ac0'
+    if (v < 0) return '#22c55e'
+    if (v > 0) return '#ef4444'
+    return '#8a9ac0'
+  }
+
+  const fmtEth = (v) => {
+    if (v == null) return '—'
+    const abs = Math.abs(v)
+    const sign = v >= 0 ? '+' : '−'
+    if (abs >= 1e6) return `${sign}${(abs / 1e6).toFixed(2)}M ETH`
+    if (abs >= 1e3) return `${sign}${(abs / 1e3).toFixed(2)}k ETH`
+    return `${sign}${abs.toFixed(0)} ETH`
+  }
+  const fmtUsd = (v) => {
+    if (v == null) return '—'
+    const abs = Math.abs(v)
+    const sign = v >= 0 ? '+' : '−'
+    if (abs >= 1e9) return `${sign}$${(abs / 1e9).toFixed(2)}B`
+    if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(1)}M`
+    if (abs >= 1e3) return `${sign}$${(abs / 1e3).toFixed(0)}k`
+    return `${sign}$${abs.toFixed(0)}`
+  }
+
+  if (!hasData) {
+    return (
+      <div>
+        <div style={{ ...S.sectionTitle, marginBottom: 10 }}>EXCHANGE NETFLOWS · CEX Spot Pressure (vía Dune)</div>
+        <div style={{ padding: '14px 12px', background: '#0a1020', borderRadius: 6, fontSize: 11, color: '#5a6a8a', textAlign: 'center' }}>
+          Sin datos de Dune (revisar DUNE_API_KEY en backend/.env)
+        </div>
+      </div>
+    )
+  }
+
+  const net24h = aggs['24h']?.netInflowEth
+  const usd24h = aggs['24h']?.netInflowUsd
+  const windows = [
+    { k: '1h',  label: 'Última hora' },
+    { k: '6h',  label: 'Últimas 6h' },
+    { k: '24h', label: 'Últimas 24h' },
+    { k: '7d',  label: 'Últimos 7d' },
+  ]
+
+  // Max for top exchange row width scaling
+  const maxAbsNet = Math.max(...byEx.map(e => Math.abs(e.netInflowEth || 0)), 1)
+  const ageMin = lastUpdate ? Math.floor((Date.now() - lastUpdate) / 60000) : null
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+        <div style={S.sectionTitle}>EXCHANGE NETFLOWS · CEX Spot Pressure (vía Dune)</div>
+        <div style={{ fontSize: 9, color: '#4a5980', ...S.mono }}>
+          {cn.exchangeCount || 0} exchanges · update {ageMin != null ? `${ageMin}m` : '—'}
+        </div>
+      </div>
+
+      {/* Verdict + 24h headline */}
+      <div style={{
+        padding: '12px 14px',
+        marginBottom: 12,
+        borderRadius: 8,
+        background: bm.bg,
+        border: `1px solid ${bm.color}33`,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        flexWrap: 'wrap',
+        gap: 12,
+      }}>
+        <div>
+          <div style={{ fontSize: 10, color: '#5a6a8a', marginBottom: 4, letterSpacing: 1 }}>SESGO 24H</div>
+          <div style={{ fontSize: 16, fontWeight: 700, color: bm.color, ...S.mono }}>{bm.label}</div>
+          <div style={{ fontSize: 10, color: '#8a9ac0', marginTop: 2 }}>{bm.desc}</div>
+        </div>
+        <div style={{ textAlign: 'right' }}>
+          <div style={{ fontSize: 10, color: '#5a6a8a', marginBottom: 4, letterSpacing: 1 }}>NET INFLOW 24H</div>
+          <div style={{ fontSize: 22, fontWeight: 700, color: netColor(net24h), ...S.mono, lineHeight: 1.1 }}>
+            {fmtEth(net24h)}
+          </div>
+          <div style={{ fontSize: 11, color: netColor(usd24h), ...S.mono, marginTop: 2 }}>
+            {fmtUsd(usd24h)}
+          </div>
+        </div>
+      </div>
+
+      {/* Window grid */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+        gap: 6,
+        marginBottom: 12,
+      }}>
+        {windows.map(w => {
+          const a = aggs[w.k]
+          if (!a) return null
+          const netE = a.netInflowEth
+          return (
+            <div key={w.k} style={{
+              padding: '8px 10px',
+              borderRadius: 6,
+              border: `1px solid ${netColor(netE)}44`,
+              background: `${netColor(netE)}08`,
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: '#e2e8f0', ...S.mono }}>{w.k.toUpperCase()}</div>
+                <div style={{ fontSize: 8, color: '#4a5980' }}>{w.label}</div>
+              </div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: netColor(netE), ...S.mono }}>{fmtEth(netE)}</div>
+              <div style={{ fontSize: 9, color: netColor(a.netInflowUsd), ...S.mono, marginTop: 1 }}>{fmtUsd(a.netInflowUsd)}</div>
+              <div style={{ borderTop: '1px solid #1a2544', marginTop: 5, paddingTop: 4, display: 'flex', justifyContent: 'space-between', fontSize: 9 }}>
+                <span style={{ color: '#5a6a8a' }}>in <span style={{ color: '#fca5a5', ...S.mono }}>{(a.inflowEth / 1e3).toFixed(1)}k</span></span>
+                <span style={{ color: '#5a6a8a' }}>out <span style={{ color: '#86efac', ...S.mono }}>{(a.outflowEth / 1e3).toFixed(1)}k</span></span>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+
+      {/* 7-day hourly sparkline */}
+      {hourly.length >= 2 && (
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+            <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1 }}>NET INFLOW HORARIO · ÚLTIMOS 7D</div>
+            <div style={{ fontSize: 9, color: '#5a6a8a', ...S.mono }}>{hourly.length}h</div>
+          </div>
+          <Spark
+            data={hourly}
+            valueKey="netInflowEth"
+            height={60}
+            width={800}
+            showZero
+            color={netColor(net24h)}
+          />
+        </div>
+      )}
+
+      {/* Per-exchange ranking */}
+      <div>
+        <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 6 }}>RANKING POR EXCHANGE · 24H</div>
+        <div style={{ display: 'grid', gap: 4 }}>
+          {byEx.map(e => {
+            const widthPct = Math.min((Math.abs(e.netInflowEth || 0) / maxAbsNet) * 100, 100)
+            const c = netColor(e.netInflowEth)
+            return (
+              <div key={e.cex} style={{
+                display: 'grid',
+                gridTemplateColumns: '90px 1fr 110px 90px',
+                alignItems: 'center',
+                gap: 8,
+                padding: '4px 6px',
+                borderRadius: 4,
+                background: '#0a1020',
+              }}>
+                <div style={{ fontSize: 11, color: '#c8d6e5', fontWeight: 600, ...S.mono }}>{e.cex}</div>
+                <div style={{ height: 6, background: '#111a35', borderRadius: 3, overflow: 'hidden', position: 'relative' }}>
+                  <div style={{
+                    position: 'absolute', top: 0, left: 0,
+                    width: `${widthPct}%`, height: '100%',
+                    background: c, opacity: 0.6, borderRadius: 3, transition: 'width 0.6s',
+                  }} />
+                </div>
+                <div style={{ fontSize: 11, fontWeight: 700, color: c, ...S.mono, textAlign: 'right' }}>{fmtEth(e.netInflowEth)}</div>
+                <div style={{ fontSize: 10, color: c, ...S.mono, textAlign: 'right' }}>{fmtUsd(e.netInflowUsd)}</div>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+
+      <div style={{ marginTop: 10, padding: '6px 8px', background: '#0a1020', borderRadius: 5, fontSize: 9, color: '#5a6a8a', lineHeight: 1.5 }}>
+        <b style={{ color: '#8a9ac0' }}>Convención</b>: net inflow &gt; 0 → ETH entrando a CEX → presión vendedora (BEARISH).
+        Net inflow &lt; 0 → ETH saliendo a self-custody → HODL / acumulación (BULLISH).
+        Datos via Dune cex.flows · 9 CEX clasificados · refresh cada 30 min.
+      </div>
+    </div>
+  )
+}
+
 // ── Money Quality Panel (plata nueva vs short covering) ─────────────
 function MoneyQualityPanel({ moneyQuality }) {
   const mq = moneyQuality || {}
@@ -3115,6 +3317,11 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
       {/* MONEY QUALITY — Plata Nueva vs Short Covering */}
       <div style={{ ...S.card, marginBottom: 10 }}>
         <MoneyQualityPanel moneyQuality={data?.moneyQuality} />
+      </div>
+
+      {/* CEX NETFLOWS — spot exchange pressure via Dune Analytics */}
+      <div style={{ ...S.card, marginBottom: 10 }}>
+        <CexNetflowsPanel cexNetflows={data?.cexNetflows} />
       </div>
 
       {/* SETUP DEL MOMENTO — stoch alignment + MQ filter */}

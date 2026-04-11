@@ -22,6 +22,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
+# Minimal .env loader (no extra dep). Looks for .env next to this file.
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 # ── Config ────────────────────────────────────────────────────────────
 BINANCE_FAPI = "https://fapi.binance.com"
 BINANCE_SPOT = "https://api.binance.com"
@@ -37,12 +47,21 @@ DEPTH_CLUSTER_SIZE = 0.25  # group price levels into $0.25 buckets
 VOLATILITY_LOOKBACK_DAYS = 30  # for percentile calculation
 PORT = int(os.getenv("PORT", 8000))
 
+# Dune Analytics — ETH CEX netflows (query 6984181)
+DUNE_API_KEY = os.getenv("DUNE_API_KEY", "")
+DUNE_QUERY_ID = os.getenv("DUNE_QUERY_ID", "6984181")
+DUNE_CACHE_TTL = 1800  # 30 min — Dune query is hourly granularity
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dashboard")
 
 # ── Cache ─────────────────────────────────────────────────────────────
 cache: dict = {}
 cache_ts: float = 0
+
+# Dune cache (longer TTL — hourly query)
+dune_cache: dict = {}
+dune_cache_ts: float = 0
 
 # ── Order Book State ──────────────────────────────────────────────────
 current_depth: dict = {}
@@ -1178,6 +1197,163 @@ async def fetch_depth() -> dict:
     return current_depth
 
 
+async def fetch_dune_cex_netflows(client: httpx.AsyncClient) -> Optional[dict]:
+    """Fetch ETH CEX netflows from Dune Analytics (cached query result)."""
+    global dune_cache, dune_cache_ts
+    if not DUNE_API_KEY:
+        return None
+    now = time.time()
+    if dune_cache and (now - dune_cache_ts) < DUNE_CACHE_TTL:
+        return dune_cache
+    try:
+        url = f"https://api.dune.com/api/v1/query/{DUNE_QUERY_ID}/results"
+        resp = await client.get(
+            url,
+            headers={"X-DUNE-API-KEY": DUNE_API_KEY},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        dune_cache = data
+        dune_cache_ts = now
+        logger.info(f"Dune fetch ok: {data.get('result', {}).get('metadata', {}).get('row_count', 0)} rows")
+        return data
+    except Exception as e:
+        logger.warning(f"Dune fetch failed: {e}")
+        return None
+
+
+def process_dune_netflows(raw: Optional[dict], current_eth_price: Optional[float]) -> dict:
+    """Aggregate Dune CEX flows into 1h/6h/24h/7d windows + per-exchange + hourly time series.
+
+    Convention: net_inflow > 0 → exchange inventory growing → BEARISH (sell pressure).
+                net_inflow < 0 → exchange inventory shrinking → BULLISH (HODL/withdrawal).
+    USD lag: Dune's price join runs ~1h behind, so the freshest hour has null usd.
+    Falls back to net_eth × current spot price for those rows.
+    """
+    if not raw or not isinstance(raw, dict):
+        return {}
+    rows = (raw.get("result") or {}).get("rows") or []
+    if not rows:
+        return {}
+
+    px = float(current_eth_price or 0)
+
+    # Parse rows: convert hour string to UTC timestamp ms
+    parsed = []
+    for r in rows:
+        try:
+            hour_str = r.get("hour", "")
+            # format: "2026-04-04 21:00:00.000 UTC"
+            hour_clean = hour_str.replace(" UTC", "").split(".")[0]
+            dt = datetime.strptime(hour_clean, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            ts_ms = int(dt.timestamp() * 1000)
+            in_eth  = float(r.get("inflow_eth")  or 0)
+            out_eth = float(r.get("outflow_eth") or 0)
+            net_eth = float(r.get("net_inflow_eth") or 0)
+            net_usd_raw = r.get("net_inflow_usd")
+            if net_usd_raw is None:
+                net_usd = net_eth * px  # USD lag fallback
+            else:
+                net_usd = float(net_usd_raw)
+            parsed.append({
+                "ts": ts_ms,
+                "cex": r.get("cex_name", ""),
+                "in_eth": in_eth,
+                "out_eth": out_eth,
+                "net_eth": net_eth,
+                "net_usd": net_usd,
+                "tx": int(r.get("tx_count") or 0),
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    if not parsed:
+        return {}
+
+    HOUR_MS = 3600 * 1000
+    max_ts = max(p["ts"] for p in parsed)
+
+    # Aggregate by rolling windows (relative to most recent hour)
+    windows = {"1h": 1, "6h": 6, "24h": 24, "7d": 168}
+    aggregates = {}
+    for label, hours in windows.items():
+        cutoff = max_ts - (hours - 1) * HOUR_MS  # inclusive of last `hours` hours
+        subset = [p for p in parsed if p["ts"] >= cutoff]
+        in_eth_t  = sum(p["in_eth"]  for p in subset)
+        out_eth_t = sum(p["out_eth"] for p in subset)
+        net_eth_t = sum(p["net_eth"] for p in subset)
+        net_usd_t = sum(p["net_usd"] for p in subset)
+        tx_t      = sum(p["tx"] for p in subset)
+        aggregates[label] = {
+            "inflowEth":    round(in_eth_t,  2),
+            "outflowEth":   round(out_eth_t, 2),
+            "netInflowEth": round(net_eth_t, 2),
+            "netInflowUsd": round(net_usd_t, 2),
+            "txCount":      tx_t,
+        }
+
+    # Per-exchange breakdown over last 24h
+    cutoff_24h = max_ts - 23 * HOUR_MS
+    by_cex_dict: dict = {}
+    for p in parsed:
+        if p["ts"] < cutoff_24h:
+            continue
+        cex = p["cex"]
+        agg = by_cex_dict.setdefault(cex, {"in": 0.0, "out": 0.0, "net_eth": 0.0, "net_usd": 0.0, "tx": 0})
+        agg["in"]  += p["in_eth"]
+        agg["out"] += p["out_eth"]
+        agg["net_eth"] += p["net_eth"]
+        agg["net_usd"] += p["net_usd"]
+        agg["tx"]  += p["tx"]
+    by_exchange = []
+    for cex, vals in by_cex_dict.items():
+        by_exchange.append({
+            "cex": cex,
+            "inflowEth":    round(vals["in"],  2),
+            "outflowEth":   round(vals["out"], 2),
+            "netInflowEth": round(vals["net_eth"], 2),
+            "netInflowUsd": round(vals["net_usd"], 2),
+            "txCount":      vals["tx"],
+        })
+    by_exchange.sort(key=lambda x: x["netInflowEth"])  # most-negative (bullish) first
+
+    # Hourly series across all exchanges (last ~7d)
+    hourly_dict: dict = {}
+    for p in parsed:
+        slot = hourly_dict.setdefault(p["ts"], {"ts": p["ts"], "net_eth": 0.0, "net_usd": 0.0, "tx": 0})
+        slot["net_eth"] += p["net_eth"]
+        slot["net_usd"] += p["net_usd"]
+        slot["tx"] += p["tx"]
+    hourly = sorted(hourly_dict.values(), key=lambda x: x["ts"])
+    hourly_series = [
+        {"ts": h["ts"], "netInflowEth": round(h["net_eth"], 2), "netInflowUsd": round(h["net_usd"], 2), "txCount": h["tx"]}
+        for h in hourly
+    ]
+
+    # Bias on 24h
+    net_24h_eth = aggregates["24h"]["netInflowEth"]
+    if net_24h_eth < -2000:
+        bias = "BULLISH"     # heavy net withdrawal
+    elif net_24h_eth < -500:
+        bias = "BULLISH_MILD"
+    elif net_24h_eth > 2000:
+        bias = "BEARISH"     # heavy net deposit
+    elif net_24h_eth > 500:
+        bias = "BEARISH_MILD"
+    else:
+        bias = "NEUTRAL"
+
+    return {
+        "lastUpdate": max_ts,
+        "exchangeCount": len(set(p["cex"] for p in parsed)),
+        "aggregates": aggregates,
+        "byExchange24h": by_exchange,
+        "hourly": hourly_series,
+        "bias": bias,
+    }
+
+
 async def fetch_all_data() -> dict:
     """Fetch all positioning data from Binance + OKX."""
     global cache, cache_ts
@@ -1286,6 +1462,8 @@ async def fetch_all_data() -> dict:
             # 5m OI history for cut-anchored MQ on 1m/5m/15m TFs (~41h coverage)
             fetch_json(client, f"{BINANCE_FAPI}/futures/data/openInterestHist",
                        {"symbol": "ETHUSDT", "period": "5m", "limit": 500}),
+            # Dune Analytics — ETH CEX netflows (cached every 30 min)
+            fetch_dune_cex_netflows(client),
             return_exceptions=True,
         )
 
@@ -1307,6 +1485,7 @@ async def fetch_all_data() -> dict:
         ethbtc_ticker, bybit_oi_raw,                         # 34-35
         kl_1m, kl_15m, kl_4h_stoch, kl_5m_stoch,             # 36-39
         bn_oi_hist_5m,                                       # 40
+        dune_cex_raw,                                        # 41
     ) = results
 
     def safe_float(obj, key, default=None):
@@ -1874,6 +2053,10 @@ async def fetch_all_data() -> dict:
         "stochastics": stochastics_data,
         "moneyQuality": money_quality,
         "cutAnchoredMq": cut_anchored_mq,
+        "cexNetflows": process_dune_netflows(
+            dune_cex_raw if isinstance(dune_cex_raw, dict) else None,
+            current_price,
+        ),
     }
 
     cache = data

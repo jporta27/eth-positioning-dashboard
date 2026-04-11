@@ -2,7 +2,7 @@ node_modules/
 dist/
 __pycache__/
 *.pyc
-.env
+# .env is intentionally tracked — repo is private and keys are needed for backend to work
 .venv
 .DS_Store
 *Temp*
