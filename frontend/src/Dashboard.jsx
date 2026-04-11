@@ -816,8 +816,7 @@ function VolatilityPanel({ volatility }) {
 }
 
 // ── Volume Profile Summary ────────────────────────────────────────────
-function VolumeProfileSummary({ vp, vpByPeriod }) {
-  const [period, setPeriod] = useState('8d')
+function VolumeProfileSummary({ vp, vpByPeriod, period, setPeriod }) {
   const periods = ['4h', '12h', '24h', '7d', '8d', '30d', '45d']
   const periodLabels = { '4h': '4 horas', '12h': '12 horas', '24h': '24 horas', '7d': '7 días', '8d': '8 días (200h)', '30d': '30 días', '45d': '45 días' }
 
@@ -895,20 +894,32 @@ function VolumeProfileSummary({ vp, vpByPeriod }) {
 }
 
 // ── Volume Profile ───────────────────────────────────────────────────
-function VolumeProfile({ data, dataByPeriod, currentPrice }) {
-  const [period, setPeriod] = useState('8d')
+function VolumeProfile({ data, dataByPeriod, currentPrice, period, setPeriod, pocInfo, pocByPeriod }) {
   const periods = ['4h', '12h', '24h', '7d', '8d', '30d', '45d']
   const periodLabels = { '4h': '4 horas', '12h': '12 horas', '24h': '24 horas', '7d': '7 días', '8d': '8 días (200h)', '30d': '30 días', '45d': '45 días' }
 
   const activeData = period === '8d' ? data : (dataByPeriod || {})[period]
+  // Canonical POC/VAH/VAL from structured profile (same source as "Niveles Clave" panel)
+  const canonicalPoc = period === '8d' ? pocInfo : (pocByPeriod || {})[period]
+  const pocPrice = canonicalPoc?.poc?.price
+  const vahPrice = canonicalPoc?.vah
+  const valPrice = canonicalPoc?.val
 
   if (!activeData || activeData.length === 0) {
     return <div style={{ color: '#4a5980', fontSize: 11, padding: '20px 0', textAlign: 'center' }}>Calculando volume profile...</div>
   }
 
   const maxVol = Math.max(...activeData.map(d => d.vol), 1)
+  // Top 5 levels ranked by volume within this ±10% dataset (for S/R highlighting)
   const sortedByVol = [...activeData].sort((a, b) => b.vol - a.vol)
   const topLevels = new Set(sortedByVol.slice(0, 5).map(d => d.price))
+  // Find the chart-bucket closest to the canonical POC so we can pin it visually
+  let pocBucket = null
+  if (pocPrice != null && activeData.length) {
+    pocBucket = activeData.reduce((best, d) =>
+      Math.abs(d.price - pocPrice) < Math.abs(best.price - pocPrice) ? d : best
+    , activeData[0]).price
+  }
   const sorted = [...activeData].sort((a, b) => b.price - a.price)
 
   return (
@@ -928,31 +939,45 @@ function VolumeProfile({ data, dataByPeriod, currentPrice }) {
       </div>
 
       <div style={{ ...S.label, marginBottom: 8 }}>
-        Volume Profile ±10% — {periodLabels[period]} · Top 5 niveles marcados
+        Volume Profile ±10% — {periodLabels[period]}
+        {pocPrice != null && <span style={{ color: '#fbbf24', marginLeft: 8 }}>· POC: ${Number(pocPrice).toFixed(0)}</span>}
+        {vahPrice != null && valPrice != null && (
+          <span style={{ color: '#5a6a8a', marginLeft: 8 }}>
+            · VA: <span style={{ color: '#ef4444' }}>${Number(valPrice).toFixed(0)}</span> – <span style={{ color: '#22c55e' }}>${Number(vahPrice).toFixed(0)}</span>
+          </span>
+        )}
       </div>
       <div style={{ maxHeight: 480, overflowY: 'auto', paddingRight: 4 }}>
         {sorted.map(level => {
+          const isPoc = pocBucket != null && level.price === pocBucket
           const isTop = topLevels.has(level.price)
           const isCurrent = currentPrice && Math.abs(level.price - currentPrice) < 3
           const intensity = level.vol / maxVol
-          const barColor = isCurrent
-            ? '#38bdf8'
-            : isTop
-              ? `rgba(251, 191, 36, ${0.4 + intensity * 0.6})`
-              : `rgba(100, 116, 139, ${0.15 + intensity * 0.5})`
+          // Priority: POC > Current > Top
+          const barColor = isPoc
+            ? `rgba(251, 191, 36, ${0.5 + intensity * 0.5})`
+            : isCurrent
+              ? '#38bdf8'
+              : isTop
+                ? `rgba(251, 191, 36, ${0.25 + intensity * 0.4})`
+                : `rgba(100, 116, 139, ${0.15 + intensity * 0.5})`
+
+          const borderLeftColor = isPoc ? '#fbbf24' : isCurrent ? '#38bdf8' : isTop ? 'rgba(251, 191, 36, 0.5)' : 'transparent'
+          const borderLeftWidth = isPoc ? 4 : 3
 
           return (
             <div key={level.price} style={{
               display: 'flex', alignItems: 'center', gap: 6, padding: '1px 0',
-              borderLeft: isCurrent ? '3px solid #38bdf8' : isTop ? '3px solid #fbbf24' : '3px solid transparent',
-              paddingLeft: (isCurrent || isTop) ? 4 : 0,
+              borderLeft: `${borderLeftWidth}px solid ${borderLeftColor}`,
+              paddingLeft: (isCurrent || isTop || isPoc) ? 4 : 0,
+              background: isPoc ? 'rgba(251, 191, 36, 0.05)' : 'transparent',
             }}>
               <span style={{
                 ...S.mono, fontSize: 10, width: 62, textAlign: 'right', flexShrink: 0,
-                color: isCurrent ? '#38bdf8' : isTop ? '#fbbf24' : '#5a6a7a',
-                fontWeight: (isCurrent || isTop) ? 700 : 400,
+                color: isPoc ? '#fbbf24' : isCurrent ? '#38bdf8' : isTop ? '#d4a017' : '#5a6a7a',
+                fontWeight: (isCurrent || isTop || isPoc) ? 700 : 400,
               }}>
-                ${level.price.toFixed(0)}
+                ${level.price.toFixed(0)}{isPoc ? ' ◄' : ''}
               </span>
               <div style={{ flex: 1, height: 10, background: '#0a1020', borderRadius: 2, overflow: 'hidden', position: 'relative' }}>
                 <div style={{
@@ -963,7 +988,8 @@ function VolumeProfile({ data, dataByPeriod, currentPrice }) {
               </div>
               <span style={{
                 ...S.mono, fontSize: 9, width: 48, textAlign: 'right', flexShrink: 0,
-                color: isTop ? '#fbbf24' : '#3a4a6a',
+                color: isPoc ? '#fbbf24' : isTop ? '#d4a017' : '#3a4a6a',
+                fontWeight: isPoc ? 700 : 400,
               }}>
                 {level.vol >= 1000000 ? `${(level.vol / 1000000).toFixed(1)}M` : level.vol >= 1000 ? `${(level.vol / 1000).toFixed(0)}K` : level.vol.toFixed(0)}
               </span>
@@ -971,8 +997,9 @@ function VolumeProfile({ data, dataByPeriod, currentPrice }) {
           )
         })}
       </div>
-      <div style={{ marginTop: 8, display: 'flex', gap: 16, fontSize: 10, color: '#3a4a6a' }}>
-        <span style={{ color: '#fbbf24' }}>▌ Top 5 niveles de volumen (soporte/resistencia clave)</span>
+      <div style={{ marginTop: 8, display: 'flex', gap: 16, fontSize: 10, color: '#3a4a6a', flexWrap: 'wrap' }}>
+        <span style={{ color: '#fbbf24', fontWeight: 700 }}>◄ POC (máx volumen absoluto)</span>
+        <span style={{ color: '#d4a017' }}>▌ Top 5 niveles (S/R clave)</span>
         <span style={{ color: '#38bdf8' }}>▌ Precio actual</span>
       </div>
     </div>
@@ -1885,6 +1912,7 @@ function computeSignals(data, period = '1h') {
 // ── Main Dashboard ───────────────────────────────────────────────────
 export default function Dashboard({ data, depth, depthHistory, error, lastUpdate }) {
   const [statePeriod, setStatePeriod] = useState('1h')
+  const [vpPeriod, setVpPeriod] = useState('8d')
   const signals = useMemo(() => computeSignals(data, statePeriod), [data, statePeriod])
   const bn = data?.binance || {}
   const okx = data?.okx || {}
@@ -2400,7 +2428,12 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
         </div>
         <div style={S.card}>
           <div style={S.sectionTitle}>Volume Profile — Niveles Clave</div>
-          <VolumeProfileSummary vp={data?.volumeProfile} vpByPeriod={data?.volumeProfileByPeriod} />
+          <VolumeProfileSummary
+            vp={data?.volumeProfile}
+            vpByPeriod={data?.volumeProfileByPeriod}
+            period={vpPeriod}
+            setPeriod={setVpPeriod}
+          />
         </div>
       </div>
 
@@ -2419,7 +2452,15 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
       {/* VOLUME PROFILE */}
       <div style={{ ...S.card, marginTop: 10 }}>
         <div style={S.sectionTitle}>Volume Profile ±10%</div>
-        <VolumeProfile data={bn.volumeProfile} dataByPeriod={bn.volumeProfileByPeriod} currentPrice={bn.price} />
+        <VolumeProfile
+          data={bn.volumeProfile}
+          dataByPeriod={bn.volumeProfileByPeriod}
+          currentPrice={bn.price}
+          period={vpPeriod}
+          setPeriod={setVpPeriod}
+          pocInfo={data?.volumeProfile}
+          pocByPeriod={data?.volumeProfileByPeriod}
+        />
       </div>
 
       {/* INDICATOR EXPLANATIONS */}
