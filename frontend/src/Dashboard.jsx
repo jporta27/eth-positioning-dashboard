@@ -1006,6 +1006,133 @@ function VolumeProfile({ data, dataByPeriod, currentPrice, period, setPeriod, po
   )
 }
 
+// ── Money Quality Panel (plata nueva vs short covering) ─────────────
+function MoneyQualityPanel({ moneyQuality }) {
+  const mq = moneyQuality || {}
+  const byWindow = mq.byWindow || {}
+  const windows = ['1h', '4h', '12h', '24h']
+  const verdict = mq.verdict || '—'
+  const score = mq.score
+  const fundingCtx = mq.fundingContext
+
+  const verdictColor = (v) => {
+    if (!v) return '#6a7aa0'
+    if (v.startsWith('ALCISTA')) return '#22c55e'
+    if (v.startsWith('Alcista')) return '#86efac'
+    if (v.startsWith('BAJISTA')) return '#ef4444'
+    if (v.startsWith('Bajista')) return '#fca5a5'
+    return '#8a9ac0'
+  }
+  const dirColor = (d) => d === 'bullish' ? '#22c55e' : d === 'bearish' ? '#ef4444' : '#8a9ac0'
+  const qualityBadge = (q) => {
+    if (q === 'high')   return { text: 'ALTA',  color: '#22c55e', bg: 'rgba(34,197,94,0.12)' }
+    if (q === 'medium') return { text: 'MEDIA', color: '#f59e0b', bg: 'rgba(245,158,11,0.12)' }
+    return { text: 'BAJA', color: '#ef4444', bg: 'rgba(239,68,68,0.12)' }
+  }
+
+  const fmtPct = (v) => v == null ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`
+  const fmtRatio = (v) => v == null ? '—' : v.toFixed(2)
+  const fmtDelta = (v) => {
+    if (v == null) return '—'
+    const abs = Math.abs(v)
+    if (abs >= 1e6) return `${v >= 0 ? '+' : ''}${(v / 1e6).toFixed(2)}M`
+    if (abs >= 1e3) return `${v >= 0 ? '+' : ''}${(v / 1e3).toFixed(1)}k`
+    return `${v >= 0 ? '+' : ''}${v.toFixed(0)}`
+  }
+
+  return (
+    <div>
+      <div style={{ ...S.sectionTitle, marginBottom: 10 }}>CALIDAD DEL MOVIMIENTO · Plata Nueva vs Covering</div>
+
+      <div style={{
+        padding: '10px 12px',
+        marginBottom: 12,
+        borderRadius: 8,
+        background: 'rgba(15, 23, 42, 0.6)',
+        border: `1px solid ${verdictColor(verdict)}33`,
+      }}>
+        <div style={{ fontSize: 10, color: '#5a6a8a', marginBottom: 4, letterSpacing: 1 }}>VEREDICTO</div>
+        <div style={{ fontSize: 14, fontWeight: 700, color: verdictColor(verdict), ...S.mono, marginBottom: 4 }}>
+          {verdict} {score != null && <span style={{ fontSize: 11, color: '#6a7aa0', fontWeight: 400 }}>· score {score >= 0 ? '+' : ''}{score}</span>}
+        </div>
+        {fundingCtx && (
+          <div style={{ fontSize: 10, color: '#8a9ac0', marginTop: 3 }}>{fundingCtx}</div>
+        )}
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6 }}>
+        {windows.map(w => {
+          const info = byWindow[w]
+          if (!info) {
+            return (
+              <div key={w} style={{
+                padding: '8px 6px', borderRadius: 6, border: '1px solid #1a2544',
+                background: '#0a1020', textAlign: 'center', opacity: 0.4,
+              }}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: '#4a5980' }}>{w}</div>
+                <div style={{ fontSize: 9, color: '#4a5980', marginTop: 4 }}>sin datos</div>
+              </div>
+            )
+          }
+          const qb = qualityBadge(info.quality)
+          return (
+            <div key={w} style={{
+              padding: '8px 8px',
+              borderRadius: 6,
+              border: `1px solid ${dirColor(info.direction)}44`,
+              background: `${dirColor(info.direction)}08`,
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: '#e2e8f0', ...S.mono }}>{w}</div>
+                <div style={{
+                  fontSize: 8, fontWeight: 700, padding: '1px 5px', borderRadius: 3,
+                  color: qb.color, background: qb.bg, letterSpacing: 0.5,
+                }}>{qb.text}</div>
+              </div>
+
+              <div style={{ fontSize: 10, color: dirColor(info.direction), fontWeight: 600, marginBottom: 6, lineHeight: 1.2 }}>
+                {info.label}
+              </div>
+
+              <div style={{ borderTop: '1px solid #1a2544', paddingTop: 5, display: 'grid', gap: 2 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9 }}>
+                  <span style={{ color: '#5a6a8a' }}>ΔPx</span>
+                  <span style={{ ...S.mono, color: info.priceChgPct >= 0 ? '#86efac' : '#fca5a5' }}>{fmtPct(info.priceChgPct)}</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9 }}>
+                  <span style={{ color: '#5a6a8a' }}>ΔOI</span>
+                  <span style={{ ...S.mono, color: info.oiDeltaPct >= 0 ? '#86efac' : '#fca5a5' }}>{fmtPct(info.oiDeltaPct)}</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9 }}>
+                  <span style={{ color: '#5a6a8a' }}>OI Δ</span>
+                  <span style={{ ...S.mono, color: '#a8b5d1' }}>{fmtDelta(info.oiDelta)}</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9 }}>
+                  <span style={{ color: '#5a6a8a' }}>Ratio</span>
+                  <span style={{ ...S.mono, color: '#e2e8f0' }}>{fmtRatio(info.ratio)}</span>
+                </div>
+                {info.deltaVsVol != null && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9 }}>
+                    <span style={{ color: '#5a6a8a' }}>Δ/Vol</span>
+                    <span style={{ ...S.mono, color: Math.abs(info.deltaVsVol) > 15 ? '#f59e0b' : '#a8b5d1' }}>
+                      {info.deltaVsVol >= 0 ? '+' : ''}{info.deltaVsVol.toFixed(1)}%
+                    </span>
+                  </div>
+                )}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+
+      <div style={{ marginTop: 10, padding: '6px 8px', background: '#0a1020', borderRadius: 5, fontSize: 9, color: '#5a6a8a', lineHeight: 1.5 }}>
+        <b style={{ color: '#8a9ac0' }}>Ratio</b> = |ΔPrecio%| / |ΔOI%|. &lt;1 acumulación real · 1-2 balanceado · 2-5 covering dominante · &gt;5 squeeze puro.
+        <br /><b style={{ color: '#8a9ac0' }}>Δ/Vol</b> = delta taker / volumen total. &gt;15% = agresión extrema.
+      </div>
+    </div>
+  )
+}
+
 // ── Stochastic Oscillator Panel ───────────────────────────────────────
 function StochasticPanel({ stochastics, timeframe, setTimeframe }) {
   const timeframes = ['1m', '5m', '15m', '1h', '4h']
@@ -1847,13 +1974,13 @@ function computeSignals(data, period = '1h', stochTf = '1h') {
   //   swing (12h,1d): funding=ALTO, OI=ALTO, taker=MEDIO, L/S=ALTO, opciones=ALTO, ethbtc=MEDIO, VP=ALTO
   //   macro (15d):    funding=ALTO, OI=ALTO, taker=BAJO, opciones=ALTO, ethbtc=ALTO, ivrv=ALTO, VP=ALTO
   const W = {
-    '5m':  { funding: 0, oi: 0, oiPrice: 0, taker: 2, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 0, vp: 1, stoch: 1 },
-    '15m': { funding: 0, oi: 0, oiPrice: 0, taker: 2, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 0, vp: 1, stoch: 1 },
-    '1h':  { funding: 1, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 1, vp: 1, stoch: 1 },
-    '4h':  { funding: 1, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 0, ethBtc: 1, gamma: 1, vp: 1, stoch: 2 },
-    '12h': { funding: 2, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 1, ethBtc: 1, gamma: 1, vp: 1, stoch: 2 },
-    '1d':  { funding: 2, oi: 2, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 1, ethBtc: 1, gamma: 2, vp: 1, stoch: 2 },
-    '15d': { funding: 2, oi: 2, oiPrice: 1, taker: 0, ls: 1, vol: 1, ivRv: 2, ethBtc: 2, gamma: 2, vp: 1, stoch: 2 },
+    '5m':  { funding: 0, oi: 0, oiPrice: 0, taker: 2, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 0, vp: 1, stoch: 1, mq: 1 },
+    '15m': { funding: 0, oi: 0, oiPrice: 0, taker: 2, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 0, vp: 1, stoch: 1, mq: 1 },
+    '1h':  { funding: 1, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 0, ivRv: 0, ethBtc: 0, gamma: 1, vp: 1, stoch: 1, mq: 2 },
+    '4h':  { funding: 1, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 0, ethBtc: 1, gamma: 1, vp: 1, stoch: 2, mq: 2 },
+    '12h': { funding: 2, oi: 1, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 1, ethBtc: 1, gamma: 1, vp: 1, stoch: 2, mq: 2 },
+    '1d':  { funding: 2, oi: 2, oiPrice: 1, taker: 1, ls: 1, vol: 1, ivRv: 1, ethBtc: 1, gamma: 2, vp: 1, stoch: 2, mq: 1 },
+    '15d': { funding: 2, oi: 2, oiPrice: 1, taker: 0, ls: 1, vol: 1, ivRv: 2, ethBtc: 2, gamma: 2, vp: 1, stoch: 2, mq: 0 },
   }
   const w = W[period] || W['1h']
 
@@ -2026,6 +2153,43 @@ function computeSignals(data, period = '1h', stochTf = '1h') {
         states.push(`Fast Stoch cruzando a la baja en OB — timing techo (×${Math.ceil(w.stoch / 2)})`)
         score -= Math.ceil(w.stoch / 2)
       }
+    }
+  }
+
+  // ── 11. Money Quality: plata nueva vs short covering (peso: w.mq) ──
+  const mq = data.moneyQuality || {}
+  const mqByWindow = mq.byWindow || {}
+  // Map period to the most relevant MQ window
+  const mqPeriodMap = { '5m': '1h', '15m': '1h', '1h': '4h', '4h': '4h', '12h': '12h', '1d': '24h', '15d': '24h' }
+  const mqKey = mqPeriodMap[period] || '4h'
+  const mqInfo = mqByWindow[mqKey]
+  if (mqInfo && w.mq > 0) {
+    const qMult = { high: 1.0, medium: 0.5, low: 0.25 }[mqInfo.quality] || 0.25
+    const points = Math.max(1, Math.round(w.mq * qMult))
+    if (mqInfo.direction === 'bullish') {
+      states.push(`${mqInfo.label} ${mqKey} (×${points})`)
+      score += points
+    } else if (mqInfo.direction === 'bearish') {
+      states.push(`${mqInfo.label} ${mqKey} (×${points})`)
+      score -= points
+    }
+    // Divergence warning: price moving one way but quality is low (no new money)
+    if (mqInfo.quality === 'low' && Math.abs(mqInfo.priceChgPct) > 0.5) {
+      if (mqInfo.direction === 'bullish') {
+        states.push(`⚠ Rally sin combustible ${mqKey} (covering)`)
+      } else if (mqInfo.direction === 'bearish') {
+        states.push(`⚠ Caída sin combustible ${mqKey} (cierre)`)
+      }
+    }
+  }
+  // Verdict contextual (sin score, solo informativo si score ya es neutro)
+  if (mq.verdict && Math.abs(score) <= 1) {
+    if (mq.verdict.startsWith('ALCISTA') && w.mq > 0) {
+      states.push(`Plata nueva bullish (${mq.verdict})`)
+      score += 1
+    } else if (mq.verdict.startsWith('BAJISTA') && w.mq > 0) {
+      states.push(`Plata nueva bearish (${mq.verdict})`)
+      score -= 1
     }
   }
 
@@ -2278,6 +2442,11 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
           </div>
         )
       })()}
+
+      {/* MONEY QUALITY — Plata Nueva vs Short Covering */}
+      <div style={{ ...S.card, marginBottom: 10 }}>
+        <MoneyQualityPanel moneyQuality={data?.moneyQuality} />
+      </div>
 
       {/* STOCHASTICS */}
       <div style={{ ...S.card, marginBottom: 10 }}>

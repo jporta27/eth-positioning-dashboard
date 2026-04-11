@@ -425,6 +425,185 @@ def estimate_liquidation_map(oi_value: float, spot_price: float, funding_rate: f
     return clusters
 
 
+def compute_money_quality(oi_hist: list, perp_flow: dict, funding_rate: Optional[float] = None) -> dict:
+    """
+    Classify price movement quality by comparing price change vs OI change per window.
+    This distinguishes NEW MONEY entering from SHORT COVERING / ROTATION.
+
+    Logic (per window 1h / 4h / 12h / 24h):
+      - Price up  + OI up    → Nuevos longs entrando (nueva plata bullish)
+      - Price up  + OI flat  → Short covering puro (sin nueva plata)
+      - Price up  + OI down  → Cierre cruzado / distribución arriba
+      - Price dn  + OI up    → Nuevos shorts entrando (nueva plata bearish)
+      - Price dn  + OI flat  → Long liquidation light
+      - Price dn  + OI down  → Long capitulation (longs cerrando fuerte)
+
+    Ratio = |ΔPrice%| / |ΔOI%|
+      < 1   → Acumulación real (mucha plata nueva por poco movimiento)
+      1-2   → Movimiento balanceado
+      2-5   → Covering dominante (rally/drop de baja calidad)
+      > 5   → Squeeze puro (sin combustible nuevo)
+    """
+    if not oi_hist or len(oi_hist) < 2:
+        return {}
+
+    # oi_hist is hourly, newest last. Index -1 = now, -(n+1) = n hours ago.
+    current_oi = oi_hist[-1].get("oi")
+    if current_oi is None:
+        return {}
+
+    windows = {"1h": 1, "4h": 4, "12h": 12, "24h": 24}
+    by_window: dict = {}
+
+    for wname, hours in windows.items():
+        if len(oi_hist) <= hours:
+            continue
+        past_oi = oi_hist[-1 - hours].get("oi")
+        if past_oi is None or past_oi <= 0:
+            continue
+        oi_delta     = current_oi - past_oi
+        oi_delta_pct = (oi_delta / past_oi) * 100
+
+        flow = (perp_flow or {}).get(wname, {}) or {}
+        price_chg_pct = flow.get("priceChgPct")
+        delta_vs_vol  = flow.get("deltaVsVol")   # taker buy-sell delta as % of total vol
+        taker_ratio   = flow.get("ratio")
+
+        if price_chg_pct is None:
+            continue
+
+        # Ratio price/OI (absolute): how much price moved per unit of OI growth
+        ratio = None
+        if abs(oi_delta_pct) > 0.01:  # avoid division by near-zero
+            ratio = abs(price_chg_pct) / abs(oi_delta_pct)
+
+        # Classify
+        price_up = price_chg_pct > 0.05
+        price_dn = price_chg_pct < -0.05
+        oi_up    = oi_delta_pct >  0.10
+        oi_dn    = oi_delta_pct < -0.10
+
+        label = "Sin actividad"
+        direction = "neutral"   # "bullish" | "bearish" | "neutral"
+        quality = "low"          # "high" | "medium" | "low"
+
+        if price_up and oi_up:
+            direction = "bullish"
+            if ratio is not None and ratio < 1:
+                label = "Acumulación real"
+                quality = "high"
+            elif ratio is not None and ratio < 2:
+                label = "Nuevos longs"
+                quality = "medium"
+            elif ratio is not None and ratio < 5:
+                label = "Short covering + longs"
+                quality = "medium"
+            else:
+                label = "Short squeeze"
+                quality = "low"
+        elif price_up and not oi_up and not oi_dn:
+            label = "Short covering puro"
+            direction = "bullish"
+            quality = "low"
+        elif price_up and oi_dn:
+            label = "Distribución arriba"
+            direction = "neutral"
+            quality = "low"
+        elif price_dn and oi_up:
+            direction = "bearish"
+            if ratio is not None and ratio < 1:
+                label = "Distribución real"
+                quality = "high"
+            elif ratio is not None and ratio < 2:
+                label = "Nuevos shorts"
+                quality = "medium"
+            elif ratio is not None and ratio < 5:
+                label = "Long liquidation + shorts"
+                quality = "medium"
+            else:
+                label = "Long squeeze"
+                quality = "low"
+        elif price_dn and not oi_up and not oi_dn:
+            label = "Longs cerrando"
+            direction = "bearish"
+            quality = "low"
+        elif price_dn and oi_dn:
+            label = "Long capitulation"
+            direction = "bearish"
+            quality = "high"
+        elif not price_up and not price_dn:
+            if oi_up:
+                label = "Build-up (lateral)"
+                direction = "neutral"
+                quality = "medium"
+            elif oi_dn:
+                label = "Deleverage (lateral)"
+                direction = "neutral"
+                quality = "medium"
+            else:
+                label = "Sin actividad"
+                direction = "neutral"
+                quality = "low"
+
+        by_window[wname] = {
+            "oiDelta":      round(oi_delta, 2),
+            "oiDeltaPct":   round(oi_delta_pct, 3),
+            "priceChgPct":  round(price_chg_pct, 3),
+            "ratio":        round(ratio, 2) if ratio is not None else None,
+            "label":        label,
+            "direction":    direction,
+            "quality":      quality,
+            "deltaVsVol":   delta_vs_vol,
+            "takerRatio":   taker_ratio,
+        }
+
+    # ── Overall verdict weighted by window (shorter = more weight for timing) ──
+    weights = {"1h": 1.0, "4h": 2.0, "12h": 2.0, "24h": 1.5}
+    score = 0.0
+    total_w = 0.0
+    for w, info in by_window.items():
+        ww = weights.get(w, 1.0)
+        if info["direction"] == "bullish":
+            sign = 1
+        elif info["direction"] == "bearish":
+            sign = -1
+        else:
+            sign = 0
+        q_mult = {"high": 1.0, "medium": 0.6, "low": 0.3}.get(info["quality"], 0.3)
+        score   += sign * ww * q_mult
+        total_w += ww
+
+    norm_score = score / total_w if total_w > 0 else 0
+
+    if norm_score > 0.4:
+        verdict = "ALCISTA con plata nueva"
+    elif norm_score > 0.15:
+        verdict = "Alcista débil / covering"
+    elif norm_score < -0.4:
+        verdict = "BAJISTA con plata nueva"
+    elif norm_score < -0.15:
+        verdict = "Bajista débil / covering"
+    else:
+        verdict = "Lateral / rotación"
+
+    # Funding context: negative funding + rising price = short squeeze setup
+    funding_context = None
+    if funding_rate is not None:
+        if funding_rate < -0.00005:
+            funding_context = "Funding negativo — shorts cargados"
+        elif funding_rate > 0.00008:
+            funding_context = "Funding positivo — longs cargados"
+        else:
+            funding_context = "Funding neutro"
+
+    return {
+        "byWindow":       by_window,
+        "verdict":        verdict,
+        "score":          round(norm_score, 3),
+        "fundingContext": funding_context,
+    }
+
+
 def calculate_options_analytics(instruments: list, spot_price: float) -> dict:
     """
     Calculate GEX, gamma flip, call/put walls and max pain from Deribit ETH options.
@@ -1273,6 +1452,9 @@ async def fetch_all_data() -> dict:
     hl_oi_val = hl_oi or 0
     total_oi_usd = bn_oi_val + okx_oi_val + bybit_oi_val + hl_oi_val
 
+    # ── Money Quality: plata nueva vs short covering (OI vs Price) ──
+    money_quality = compute_money_quality(oi_hist, perp_flow, funding_rate=bn_fund_rate)
+
     # ── Stochastics multi-timeframe ──────────────────────────────────
     stochastics_data = compute_stochastics_multi({
         "1m":  kl_1m if isinstance(kl_1m, list) else [],
@@ -1395,6 +1577,7 @@ async def fetch_all_data() -> dict:
         "ivTermStructure": iv_term_structure,
         "liquidationMap": liq_map_data,
         "stochastics": stochastics_data,
+        "moneyQuality": money_quality,
     }
 
     cache = data
