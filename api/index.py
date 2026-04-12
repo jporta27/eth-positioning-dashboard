@@ -11,7 +11,7 @@ import statistics
 import asyncio
 import logging
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import httpx
 from fastapi import FastAPI
@@ -1112,13 +1112,14 @@ async def fetch_dune_cex_netflows(client: httpx.AsyncClient) -> Optional[dict]:
 
 
 async def fetch_defillama_reserves(client: httpx.AsyncClient) -> Optional[dict]:
-    """Fetch current ETH reserves (absolute stock) from DefiLlama CEX data."""
+    """Fetch current ETH reserves + historical averages from DefiLlama."""
     global llama_cache, llama_cache_ts
-    now = time.time()
-    if llama_cache and (now - llama_cache_ts) < DEFILLAMA_CACHE_TTL:
+    now_ts = time.time()
+    if llama_cache and (now_ts - llama_cache_ts) < DEFILLAMA_CACHE_TTL:
         return llama_cache
 
-    by_exchange = []
+    now_dt = datetime.now(timezone.utc)
+
     async def _fetch_one(name: str, slug: str) -> Optional[dict]:
         try:
             resp = await client.get(
@@ -1128,33 +1129,82 @@ async def fetch_defillama_reserves(client: httpx.AsyncClient) -> Optional[dict]:
             resp.raise_for_status()
             data = resp.json()
             tokens_arr = data.get("tokens", [])
-            if tokens_arr:
-                latest_tokens = tokens_arr[-1].get("tokens", {})
-                eth_sum = sum(
-                    v for k, v in latest_tokens.items()
-                    if k.upper() in DEFILLAMA_ETH_KEYS
-                )
-                return {"name": name, "ethReserve": round(eth_sum, 2)}
+            if not tokens_arr:
+                return None
+
+            latest_tokens = tokens_arr[-1].get("tokens", {})
+            current_eth = sum(
+                v for k, v in latest_tokens.items()
+                if k.upper() in DEFILLAMA_ETH_KEYS
+            )
+
+            daily: list = []
+            for entry in tokens_arr:
+                ts = entry.get("date", 0)
+                entry_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                age_days = (now_dt - entry_dt).days
+                if age_days <= 90:
+                    toks = entry.get("tokens", {})
+                    eth = sum(v for k, v in toks.items() if k.upper() in DEFILLAMA_ETH_KEYS)
+                    daily.append({"date": ts, "eth": eth, "age_days": age_days})
+
+            return {"name": name, "ethReserve": round(current_eth, 2), "daily": daily}
         except Exception as e:
             logger.warning(f"DefiLlama fetch failed for {name}: {e}")
         return None
 
     tasks = [_fetch_one(name, slug) for name, slug in DEFILLAMA_CEX_SLUGS.items()]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    by_exchange = [r for r in results if isinstance(r, dict)]
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+    exchange_results = [r for r in raw_results if isinstance(r, dict)]
 
-    if not by_exchange:
+    if not exchange_results:
         return None
 
+    by_exchange = [{"name": r["name"], "ethReserve": r["ethReserve"]} for r in exchange_results]
     total_eth = sum(ex["ethReserve"] for ex in by_exchange)
+
+    n_exchanges = len(exchange_results)
+    day_sums: dict = {}
+    for exr in exchange_results:
+        seen_dates: set = set()
+        for d in exr.get("daily", []):
+            date_str = datetime.fromtimestamp(d["date"], tz=timezone.utc).strftime("%Y-%m-%d")
+            if date_str in seen_dates:
+                continue
+            seen_dates.add(date_str)
+            if date_str not in day_sums:
+                day_sums[date_str] = {"total": 0.0, "n": 0}
+            day_sums[date_str]["total"] += d["eth"]
+            day_sums[date_str]["n"] += 1
+
+    min_exchanges = max(1, n_exchanges - 1)
+    complete_days = sorted(
+        [(dt_str, info["total"]) for dt_str, info in day_sums.items()
+         if info["n"] >= min_exchanges]
+    )
+
+    history: dict = {}
+    for window in (7, 30, 90):
+        cutoff_str = (now_dt - timedelta(days=window)).strftime("%Y-%m-%d")
+        subset = [eth for dt_str, eth in complete_days if dt_str >= cutoff_str]
+        if subset:
+            avg = sum(subset) / len(subset)
+            delta_pct = (total_eth - avg) / avg * 100 if avg > 0 else 0
+            history[f"{window}d"] = {
+                "avgEth": round(avg, 0),
+                "currentVsAvgPct": round(delta_pct, 2),
+                "samples": len(subset),
+            }
+
     result = {
         "totalEth": round(total_eth, 2),
         "byExchange": sorted(by_exchange, key=lambda x: -x["ethReserve"]),
-        "exchangeCount": len(by_exchange),
+        "exchangeCount": len(exchange_results),
+        "history": history,
     }
     llama_cache = result
-    llama_cache_ts = now
-    logger.info(f"DefiLlama reserves ok: {total_eth:,.0f} ETH across {len(by_exchange)} exchanges")
+    llama_cache_ts = now_ts
+    logger.info(f"DefiLlama reserves ok: {total_eth:,.0f} ETH across {len(exchange_results)} exchanges, history: {list(history.keys())}")
     return result
 
 
@@ -1373,6 +1423,7 @@ def process_dune_netflows(
             "flowAsReservesPct": round(abs(net_24h_eth) / reserves["totalEth"] * 100, 4)
                 if reserves and reserves.get("totalEth") and reserves["totalEth"] > 0 else None,
             "reservesByExchange": reserves.get("byExchange") if reserves else None,
+            "reservesHistory": reserves.get("history") if reserves else None,
         },
     }
 

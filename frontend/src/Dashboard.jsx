@@ -1221,15 +1221,33 @@ function CexNetflowsPanel({ cexNetflows }) {
             })()}
           </div>
 
-          {/* Reserves — absolute stock from DefiLlama */}
+          {/* Reserves — absolute stock from DefiLlama + historical trend */}
           <div style={{ padding: '8px 10px', borderRadius: 6, border: '1px solid #1a2544', background: '#0a1020' }}>
             <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 2 }}>OFERTA LIQUIDA CEX</div>
             <div style={{ fontSize: 16, fontWeight: 700, color: '#c8d6e5', ...S.mono }}>
               {rc.reservesTotalEth != null ? `${(rc.reservesTotalEth / 1e6).toFixed(2)}M` : '—'}
             </div>
-            <div style={{ fontSize: 9, color: '#5a6a8a', marginTop: 2 }}>
-              {rc.reservesExchangeCount ? `${rc.reservesExchangeCount} exchanges (DefiLlama)` : '—'}
-            </div>
+            {rc.reservesHistory && (
+              <div style={{ fontSize: 9, color: '#5a6a8a', marginTop: 3, lineHeight: 1.5 }}>
+                {['7d', '30d', '90d'].map(w => {
+                  const h = rc.reservesHistory[w]
+                  if (!h) return null
+                  const pct = h.currentVsAvgPct
+                  const color = pct < -2 ? '#86efac' : pct > 2 ? '#fca5a5' : '#5a6a8a'
+                  return <div key={w} style={{ display: 'flex', justifyContent: 'space-between', gap: 4 }}>
+                    <span>vs avg {w}:</span>
+                    <span style={{ color, fontWeight: 600, ...S.mono }}>
+                      {pct >= 0 ? '+' : ''}{pct.toFixed(1)}%
+                    </span>
+                  </div>
+                })}
+              </div>
+            )}
+            {!rc.reservesHistory && (
+              <div style={{ fontSize: 9, color: '#5a6a8a', marginTop: 2 }}>
+                {rc.reservesExchangeCount ? `${rc.reservesExchangeCount} exchanges` : '—'}
+              </div>
+            )}
           </div>
 
           {/* Flow as % of reserves */}
