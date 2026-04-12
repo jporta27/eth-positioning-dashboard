@@ -45,6 +45,19 @@ DUNE_QUERY_ID = os.getenv("DUNE_QUERY_ID", "6984181")
 DUNE_CACHE_TTL = 1800  # 30 min — Dune query is hourly granularity
 DUNE_MAX_AGE_HOURS = 2  # trigger re-execution if results older than this
 
+# DefiLlama — CEX ETH reserves (absolute stock)
+DEFILLAMA_CEX_SLUGS = {
+    "Binance":    "binance-cex",
+    "OKX":        "okx",
+    "Bybit":      "bybit",
+    "Bitfinex":   "bitfinex",
+    "KuCoin":     "kucoin",
+    "Gate.io":    "gate",
+    "Crypto.com": "crypto-com",
+}
+DEFILLAMA_CACHE_TTL = 3600  # 1h — reserves change slowly
+DEFILLAMA_ETH_KEYS = {"ETH", "WETH", "STETH", "BETH", "CBETH", "EETH", "WEETH", "RETH"}
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dashboard")
 
@@ -55,6 +68,8 @@ depth_cache: dict = {}
 depth_cache_ts: float = 0
 dune_cache: dict = {}
 dune_cache_ts: float = 0
+llama_cache: dict = {}
+llama_cache_ts: float = 0
 
 
 def cluster_levels(levels: list, cluster_size: float, side: str = "bid") -> list:
@@ -1096,11 +1111,59 @@ async def fetch_dune_cex_netflows(client: httpx.AsyncClient) -> Optional[dict]:
         return None
 
 
+async def fetch_defillama_reserves(client: httpx.AsyncClient) -> Optional[dict]:
+    """Fetch current ETH reserves (absolute stock) from DefiLlama CEX data."""
+    global llama_cache, llama_cache_ts
+    now = time.time()
+    if llama_cache and (now - llama_cache_ts) < DEFILLAMA_CACHE_TTL:
+        return llama_cache
+
+    by_exchange = []
+    async def _fetch_one(name: str, slug: str) -> Optional[dict]:
+        try:
+            resp = await client.get(
+                f"https://api.llama.fi/protocol/{slug}",
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            tokens_arr = data.get("tokens", [])
+            if tokens_arr:
+                latest_tokens = tokens_arr[-1].get("tokens", {})
+                eth_sum = sum(
+                    v for k, v in latest_tokens.items()
+                    if k.upper() in DEFILLAMA_ETH_KEYS
+                )
+                return {"name": name, "ethReserve": round(eth_sum, 2)}
+        except Exception as e:
+            logger.warning(f"DefiLlama fetch failed for {name}: {e}")
+        return None
+
+    tasks = [_fetch_one(name, slug) for name, slug in DEFILLAMA_CEX_SLUGS.items()]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    by_exchange = [r for r in results if isinstance(r, dict)]
+
+    if not by_exchange:
+        return None
+
+    total_eth = sum(ex["ethReserve"] for ex in by_exchange)
+    result = {
+        "totalEth": round(total_eth, 2),
+        "byExchange": sorted(by_exchange, key=lambda x: -x["ethReserve"]),
+        "exchangeCount": len(by_exchange),
+    }
+    llama_cache = result
+    llama_cache_ts = now
+    logger.info(f"DefiLlama reserves ok: {total_eth:,.0f} ETH across {len(by_exchange)} exchanges")
+    return result
+
+
 def process_dune_netflows(
     raw: Optional[dict],
     current_eth_price: Optional[float],
     spot_volume_usd_24h: Optional[float] = None,
     price_change_pct_24h: Optional[float] = None,
+    reserves: Optional[dict] = None,
 ) -> dict:
     """Aggregate Dune CEX flows into 1h/6h/24h/7d windows + per-exchange + hourly series,
     plus relative context (z-score, percentile, flow/vol ratio, flow-price divergence).
@@ -1304,6 +1367,12 @@ def process_dune_netflows(
             "spotVolumeUsd24h": round(spot_volume_usd_24h, 0) if spot_volume_usd_24h else None,
             "priceChangePct24h": round(price_change_pct_24h, 3) if price_change_pct_24h is not None else None,
             "divergence":     divergence,
+            # Reserves context (from DefiLlama)
+            "reservesTotalEth": reserves.get("totalEth") if reserves else None,
+            "reservesExchangeCount": reserves.get("exchangeCount") if reserves else None,
+            "flowAsReservesPct": round(abs(net_24h_eth) / reserves["totalEth"] * 100, 4)
+                if reserves and reserves.get("totalEth") and reserves["totalEth"] > 0 else None,
+            "reservesByExchange": reserves.get("byExchange") if reserves else None,
         },
     }
 
@@ -1400,6 +1469,8 @@ async def fetch_all_data() -> dict:
                        {"symbol": "ETHUSDT", "period": "5m", "limit": 500}),
             # Dune Analytics — ETH CEX netflows (cached every 30 min)
             fetch_dune_cex_netflows(client),
+            # DefiLlama — CEX ETH reserves / absolute stock (cached 1h)
+            fetch_defillama_reserves(client),
             return_exceptions=True,
         )
 
@@ -1422,6 +1493,7 @@ async def fetch_all_data() -> dict:
         kl_1m, kl_15m, kl_4h_stoch, kl_5m_stoch,
         bn_oi_hist_5m,
         dune_cex_raw,
+        defillama_reserves_raw,
     ) = results
 
     def safe_float(obj, key, default=None):
@@ -1956,6 +2028,7 @@ async def fetch_all_data() -> dict:
             current_price,
             spot_volume_usd_24h=vol_bn_spot if vol_bn_spot else None,
             price_change_pct_24h=safe_float(bn_ticker, "priceChangePercent"),
+            reserves=defillama_reserves_raw if isinstance(defillama_reserves_raw, dict) else None,
         ),
     }
 

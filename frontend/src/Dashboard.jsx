@@ -1153,7 +1153,7 @@ function CexNetflowsPanel({ cexNetflows }) {
         </div>
       </div>
 
-      {/* Contexto Relativo — 4 metrics to distinguish material from noise */}
+      {/* Contexto Relativo — 6 metrics to distinguish material from noise */}
       {(rc.zScore != null || rc.flowVolRatioPct != null || rc.divergence != null) && (
         <div style={{
           display: 'grid',
@@ -1219,6 +1219,33 @@ function CexNetflowsPanel({ cexNetflows }) {
                 </>
               )
             })()}
+          </div>
+
+          {/* Reserves — absolute stock from DefiLlama */}
+          <div style={{ padding: '8px 10px', borderRadius: 6, border: '1px solid #1a2544', background: '#0a1020' }}>
+            <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 2 }}>OFERTA LIQUIDA CEX</div>
+            <div style={{ fontSize: 16, fontWeight: 700, color: '#c8d6e5', ...S.mono }}>
+              {rc.reservesTotalEth != null ? `${(rc.reservesTotalEth / 1e6).toFixed(2)}M` : '—'}
+            </div>
+            <div style={{ fontSize: 9, color: '#5a6a8a', marginTop: 2 }}>
+              {rc.reservesExchangeCount ? `${rc.reservesExchangeCount} exchanges (DefiLlama)` : '—'}
+            </div>
+          </div>
+
+          {/* Flow as % of reserves */}
+          <div style={{ padding: '8px 10px', borderRadius: 6, border: '1px solid #1a2544', background: '#0a1020' }}>
+            <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 2 }}>FLOW / STOCK</div>
+            <div style={{ fontSize: 16, fontWeight: 700, ...S.mono,
+              color: rc.flowAsReservesPct == null ? '#c8d6e5'
+                : rc.flowAsReservesPct >= 0.5 ? '#f59e0b'
+                : rc.flowAsReservesPct >= 0.1 ? '#c8d6e5' : '#5a6a8a' }}>
+              {rc.flowAsReservesPct != null ? `${rc.flowAsReservesPct.toFixed(3)}%` : '—'}
+            </div>
+            <div style={{ fontSize: 9, color: '#5a6a8a', marginTop: 2 }}>
+              {rc.flowAsReservesPct == null ? '—'
+                : rc.flowAsReservesPct >= 0.5 ? 'significativo vs stock'
+                : rc.flowAsReservesPct >= 0.1 ? 'perceptible vs stock' : 'despreciable vs stock'}
+            </div>
           </div>
         </div>
       )}
@@ -1310,7 +1337,7 @@ function CexNetflowsPanel({ cexNetflows }) {
       <div style={{ marginTop: 10, padding: '6px 8px', background: '#0a1020', borderRadius: 5, fontSize: 9, color: '#5a6a8a', lineHeight: 1.5 }}>
         <b style={{ color: '#8a9ac0' }}>Lectura</b>: mide <i>cambios en la oferta líquida de ETH en CEX</i>, no ejecución. Un net inflow positivo significa que entra más ETH del que sale → crece el inventario disponible para venta → <i>presión vendedora POTENCIAL</i>. Un net inflow negativo significa retiro a self-custody → <i>presión compradora POTENCIAL</i> (HODL).
         <br /><b style={{ color: '#8a9ac0' }}>Contexto relativo</b>: z-score y percentil comparan contra la distribución rolling 24h de los últimos 7d (&lt;1σ = regimen normal, &gt;2σ = extremo). Flow/Vol mide el flujo contra el volumen spot real (&lt;1% = marginal, &gt;5% = material). Divergencia contrasta con la dirección del precio 24h.
-        <br />Datos via Dune cex.flows · 9 CEX clasificados · refresh cada 30 min.
+        <br />Flujos via Dune cex.flows (refresh 30 min). Oferta liquida (stock) via DefiLlama (refresh 1h, no incluye Coinbase/Kraken).
       </div>
     </div>
   )
