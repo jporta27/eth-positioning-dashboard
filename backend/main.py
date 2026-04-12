@@ -1223,11 +1223,25 @@ async def fetch_dune_cex_netflows(client: httpx.AsyncClient) -> Optional[dict]:
         return None
 
 
-def process_dune_netflows(raw: Optional[dict], current_eth_price: Optional[float]) -> dict:
-    """Aggregate Dune CEX flows into 1h/6h/24h/7d windows + per-exchange + hourly time series.
+def process_dune_netflows(
+    raw: Optional[dict],
+    current_eth_price: Optional[float],
+    spot_volume_usd_24h: Optional[float] = None,
+    price_change_pct_24h: Optional[float] = None,
+) -> dict:
+    """Aggregate Dune CEX flows into 1h/6h/24h/7d windows + per-exchange + hourly series,
+    plus relative context (z-score, percentile, flow/vol ratio, flow-price divergence).
 
-    Convention: net_inflow > 0 → exchange inventory growing → BEARISH (sell pressure).
-                net_inflow < 0 → exchange inventory shrinking → BULLISH (HODL/withdrawal).
+    This signal measures changes in the liquid supply of ETH held on CEX — NOT execution.
+    Net inflow > 0 = ETH entering exchanges = supply side growing = POTENTIAL sell pressure.
+    Net inflow < 0 = ETH leaving exchanges to self-custody = POTENTIAL HODL / buy pressure.
+
+    Relative context distinguishes statistically normal flows from materially impactful ones:
+      - z-score vs rolling 24h distribution (is this flow anomalous for the current regime?)
+      - percentile vs same distribution (where does it rank?)
+      - flow/volume ratio (is the flow large vs actual spot trading?)
+      - flow-price divergence (does the flow line up with the realized price move?)
+
     USD lag: Dune's price join runs ~1h behind, so the freshest hour has null usd.
     Falls back to net_eth × current spot price for those rows.
     """
@@ -1331,18 +1345,89 @@ def process_dune_netflows(raw: Optional[dict], current_eth_price: Optional[float
         for h in hourly
     ]
 
-    # Bias on 24h
+    # ── Relative context ───────────────────────────────────────────────
     net_24h_eth = aggregates["24h"]["netInflowEth"]
-    if net_24h_eth < -2000:
-        bias = "BULLISH"     # heavy net withdrawal
-    elif net_24h_eth < -500:
-        bias = "BULLISH_MILD"
-    elif net_24h_eth > 2000:
-        bias = "BEARISH"     # heavy net deposit
-    elif net_24h_eth > 500:
-        bias = "BEARISH_MILD"
+    net_24h_usd = aggregates["24h"]["netInflowUsd"]
+
+    # Build rolling 24h netflow distribution across the 7d history.
+    # For each hour h, compute the sum of net_eth over hours [h-23 .. h].
+    # Each rolling sum is heavily overlapping with its neighbors, but serves as a
+    # rough empirical distribution of "typical 24h flows" under the current regime.
+    rolling_24h_list: list = []
+    n_h = len(hourly_series)
+    if n_h >= 24:
+        running = sum(h["netInflowEth"] for h in hourly_series[:24])
+        rolling_24h_list.append(running)
+        for i in range(24, n_h):
+            running += hourly_series[i]["netInflowEth"] - hourly_series[i - 24]["netInflowEth"]
+            rolling_24h_list.append(running)
+
+    # Exclude the most recent 24h window from the comparison distribution so we're
+    # scoring "current vs historical" rather than "current vs including-itself".
+    hist_distribution = rolling_24h_list[:-1] if len(rolling_24h_list) > 1 else rolling_24h_list
+
+    mean_24h = statistics.fmean(hist_distribution) if hist_distribution else 0.0
+    stdev_24h = statistics.stdev(hist_distribution) if len(hist_distribution) > 1 else 0.0
+    z_score = (net_24h_eth - mean_24h) / stdev_24h if stdev_24h > 0 else 0.0
+
+    # Percentile rank of current value within historical distribution
+    if hist_distribution:
+        rank = sum(1 for v in hist_distribution if v <= net_24h_eth)
+        percentile = rank / len(hist_distribution) * 100.0
     else:
+        percentile = 50.0
+
+    # Flow-to-volume ratio (|net USD 24h| / spot volume USD 24h)
+    flow_vol_ratio_pct = None
+    if spot_volume_usd_24h and spot_volume_usd_24h > 0:
+        flow_vol_ratio_pct = abs(net_24h_usd) / spot_volume_usd_24h * 100.0
+
+    # Magnitude label from |z-score|
+    abs_z = abs(z_score)
+    if abs_z >= 2.0:
+        magnitude = "EXTREME"
+    elif abs_z >= 1.0:
+        magnitude = "ELEVATED"
+    elif abs_z >= 0.3:
+        magnitude = "NORMAL"
+    else:
+        magnitude = "NOISE"
+
+    # Direction from sign (with small noise band)
+    noise_band = max(abs(mean_24h), 500)  # at least ±500 ETH of deadband
+    if net_24h_eth < -noise_band:
+        direction = "BULLISH"   # withdrawal → potential HODL / buy pressure
+    elif net_24h_eth > noise_band:
+        direction = "BEARISH"   # deposit → potential sell pressure
+    else:
+        direction = "NEUTRAL"
+
+    # Flow-price divergence over 24h window
+    # Flow dir (bullish=+1, bearish=-1) vs realized price dir
+    divergence = None
+    if price_change_pct_24h is not None and direction != "NEUTRAL":
+        flow_sign = 1 if direction == "BULLISH" else -1
+        if price_change_pct_24h > 0.5:
+            price_sign = 1
+        elif price_change_pct_24h < -0.5:
+            price_sign = -1
+        else:
+            price_sign = 0
+        if price_sign == 0:
+            divergence = "FLAT_PRICE"  # flow has direction, price doesn't — accumulation/distribution under cover
+        elif flow_sign == price_sign:
+            divergence = "CONFIRMED"   # flow direction matches realized move
+        else:
+            divergence = "DIVERGENT"   # flow direction opposite to realized move — watch for reversal
+
+    # Legacy `bias` field kept for backwards compatibility with older frontend:
+    # combines direction + magnitude into a single label.
+    if direction == "NEUTRAL":
         bias = "NEUTRAL"
+    elif magnitude in ("EXTREME", "ELEVATED"):
+        bias = direction
+    else:
+        bias = f"{direction}_MILD"
 
     return {
         "lastUpdate": max_ts,
@@ -1351,6 +1436,19 @@ def process_dune_netflows(raw: Optional[dict], current_eth_price: Optional[float
         "byExchange24h": by_exchange,
         "hourly": hourly_series,
         "bias": bias,
+        "direction": direction,
+        "magnitude": magnitude,
+        "relativeContext": {
+            "mean24hEth":     round(mean_24h, 2),
+            "stdev24hEth":    round(stdev_24h, 2),
+            "zScore":         round(z_score, 2),
+            "percentile":     round(percentile, 1),
+            "samplesN":       len(hist_distribution),
+            "flowVolRatioPct": round(flow_vol_ratio_pct, 3) if flow_vol_ratio_pct is not None else None,
+            "spotVolumeUsd24h": round(spot_volume_usd_24h, 0) if spot_volume_usd_24h else None,
+            "priceChangePct24h": round(price_change_pct_24h, 3) if price_change_pct_24h is not None else None,
+            "divergence":     divergence,
+        },
     }
 
 
@@ -2056,6 +2154,8 @@ async def fetch_all_data() -> dict:
         "cexNetflows": process_dune_netflows(
             dune_cex_raw if isinstance(dune_cex_raw, dict) else None,
             current_price,
+            spot_volume_usd_24h=vol_bn_spot if vol_bn_spot else None,
+            price_change_pct_24h=safe_float(bn_ticker, "priceChangePercent"),
         ),
     }
 

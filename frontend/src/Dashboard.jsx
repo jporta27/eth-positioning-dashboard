@@ -1012,20 +1012,51 @@ function CexNetflowsPanel({ cexNetflows }) {
   const aggs = cn.aggregates || {}
   const byEx = cn.byExchange24h || []
   const hourly = cn.hourly || []
-  const bias = cn.bias || 'NEUTRAL'
+  const direction = cn.direction || 'NEUTRAL'
+  const magnitude = cn.magnitude || 'NOISE'
+  const rc = cn.relativeContext || {}
   const lastUpdate = cn.lastUpdate
 
   const hasData = byEx.length > 0 && Object.keys(aggs).length > 0
 
-  // Bias styling
-  const biasMeta = {
-    BULLISH:      { label: 'BULLISH',       color: '#22c55e', bg: 'rgba(34,197,94,0.12)',  desc: 'Salida fuerte de ETH de exchanges → presión de retiro / HODL' },
-    BULLISH_MILD: { label: 'BULLISH MILD',  color: '#86efac', bg: 'rgba(34,197,94,0.08)',  desc: 'Net withdrawal moderado · ligero sesgo comprador' },
-    NEUTRAL:      { label: 'NEUTRAL',       color: '#8a9ac0', bg: 'rgba(138,154,192,0.1)', desc: 'Flujos balanceados · sin presión clara' },
-    BEARISH_MILD: { label: 'BEARISH MILD',  color: '#fca5a5', bg: 'rgba(239,68,68,0.08)',  desc: 'Net deposit moderado · ligero sesgo vendedor' },
-    BEARISH:      { label: 'BEARISH',       color: '#ef4444', bg: 'rgba(239,68,68,0.12)',  desc: 'Entrada fuerte de ETH a exchanges → presión vendedora' },
+  // Direction styling — captures the POTENTIAL pressure, not executed flow
+  const dirMeta = {
+    BULLISH: {
+      label: 'BULLISH POTENCIAL',
+      color: '#22c55e',
+      bg: 'rgba(34,197,94,0.12)',
+      desc: 'Oferta líquida en CEX bajando → presión COMPRADORA potencial (HODL/retiro)',
+    },
+    NEUTRAL: {
+      label: 'NEUTRAL',
+      color: '#8a9ac0',
+      bg: 'rgba(138,154,192,0.1)',
+      desc: 'Flujos balanceados · sin cambio material en la oferta líquida',
+    },
+    BEARISH: {
+      label: 'BEARISH POTENCIAL',
+      color: '#ef4444',
+      bg: 'rgba(239,68,68,0.12)',
+      desc: 'Oferta líquida en CEX subiendo → presión VENDEDORA potencial (depósitos)',
+    },
   }
-  const bm = biasMeta[bias] || biasMeta.NEUTRAL
+  const dm = dirMeta[direction] || dirMeta.NEUTRAL
+
+  // Magnitude styling — how statistically anomalous vs the 7d regime
+  const magMeta = {
+    EXTREME:  { label: 'EXTREMO',  color: '#f59e0b', bg: 'rgba(245,158,11,0.18)' },
+    ELEVATED: { label: 'ELEVADO',  color: '#fbbf24', bg: 'rgba(251,191,36,0.14)' },
+    NORMAL:   { label: 'NORMAL',   color: '#8a9ac0', bg: 'rgba(138,154,192,0.1)' },
+    NOISE:    { label: 'RUIDO',    color: '#4a5980', bg: 'rgba(74,89,128,0.1)' },
+  }
+  const mg = magMeta[magnitude] || magMeta.NOISE
+
+  // Divergence styling
+  const divergenceMeta = {
+    CONFIRMED:  { label: 'CONFIRMA',    color: '#22c55e', desc: 'Flujo y precio alineados' },
+    DIVERGENT:  { label: 'DIVERGE',     color: '#f59e0b', desc: 'Flujo vs precio opuestos · posible reversión' },
+    FLAT_PRICE: { label: 'PRECIO PLANO', color: '#8a9ac0', desc: 'Flujo con dirección · precio sin cambio (acum/distr silenciosa)' },
+  }
 
   // Color helper: negative net = bullish (green), positive = bearish (red)
   const netColor = (v) => {
@@ -1086,13 +1117,13 @@ function CexNetflowsPanel({ cexNetflows }) {
         </div>
       </div>
 
-      {/* Verdict + 24h headline */}
+      {/* Verdict + 24h headline — direction × magnitude split */}
       <div style={{
         padding: '12px 14px',
         marginBottom: 12,
         borderRadius: 8,
-        background: bm.bg,
-        border: `1px solid ${bm.color}33`,
+        background: dm.bg,
+        border: `1px solid ${dm.color}33`,
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
@@ -1100,12 +1131,19 @@ function CexNetflowsPanel({ cexNetflows }) {
         gap: 12,
       }}>
         <div>
-          <div style={{ fontSize: 10, color: '#5a6a8a', marginBottom: 4, letterSpacing: 1 }}>SESGO 24H</div>
-          <div style={{ fontSize: 16, fontWeight: 700, color: bm.color, ...S.mono }}>{bm.label}</div>
-          <div style={{ fontSize: 10, color: '#8a9ac0', marginTop: 2 }}>{bm.desc}</div>
+          <div style={{ fontSize: 10, color: '#5a6a8a', marginBottom: 4, letterSpacing: 1 }}>PRESIÓN POTENCIAL 24H</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 16, fontWeight: 700, color: dm.color, ...S.mono }}>{dm.label}</span>
+            <span style={{
+              fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 3,
+              color: mg.color, background: mg.bg, border: `1px solid ${mg.color}44`,
+              letterSpacing: 0.5,
+            }}>{mg.label}</span>
+          </div>
+          <div style={{ fontSize: 10, color: '#8a9ac0', marginTop: 3 }}>{dm.desc}</div>
         </div>
         <div style={{ textAlign: 'right' }}>
-          <div style={{ fontSize: 10, color: '#5a6a8a', marginBottom: 4, letterSpacing: 1 }}>NET INFLOW 24H</div>
+          <div style={{ fontSize: 10, color: '#5a6a8a', marginBottom: 4, letterSpacing: 1 }}>Δ OFERTA LÍQUIDA 24H</div>
           <div style={{ fontSize: 22, fontWeight: 700, color: netColor(net24h), ...S.mono, lineHeight: 1.1 }}>
             {fmtEth(net24h)}
           </div>
@@ -1114,6 +1152,76 @@ function CexNetflowsPanel({ cexNetflows }) {
           </div>
         </div>
       </div>
+
+      {/* Contexto Relativo — 4 metrics to distinguish material from noise */}
+      {(rc.zScore != null || rc.flowVolRatioPct != null || rc.divergence != null) && (
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+          gap: 6,
+          marginBottom: 12,
+        }}>
+          {/* Z-score */}
+          <div style={{ padding: '8px 10px', borderRadius: 6, border: '1px solid #1a2544', background: '#0a1020' }}>
+            <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 2 }}>Z-SCORE vs 7D</div>
+            <div style={{ fontSize: 16, fontWeight: 700, color: Math.abs(rc.zScore || 0) >= 1 ? mg.color : '#c8d6e5', ...S.mono }}>
+              {rc.zScore != null ? `${rc.zScore >= 0 ? '+' : ''}${rc.zScore.toFixed(2)}σ` : '—'}
+            </div>
+            <div style={{ fontSize: 9, color: '#5a6a8a', marginTop: 2 }}>
+              {rc.samplesN ? `n=${rc.samplesN} ventanas` : 'sin base'}
+            </div>
+          </div>
+
+          {/* Percentile */}
+          <div style={{ padding: '8px 10px', borderRadius: 6, border: '1px solid #1a2544', background: '#0a1020' }}>
+            <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 2 }}>PERCENTIL</div>
+            <div style={{ fontSize: 16, fontWeight: 700, color: '#c8d6e5', ...S.mono }}>
+              {rc.percentile != null ? `${rc.percentile.toFixed(0)}%` : '—'}
+            </div>
+            <div style={{ fontSize: 9, color: '#5a6a8a', marginTop: 2 }}>
+              {rc.percentile != null
+                ? (rc.percentile < 10 ? 'más bullish que casi todas' : rc.percentile > 90 ? 'más bearish que casi todas' : 'rango típico')
+                : '—'}
+            </div>
+          </div>
+
+          {/* Flow / Volume ratio */}
+          <div style={{ padding: '8px 10px', borderRadius: 6, border: '1px solid #1a2544', background: '#0a1020' }}>
+            <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 2 }}>FLOW / SPOT VOL</div>
+            <div style={{ fontSize: 16, fontWeight: 700, ...S.mono,
+              color: rc.flowVolRatioPct == null ? '#c8d6e5'
+                : rc.flowVolRatioPct >= 5 ? '#f59e0b'
+                : rc.flowVolRatioPct >= 1 ? '#c8d6e5' : '#5a6a8a' }}>
+              {rc.flowVolRatioPct != null ? `${rc.flowVolRatioPct.toFixed(2)}%` : '—'}
+            </div>
+            <div style={{ fontSize: 9, color: '#5a6a8a', marginTop: 2 }}>
+              {rc.flowVolRatioPct == null ? '—'
+                : rc.flowVolRatioPct >= 5 ? 'material'
+                : rc.flowVolRatioPct >= 1 ? 'perceptible' : 'marginal'}
+            </div>
+          </div>
+
+          {/* Divergence flag */}
+          <div style={{ padding: '8px 10px', borderRadius: 6, border: '1px solid #1a2544', background: '#0a1020' }}>
+            <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 2 }}>FLOW vs PRECIO</div>
+            {(() => {
+              const dv = divergenceMeta[rc.divergence]
+              if (!dv) return <div style={{ fontSize: 13, color: '#5a6a8a', ...S.mono }}>—</div>
+              return (
+                <>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: dv.color, ...S.mono }}>{dv.label}</span>
+                    <span style={{ fontSize: 10, color: rc.priceChangePct24h >= 0 ? '#86efac' : '#fca5a5', ...S.mono }}>
+                      {rc.priceChangePct24h != null ? `${rc.priceChangePct24h >= 0 ? '+' : ''}${rc.priceChangePct24h.toFixed(2)}%` : ''}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 9, color: '#5a6a8a', marginTop: 2, lineHeight: 1.3 }}>{dv.desc}</div>
+                </>
+              )
+            })()}
+          </div>
+        </div>
+      )}
 
       {/* Window grid */}
       <div style={{
@@ -1200,9 +1308,9 @@ function CexNetflowsPanel({ cexNetflows }) {
       </div>
 
       <div style={{ marginTop: 10, padding: '6px 8px', background: '#0a1020', borderRadius: 5, fontSize: 9, color: '#5a6a8a', lineHeight: 1.5 }}>
-        <b style={{ color: '#8a9ac0' }}>Convención</b>: net inflow &gt; 0 → ETH entrando a CEX → presión vendedora (BEARISH).
-        Net inflow &lt; 0 → ETH saliendo a self-custody → HODL / acumulación (BULLISH).
-        Datos via Dune cex.flows · 9 CEX clasificados · refresh cada 30 min.
+        <b style={{ color: '#8a9ac0' }}>Lectura</b>: mide <i>cambios en la oferta líquida de ETH en CEX</i>, no ejecución. Un net inflow positivo significa que entra más ETH del que sale → crece el inventario disponible para venta → <i>presión vendedora POTENCIAL</i>. Un net inflow negativo significa retiro a self-custody → <i>presión compradora POTENCIAL</i> (HODL).
+        <br /><b style={{ color: '#8a9ac0' }}>Contexto relativo</b>: z-score y percentil comparan contra la distribución rolling 24h de los últimos 7d (&lt;1σ = regimen normal, &gt;2σ = extremo). Flow/Vol mide el flujo contra el volumen spot real (&lt;1% = marginal, &gt;5% = material). Divergencia contrasta con la dirección del precio 24h.
+        <br />Datos via Dune cex.flows · 9 CEX clasificados · refresh cada 30 min.
       </div>
     </div>
   )
