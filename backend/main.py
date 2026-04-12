@@ -65,6 +65,7 @@ DEFILLAMA_CEX_SLUGS = {
 }
 DEFILLAMA_CACHE_TTL = 3600  # 1h — reserves change slowly
 DEFILLAMA_ETH_KEYS = {"ETH", "WETH", "STETH", "BETH", "CBETH", "EETH", "WEETH", "RETH"}
+DEFILLAMA_STABLE_KEYS = {"USDT", "USDC", "DAI", "FDUSD", "BUSD", "TUSD", "USDD", "PYUSD", "USDE"}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dashboard")
@@ -1352,8 +1353,12 @@ async def fetch_defillama_reserves(client: httpx.AsyncClient) -> Optional[dict]:
                 v for k, v in latest_tokens.items()
                 if k.upper() in DEFILLAMA_ETH_KEYS
             )
+            current_stable = sum(
+                v for k, v in latest_tokens.items()
+                if k.upper() in DEFILLAMA_STABLE_KEYS
+            )
 
-            # Historical daily ETH for last 90 days
+            # Historical daily ETH + stablecoins for last 90 days
             daily: list = []
             for entry in tokens_arr:
                 ts = entry.get("date", 0)
@@ -1362,11 +1367,13 @@ async def fetch_defillama_reserves(client: httpx.AsyncClient) -> Optional[dict]:
                 if age_days <= 90:
                     toks = entry.get("tokens", {})
                     eth = sum(v for k, v in toks.items() if k.upper() in DEFILLAMA_ETH_KEYS)
-                    daily.append({"date": ts, "eth": eth, "age_days": age_days})
+                    stable = sum(v for k, v in toks.items() if k.upper() in DEFILLAMA_STABLE_KEYS)
+                    daily.append({"date": ts, "eth": eth, "stable": stable, "age_days": age_days})
 
             return {
                 "name": name,
                 "ethReserve": round(current_eth, 2),
+                "stableReserve": round(current_stable, 2),
                 "daily": daily,
             }
         except Exception as e:
@@ -1381,15 +1388,19 @@ async def fetch_defillama_reserves(client: httpx.AsyncClient) -> Optional[dict]:
         return None
 
     # Current totals
-    by_exchange = [{"name": r["name"], "ethReserve": r["ethReserve"]} for r in exchange_results]
+    by_exchange = [
+        {"name": r["name"], "ethReserve": r["ethReserve"], "stableReserve": r.get("stableReserve", 0)}
+        for r in exchange_results
+    ]
     total_eth = sum(ex["ethReserve"] for ex in by_exchange)
+    total_stable = sum(ex["stableReserve"] for ex in by_exchange)
 
     # Build aggregate daily series: sum all exchanges per calendar date.
     # Each exchange's tokens array has entries at slightly different
     # unix timestamps, so we normalize to YYYY-MM-DD to ensure each day
     # aggregates ALL exchanges that reported for that date.
     n_exchanges = len(exchange_results)
-    day_sums: dict = {}  # "YYYY-MM-DD" -> {total_eth, n_exchanges}
+    day_sums: dict = {}  # "YYYY-MM-DD" -> {total_eth, total_stable, n_exchanges}
     for exr in exchange_results:
         seen_dates: set = set()
         for d in exr.get("daily", []):
@@ -1398,41 +1409,54 @@ async def fetch_defillama_reserves(client: httpx.AsyncClient) -> Optional[dict]:
                 continue  # skip duplicate entries for same exchange on same day
             seen_dates.add(date_str)
             if date_str not in day_sums:
-                day_sums[date_str] = {"total": 0.0, "n": 0}
-            day_sums[date_str]["total"] += d["eth"]
+                day_sums[date_str] = {"eth": 0.0, "stable": 0.0, "n": 0}
+            day_sums[date_str]["eth"] += d["eth"]
+            day_sums[date_str]["stable"] += d.get("stable", 0)
             day_sums[date_str]["n"] += 1
 
     # Only keep days where ALL (or most) exchanges reported, to avoid
     # partial-day artifacts dragging the average down
     min_exchanges = max(1, n_exchanges - 1)  # allow 1 missing
     complete_days = sorted(
-        [(dt_str, info["total"]) for dt_str, info in day_sums.items()
+        [(dt_str, info["eth"], info["stable"]) for dt_str, info in day_sums.items()
          if info["n"] >= min_exchanges]
     )
 
-    # Compute averages for each window
-    history: dict = {}
+    # Compute averages for each window (ETH + stablecoins)
+    history_eth: dict = {}
+    history_stable: dict = {}
     for window in (7, 30, 90):
         cutoff_str = (now_dt - timedelta(days=window)).strftime("%Y-%m-%d")
-        subset = [eth for dt_str, eth in complete_days if dt_str >= cutoff_str]
-        if subset:
-            avg = sum(subset) / len(subset)
+        eth_subset = [eth for dt_str, eth, stb in complete_days if dt_str >= cutoff_str]
+        stb_subset = [stb for dt_str, eth, stb in complete_days if dt_str >= cutoff_str]
+        if eth_subset:
+            avg = sum(eth_subset) / len(eth_subset)
             delta_pct = (total_eth - avg) / avg * 100 if avg > 0 else 0
-            history[f"{window}d"] = {
+            history_eth[f"{window}d"] = {
                 "avgEth": round(avg, 0),
                 "currentVsAvgPct": round(delta_pct, 2),
-                "samples": len(subset),
+                "samples": len(eth_subset),
+            }
+        if stb_subset:
+            avg_s = sum(stb_subset) / len(stb_subset)
+            delta_pct_s = (total_stable - avg_s) / avg_s * 100 if avg_s > 0 else 0
+            history_stable[f"{window}d"] = {
+                "avgUsd": round(avg_s, 0),
+                "currentVsAvgPct": round(delta_pct_s, 2),
+                "samples": len(stb_subset),
             }
 
     result = {
         "totalEth": round(total_eth, 2),
+        "totalStable": round(total_stable, 2),
         "byExchange": sorted(by_exchange, key=lambda x: -x["ethReserve"]),
         "exchangeCount": len(exchange_results),
-        "history": history,
+        "history": history_eth,
+        "stableHistory": history_stable,
     }
     llama_cache = result
     llama_cache_ts = now_ts
-    logger.info(f"DefiLlama reserves ok: {total_eth:,.0f} ETH across {len(exchange_results)} exchanges, history windows: {list(history.keys())}")
+    logger.info(f"DefiLlama reserves ok: {total_eth:,.0f} ETH + ${total_stable:,.0f} stables across {len(exchange_results)} exchanges")
     return result
 
 
@@ -1664,11 +1688,13 @@ def process_dune_netflows(
             "divergence":     divergence,
             # Reserves context (from DefiLlama)
             "reservesTotalEth": reserves.get("totalEth") if reserves else None,
+            "reservesTotalStable": reserves.get("totalStable") if reserves else None,
             "reservesExchangeCount": reserves.get("exchangeCount") if reserves else None,
             "flowAsReservesPct": round(abs(net_24h_eth) / reserves["totalEth"] * 100, 4)
                 if reserves and reserves.get("totalEth") and reserves["totalEth"] > 0 else None,
             "reservesByExchange": reserves.get("byExchange") if reserves else None,
             "reservesHistory": reserves.get("history") if reserves else None,
+            "stableHistory": reserves.get("stableHistory") if reserves else None,
         },
     }
 

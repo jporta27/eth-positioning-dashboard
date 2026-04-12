@@ -1221,36 +1221,7 @@ function CexNetflowsPanel({ cexNetflows }) {
             })()}
           </div>
 
-          {/* Reserves — absolute stock from DefiLlama + historical trend */}
-          <div style={{ padding: '8px 10px', borderRadius: 6, border: '1px solid #1a2544', background: '#0a1020' }}>
-            <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 2 }}>OFERTA LIQUIDA CEX</div>
-            <div style={{ fontSize: 16, fontWeight: 700, color: '#c8d6e5', ...S.mono }}>
-              {rc.reservesTotalEth != null ? `${(rc.reservesTotalEth / 1e6).toFixed(2)}M` : '—'}
-            </div>
-            {rc.reservesHistory && (
-              <div style={{ fontSize: 9, color: '#5a6a8a', marginTop: 3, lineHeight: 1.5 }}>
-                {['7d', '30d', '90d'].map(w => {
-                  const h = rc.reservesHistory[w]
-                  if (!h) return null
-                  const pct = h.currentVsAvgPct
-                  const color = pct < -2 ? '#86efac' : pct > 2 ? '#fca5a5' : '#5a6a8a'
-                  return <div key={w} style={{ display: 'flex', justifyContent: 'space-between', gap: 4 }}>
-                    <span>vs avg {w}:</span>
-                    <span style={{ color, fontWeight: 600, ...S.mono }}>
-                      {pct >= 0 ? '+' : ''}{pct.toFixed(1)}%
-                    </span>
-                  </div>
-                })}
-              </div>
-            )}
-            {!rc.reservesHistory && (
-              <div style={{ fontSize: 9, color: '#5a6a8a', marginTop: 2 }}>
-                {rc.reservesExchangeCount ? `${rc.reservesExchangeCount} exchanges` : '—'}
-              </div>
-            )}
-          </div>
-
-          {/* Flow as % of reserves */}
+          {/* Flow as % of reserves — compact */}
           <div style={{ padding: '8px 10px', borderRadius: 6, border: '1px solid #1a2544', background: '#0a1020' }}>
             <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 2 }}>FLOW / STOCK</div>
             <div style={{ fontSize: 16, fontWeight: 700, ...S.mono,
@@ -1319,9 +1290,161 @@ function CexNetflowsPanel({ cexNetflows }) {
         </div>
       )}
 
-      {/* Per-exchange ranking */}
+      {/* ── RESERVAS CEX · Stock absoluto + Stablecoins + Narrativa ── */}
+      {(rc.reservesTotalEth != null || rc.reservesTotalStable != null) && (() => {
+        // Narrative: combine ETH flow direction + stablecoin trend direction
+        const ethTrend7d = rc.reservesHistory?.['7d']?.currentVsAvgPct
+        const stableTrend7d = rc.stableHistory?.['7d']?.currentVsAvgPct
+        let narrative = null
+        if (ethTrend7d != null && stableTrend7d != null) {
+          const ethDown = ethTrend7d < -1   // ETH leaving exchanges
+          const ethUp = ethTrend7d > 1      // ETH entering exchanges
+          const stableUp = stableTrend7d > 1 // Stables entering
+          const stableDown = stableTrend7d < -1 // Stables leaving
+          if (ethDown && stableUp) {
+            narrative = { label: 'ACUMULACION PROBABLE', color: '#22c55e', bg: 'rgba(34,197,94,0.12)',
+              desc: 'ETH saliendo a self-custody + fondeo USD creciendo en exchanges (dry powder disponible)' }
+          } else if (ethUp && stableDown) {
+            narrative = { label: 'DISTRIBUCION PROBABLE', color: '#ef4444', bg: 'rgba(239,68,68,0.12)',
+              desc: 'ETH entrando a exchanges + fondeo USD saliendo = posible liquidacion de posiciones' }
+          } else if (ethUp && stableUp) {
+            narrative = { label: 'CAPITALIZACION', color: '#f59e0b', bg: 'rgba(245,158,11,0.15)',
+              desc: 'Todo entrando a exchanges = alta actividad inminente (trading, lending, margin, etc.)' }
+          } else if (ethDown && stableDown) {
+            narrative = { label: 'DESAPALANCAMIENTO', color: '#8b5cf6', bg: 'rgba(139,92,246,0.12)',
+              desc: 'Todo saliendo de exchanges = reduccion general de exposicion on-exchange' }
+          } else {
+            narrative = { label: 'NEUTRAL', color: '#8a9ac0', bg: 'rgba(138,154,192,0.08)',
+              desc: 'Sin tendencia clara en la relacion ETH-stablecoins' }
+          }
+        }
+        const maxReserve = rc.reservesByExchange
+          ? Math.max(...rc.reservesByExchange.map(e => e.ethReserve || 0), 1)
+          : 1
+        const fmtB = (v) => v >= 1e9 ? `$${(v / 1e9).toFixed(2)}B` : `$${(v / 1e6).toFixed(0)}M`
+        return (
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1.5, marginBottom: 6, fontWeight: 700 }}>
+              RESERVAS CEX · Stock Absoluto (via DefiLlama)
+            </div>
+
+            {/* Narrative verdict */}
+            {narrative && (
+              <div style={{
+                padding: '10px 14px', marginBottom: 8, borderRadius: 8,
+                background: narrative.bg, border: `1px solid ${narrative.color}33`,
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8,
+              }}>
+                <div>
+                  <div style={{ fontSize: 10, color: '#5a6a8a', marginBottom: 3, letterSpacing: 1 }}>NARRATIVA 7D (fondeo, no intencionalidad)</div>
+                  <span style={{ fontSize: 15, fontWeight: 700, color: narrative.color, ...S.mono }}>{narrative.label}</span>
+                  <div style={{ fontSize: 10, color: '#8a9ac0', marginTop: 3, maxWidth: 500 }}>{narrative.desc}</div>
+                </div>
+                {rc.flowAsReservesPct != null && (
+                  <div style={{ textAlign: 'right' }}>
+                    <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 2 }}>FLOW / STOCK 24H</div>
+                    <div style={{ fontSize: 18, fontWeight: 700, ...S.mono,
+                      color: rc.flowAsReservesPct >= 0.5 ? '#f59e0b' : rc.flowAsReservesPct >= 0.1 ? '#c8d6e5' : '#5a6a8a' }}>
+                      {rc.flowAsReservesPct.toFixed(3)}%
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ETH + Stablecoins side by side */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 8 }}>
+              {/* ETH Reserves */}
+              <div style={{ padding: '10px 12px', borderRadius: 8, border: '1px solid #1a2544', background: '#0a1020' }}>
+                <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 4 }}>ETH RESERVES</div>
+                <div style={{ fontSize: 20, fontWeight: 700, color: '#c8d6e5', ...S.mono }}>
+                  {rc.reservesTotalEth != null ? `${(rc.reservesTotalEth / 1e6).toFixed(2)}M` : '—'}
+                </div>
+                {rc.reservesHistory && (
+                  <div style={{ fontSize: 9, color: '#5a6a8a', marginTop: 6, lineHeight: 1.6 }}>
+                    {['7d', '30d', '90d'].map(w => {
+                      const h = rc.reservesHistory[w]
+                      if (!h) return null
+                      const p = h.currentVsAvgPct
+                      const c = p < -2 ? '#86efac' : p > 2 ? '#fca5a5' : '#5a6a8a'
+                      return <div key={w} style={{ display: 'flex', justifyContent: 'space-between' }}>
+                        <span>vs avg {w}:</span>
+                        <span style={{ color: c, fontWeight: 600, ...S.mono }}>{p >= 0 ? '+' : ''}{p.toFixed(1)}%</span>
+                      </div>
+                    })}
+                  </div>
+                )}
+                <div style={{ fontSize: 9, color: '#4a5980', marginTop: 4 }}>
+                  {rc.reservesExchangeCount || '—'} exchanges
+                </div>
+              </div>
+
+              {/* Stablecoin Reserves — dry powder / available capital, NOT buying pressure */}
+              <div style={{ padding: '10px 12px', borderRadius: 8, border: '1px solid #1a2544', background: '#0a1020' }}>
+                <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 4 }}>FONDEO USD EN CEX (dry powder)</div>
+                <div style={{ fontSize: 20, fontWeight: 700, color: '#c8d6e5', ...S.mono }}>
+                  {rc.reservesTotalStable != null ? fmtB(rc.reservesTotalStable) : '—'}
+                </div>
+                {rc.stableHistory && (
+                  <div style={{ fontSize: 9, color: '#5a6a8a', marginTop: 6, lineHeight: 1.6 }}>
+                    {['7d', '30d', '90d'].map(w => {
+                      const h = rc.stableHistory[w]
+                      if (!h) return null
+                      const p = h.currentVsAvgPct
+                      // For stables: UP = more buying power = green, DOWN = capital leaving = red
+                      const c = p > 2 ? '#86efac' : p < -2 ? '#fca5a5' : '#5a6a8a'
+                      return <div key={w} style={{ display: 'flex', justifyContent: 'space-between' }}>
+                        <span>vs avg {w}:</span>
+                        <span style={{ color: c, fontWeight: 600, ...S.mono }}>{p >= 0 ? '+' : ''}{p.toFixed(1)}%</span>
+                      </div>
+                    })}
+                  </div>
+                )}
+                <div style={{ fontSize: 9, color: '#4a5980', marginTop: 4 }}>
+                  USDT + USDC + DAI + otros (no implica compra)
+                </div>
+              </div>
+            </div>
+
+            {/* Per-exchange reserves breakdown */}
+            {rc.reservesByExchange && rc.reservesByExchange.length > 0 && (
+              <div>
+                <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 4 }}>STOCK POR EXCHANGE</div>
+                <div style={{ display: 'grid', gap: 3 }}>
+                  {rc.reservesByExchange.map(ex => {
+                    const widthPct = Math.min((ex.ethReserve / maxReserve) * 100, 100)
+                    return (
+                      <div key={ex.name} style={{
+                        display: 'grid', gridTemplateColumns: '80px 1fr 90px 80px',
+                        alignItems: 'center', gap: 6, padding: '3px 6px', borderRadius: 4, background: '#0a1020',
+                      }}>
+                        <div style={{ fontSize: 10, color: '#c8d6e5', fontWeight: 600, ...S.mono }}>{ex.name}</div>
+                        <div style={{ height: 5, background: '#111a35', borderRadius: 3, overflow: 'hidden', position: 'relative' }}>
+                          <div style={{
+                            position: 'absolute', top: 0, left: 0,
+                            width: `${widthPct}%`, height: '100%',
+                            background: '#38bdf8', opacity: 0.5, borderRadius: 3, transition: 'width 0.6s',
+                          }} />
+                        </div>
+                        <div style={{ fontSize: 10, color: '#c8d6e5', ...S.mono, textAlign: 'right' }}>
+                          {(ex.ethReserve / 1e3).toFixed(0)}k ETH
+                        </div>
+                        <div style={{ fontSize: 10, color: '#8a9ac0', ...S.mono, textAlign: 'right' }}>
+                          {ex.stableReserve != null ? fmtB(ex.stableReserve) : '—'}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        )
+      })()}
+
+      {/* Per-exchange netflow ranking */}
       <div>
-        <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 6 }}>RANKING POR EXCHANGE · 24H</div>
+        <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 6 }}>RANKING NETFLOWS POR EXCHANGE · 24H</div>
         <div style={{ display: 'grid', gap: 4 }}>
           {byEx.map(e => {
             const widthPct = Math.min((Math.abs(e.netInflowEth || 0) / maxAbsNet) * 100, 100)
@@ -1355,7 +1478,8 @@ function CexNetflowsPanel({ cexNetflows }) {
       <div style={{ marginTop: 10, padding: '6px 8px', background: '#0a1020', borderRadius: 5, fontSize: 9, color: '#5a6a8a', lineHeight: 1.5 }}>
         <b style={{ color: '#8a9ac0' }}>Lectura</b>: mide <i>cambios en la oferta líquida de ETH en CEX</i>, no ejecución. Un net inflow positivo significa que entra más ETH del que sale → crece el inventario disponible para venta → <i>presión vendedora POTENCIAL</i>. Un net inflow negativo significa retiro a self-custody → <i>presión compradora POTENCIAL</i> (HODL).
         <br /><b style={{ color: '#8a9ac0' }}>Contexto relativo</b>: z-score y percentil comparan contra la distribución rolling 24h de los últimos 7d (&lt;1σ = regimen normal, &gt;2σ = extremo). Flow/Vol mide el flujo contra el volumen spot real (&lt;1% = marginal, &gt;5% = material). Divergencia contrasta con la dirección del precio 24h.
-        <br />Flujos via Dune cex.flows (refresh 30 min). Oferta liquida (stock) via DefiLlama (refresh 1h, no incluye Coinbase/Kraken).
+        <br /><b style={{ color: '#8a9ac0' }}>Narrativa</b>: cruza tendencia 7d de reservas ETH vs stablecoins. Stables = <i>fondeo disponible</i> (dry powder), no implica compra directa — puede ir a trading, lending, margin, etc. La combinacion ETH+stables sugiere <i>probabilidad</i> de escenario, no certeza.
+        <br />Flujos via Dune cex.flows (refresh 30 min). Reservas (stock) via DefiLlama (refresh 1h, no incluye Coinbase/Kraken).
       </div>
     </div>
   )
