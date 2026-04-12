@@ -1231,6 +1231,142 @@ async def fetch_defillama_reserves(client: httpx.AsyncClient) -> Optional[dict]:
     return result
 
 
+# ── ETHBTC Taker Rotation ────────────────────────────────────────────
+async def fetch_ethbtc_taker(client: httpx.AsyncClient) -> Optional[dict]:
+    """Fetch ETHBTC spot taker buy/sell ratio from klines."""
+    try:
+        resp = await client.get(
+            f"{BINANCE_SPOT}/api/v3/klines",
+            params={"symbol": "ETHBTC", "interval": "1h", "limit": 168},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        klines = resp.json()
+        if not klines:
+            return None
+
+        hours = []
+        for k in klines:
+            total_vol = float(k[5])
+            taker_buy = float(k[9])
+            if total_vol > 0:
+                hours.append({
+                    "ts": int(k[0]),
+                    "ratio": round(taker_buy / total_vol, 4),
+                    "volume": round(total_vol, 2),
+                    "close": float(k[4]),
+                })
+
+        if not hours:
+            return None
+
+        current = hours[-1]["ratio"]
+        last_24 = hours[-24:] if len(hours) >= 24 else hours
+        avg_24h = sum(h["ratio"] for h in last_24) / len(last_24)
+        avg_7d = sum(h["ratio"] for h in hours) / len(hours)
+        price_chg = (hours[-1]["close"] - hours[0]["close"]) / hours[0]["close"] * 100 if hours[0]["close"] > 0 else 0
+
+        if avg_24h > 0.54:
+            signal = "BTC_TO_ETH"
+        elif avg_24h < 0.46:
+            signal = "ETH_TO_BTC"
+        else:
+            signal = "BALANCED"
+
+        return {
+            "currentRatio": round(current, 4),
+            "avg24h": round(avg_24h, 4),
+            "avg7d": round(avg_7d, 4),
+            "priceChange7dPct": round(price_chg, 2),
+            "currentPrice": hours[-1]["close"],
+            "signal": signal,
+            "hourly": hours[-48:],
+        }
+    except Exception as e:
+        logger.warning(f"ETHBTC taker fetch failed: {e}")
+        return None
+
+
+# ── DeFi ETH Distribution ────────────────────────────────────────────
+DEFI_ETH_PROTOCOLS = {
+    "Lido":        {"slug": "lido",        "category": "liquid_staking"},
+    "Rocket Pool": {"slug": "rocket-pool", "category": "liquid_staking"},
+    "EigenLayer":  {"slug": "eigenlayer",  "category": "restaking"},
+    "Aave V3":     {"slug": "aave-v3",     "category": "lending"},
+    "MakerDAO":    {"slug": "makerdao",    "category": "cdp"},
+    "Spark":       {"slug": "spark",       "category": "lending"},
+}
+DEFI_CACHE_TTL = 3600
+
+defi_cache: dict = {}
+defi_cache_ts: float = 0
+
+
+async def fetch_defi_eth_map(client: httpx.AsyncClient) -> Optional[dict]:
+    """Fetch ETH locked in major DeFi protocols via DefiLlama."""
+    global defi_cache, defi_cache_ts
+    now_ts = time.time()
+    if defi_cache and (now_ts - defi_cache_ts) < DEFI_CACHE_TTL:
+        return defi_cache
+
+    async def _fetch_protocol(name: str, info: dict) -> Optional[dict]:
+        try:
+            resp = await client.get(
+                f"https://api.llama.fi/protocol/{info['slug']}",
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            tokens_arr = data.get("tokens", [])
+            if tokens_arr:
+                latest_tokens = tokens_arr[-1].get("tokens", {})
+                eth_amount = sum(
+                    v for k, v in latest_tokens.items()
+                    if k.upper() in DEFILLAMA_ETH_KEYS
+                )
+                if eth_amount > 0:
+                    return {"name": name, "category": info["category"], "ethAmount": round(eth_amount, 2)}
+            chain_tvls = data.get("currentChainTvls", {})
+            eth_chain_tvl = chain_tvls.get("Ethereum", 0)
+            if eth_chain_tvl > 0:
+                return {"name": name, "category": info["category"], "ethAmount": 0, "tvlUsd": round(eth_chain_tvl, 0)}
+            return None
+        except Exception as e:
+            logger.warning(f"DeFi fetch failed for {name}: {e}")
+            return None
+
+    tasks = [_fetch_protocol(name, info) for name, info in DEFI_ETH_PROTOCOLS.items()]
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+    protocols = [r for r in raw_results if isinstance(r, dict)]
+    if not protocols:
+        return None
+
+    categories: dict = {}
+    for p in protocols:
+        cat = p["category"]
+        if cat not in categories:
+            categories[cat] = {"totalEth": 0.0, "totalUsd": 0.0, "protocols": []}
+        categories[cat]["totalEth"] += p.get("ethAmount", 0)
+        categories[cat]["totalUsd"] += p.get("tvlUsd", 0)
+        categories[cat]["protocols"].append({
+            "name": p["name"], "ethAmount": p.get("ethAmount", 0), "tvlUsd": p.get("tvlUsd"),
+        })
+    for cat in categories.values():
+        cat["totalEth"] = round(cat["totalEth"], 2)
+        cat["totalUsd"] = round(cat["totalUsd"], 0)
+
+    total_defi_eth = sum(c["totalEth"] for c in categories.values())
+    result = {
+        "totalDefiEth": round(total_defi_eth, 2),
+        "byCategory": categories,
+        "protocolCount": len(protocols),
+    }
+    defi_cache = result
+    defi_cache_ts = now_ts
+    logger.info(f"DeFi ETH map ok: {total_defi_eth:,.0f} ETH across {len(protocols)} protocols")
+    return result
+
+
 def process_dune_netflows(
     raw: Optional[dict],
     current_eth_price: Optional[float],
@@ -1547,6 +1683,10 @@ async def fetch_all_data() -> dict:
             fetch_dune_cex_netflows(client),
             # DefiLlama — CEX ETH reserves / absolute stock (cached 1h)
             fetch_defillama_reserves(client),
+            # ETHBTC taker rotation signal
+            fetch_ethbtc_taker(client),
+            # DeFi ETH distribution (Lido, Aave, Maker, EigenLayer, etc.)
+            fetch_defi_eth_map(client),
             return_exceptions=True,
         )
 
@@ -1570,6 +1710,8 @@ async def fetch_all_data() -> dict:
         bn_oi_hist_5m,
         dune_cex_raw,
         defillama_reserves_raw,
+        ethbtc_taker_raw,
+        defi_eth_map_raw,
     ) = results
 
     def safe_float(obj, key, default=None):
@@ -2106,6 +2248,8 @@ async def fetch_all_data() -> dict:
             price_change_pct_24h=safe_float(bn_ticker, "priceChangePercent"),
             reserves=defillama_reserves_raw if isinstance(defillama_reserves_raw, dict) else None,
         ),
+        "ethBtcRotation": ethbtc_taker_raw if isinstance(ethbtc_taker_raw, dict) else None,
+        "defiEthMap": defi_eth_map_raw if isinstance(defi_eth_map_raw, dict) else None,
     }
 
     cache = data

@@ -1485,6 +1485,194 @@ function CexNetflowsPanel({ cexNetflows }) {
   )
 }
 
+// ── ETH Capital Map Panel ────────────────────────────────────────────
+function EthCapitalMapPanel({ defiEthMap, ethBtcRotation, cexReserves }) {
+  const defi = defiEthMap || {}
+  const rot = ethBtcRotation || {}
+  const cex = cexReserves || {}  // from cexNetflows.relativeContext
+
+  const hasDefi = defi.totalDefiEth > 0 || (defi.byCategory && Object.keys(defi.byCategory).length > 0)
+  const hasRotation = rot.currentRatio != null
+  const hasCex = cex.reservesTotalEth != null
+
+  if (!hasDefi && !hasRotation && !hasCex) {
+    return (
+      <div>
+        <div style={S.sectionTitle}>ETH CAPITAL MAP</div>
+        <div style={{ padding: '14px 12px', background: '#0a1020', borderRadius: 6, fontSize: 11, color: '#5a6a8a', textAlign: 'center' }}>
+          Cargando datos DeFi + rotacion...
+        </div>
+      </div>
+    )
+  }
+
+  const fmtM = (v) => {
+    if (v == null) return '—'
+    if (v >= 1e6) return `${(v / 1e6).toFixed(2)}M`
+    if (v >= 1e3) return `${(v / 1e3).toFixed(0)}k`
+    return v.toFixed(0)
+  }
+
+  // Category display config
+  const catMeta = {
+    liquid_staking: { label: 'Liquid Staking', color: '#38bdf8', desc: 'ETH stakeado via Lido, Rocket Pool, etc.' },
+    restaking:      { label: 'Restaking',      color: '#a78bfa', desc: 'ETH re-stakeado (EigenLayer)' },
+    lending:        { label: 'Lending',        color: '#fbbf24', desc: 'ETH depositado como colateral o prestado' },
+    cdp:            { label: 'CDP / Vaults',   color: '#fb923c', desc: 'ETH bloqueado en vaults (Maker, etc.)' },
+  }
+
+  // Rotation signal
+  const rotMeta = {
+    BTC_TO_ETH: { label: 'BTC → ETH', color: '#22c55e', desc: 'Takers comprando ETH con BTC agresivamente' },
+    ETH_TO_BTC: { label: 'ETH → BTC', color: '#ef4444', desc: 'Takers vendiendo ETH por BTC agresivamente' },
+    BALANCED:   { label: 'BALANCEADO', color: '#8a9ac0', desc: 'Sin rotacion clara entre BTC y ETH' },
+  }
+  const rm = rotMeta[rot.signal] || rotMeta.BALANCED
+
+  // Total map
+  const cexEth = cex.reservesTotalEth || 0
+  const defiEth = defi.totalDefiEth || 0
+  const grandTotal = cexEth + defiEth
+  const cexPct = grandTotal > 0 ? (cexEth / grandTotal * 100) : 0
+  const defiPct = grandTotal > 0 ? (defiEth / grandTotal * 100) : 0
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+        <div style={S.sectionTitle}>ETH CAPITAL MAP · Donde esta el ETH</div>
+        <div style={{ fontSize: 9, color: '#4a5980', ...S.mono }}>
+          DeFi via DefiLlama · Rotacion via Binance ETHBTC
+        </div>
+      </div>
+
+      {/* Distribution bar */}
+      {grandTotal > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: '#5a6a8a', marginBottom: 3 }}>
+            <span>CEX {fmtM(cexEth)} ETH ({cexPct.toFixed(1)}%)</span>
+            <span>DeFi {fmtM(defiEth)} ETH ({defiPct.toFixed(1)}%)</span>
+          </div>
+          <div style={{ display: 'flex', height: 8, borderRadius: 4, overflow: 'hidden', gap: 1 }}>
+            <div style={{ width: `${cexPct}%`, background: '#f59e0b', borderRadius: '4px 0 0 4px', transition: 'width 0.6s' }} />
+            <div style={{ width: `${defiPct}%`, background: '#38bdf8', borderRadius: '0 4px 4px 0', transition: 'width 0.6s' }} />
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: '#4a5980', marginTop: 2 }}>
+            <span>Total rastreado: {fmtM(grandTotal)} ETH</span>
+            <span style={{ color: '#f59e0b' }}>CEX</span>
+            <span style={{ color: '#38bdf8' }}>DeFi</span>
+          </div>
+        </div>
+      )}
+
+      {/* Three columns: DeFi breakdown | Rotation | Summary */}
+      <div style={{ display: 'grid', gridTemplateColumns: hasRotation ? '1fr 1fr' : '1fr', gap: 8, marginBottom: 10 }}>
+
+        {/* DeFi by category */}
+        {hasDefi && (
+          <div style={{ padding: '10px 12px', borderRadius: 8, border: '1px solid #1a2544', background: '#0a1020' }}>
+            <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 6 }}>DEFI ETH DISTRIBUTION</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: '#38bdf8', ...S.mono, marginBottom: 8 }}>
+              {fmtM(defi.totalDefiEth)} ETH
+            </div>
+            {defi.byCategory && Object.entries(defi.byCategory).map(([catKey, catData]) => {
+              const cm = catMeta[catKey] || { label: catKey, color: '#8a9ac0' }
+              const barW = defi.totalDefiEth > 0 ? Math.max(2, (catData.totalEth / defi.totalDefiEth) * 100) : 0
+              return (
+                <div key={catKey} style={{ marginBottom: 6 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, marginBottom: 2 }}>
+                    <span style={{ color: cm.color, fontWeight: 600 }}>{cm.label}</span>
+                    <span style={{ color: '#c8d6e5', ...S.mono }}>{fmtM(catData.totalEth)}</span>
+                  </div>
+                  <div style={{ height: 4, background: '#111a35', borderRadius: 2, overflow: 'hidden' }}>
+                    <div style={{ width: `${barW}%`, height: '100%', background: cm.color, opacity: 0.6, borderRadius: 2, transition: 'width 0.6s' }} />
+                  </div>
+                  {catData.protocols && (
+                    <div style={{ fontSize: 9, color: '#4a5980', marginTop: 2 }}>
+                      {catData.protocols.map(p => `${p.name} ${fmtM(p.ethAmount)}`).join(' · ')}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )}
+
+        {/* ETHBTC Rotation */}
+        {hasRotation && (
+          <div style={{ padding: '10px 12px', borderRadius: 8, border: '1px solid #1a2544', background: '#0a1020' }}>
+            <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1, marginBottom: 6 }}>ROTACION BTC / ETH</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+              <span style={{ fontSize: 15, fontWeight: 700, color: rm.color, ...S.mono }}>{rm.label}</span>
+            </div>
+            <div style={{ fontSize: 10, color: '#8a9ac0', marginBottom: 8 }}>{rm.desc}</div>
+
+            {/* Taker ratio gauge */}
+            <div style={{ marginBottom: 8 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: '#5a6a8a', marginBottom: 3 }}>
+                <span>ETH→BTC</span>
+                <span>Taker Buy Ratio</span>
+                <span>BTC→ETH</span>
+              </div>
+              <div style={{ position: 'relative', height: 8, background: '#111a35', borderRadius: 4 }}>
+                {/* Center line at 0.5 */}
+                <div style={{ position: 'absolute', left: '50%', top: 0, width: 1, height: '100%', background: '#2a3555' }} />
+                {/* Current ratio marker */}
+                <div style={{
+                  position: 'absolute',
+                  left: `${(rot.currentRatio || 0.5) * 100}%`,
+                  top: -2, width: 12, height: 12, borderRadius: '50%',
+                  background: rm.color, border: '2px solid #0a1020',
+                  transform: 'translateX(-50%)', transition: 'left 0.6s',
+                }} />
+              </div>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 4, fontSize: 10 }}>
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ color: '#5a6a8a', fontSize: 9 }}>ACTUAL</div>
+                <div style={{ color: '#c8d6e5', fontWeight: 700, ...S.mono }}>{(rot.currentRatio * 100).toFixed(1)}%</div>
+              </div>
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ color: '#5a6a8a', fontSize: 9 }}>AVG 24H</div>
+                <div style={{ color: '#c8d6e5', fontWeight: 700, ...S.mono }}>{(rot.avg24h * 100).toFixed(1)}%</div>
+              </div>
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ color: '#5a6a8a', fontSize: 9 }}>AVG 7D</div>
+                <div style={{ color: '#c8d6e5', fontWeight: 700, ...S.mono }}>{(rot.avg7d * 100).toFixed(1)}%</div>
+              </div>
+            </div>
+
+            {/* ETHBTC price change */}
+            <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ fontSize: 9, color: '#5a6a8a' }}>ETH/BTC 7d</span>
+              <span style={{ fontSize: 12, fontWeight: 700, ...S.mono,
+                color: rot.priceChange7dPct > 0 ? '#22c55e' : rot.priceChange7dPct < 0 ? '#ef4444' : '#8a9ac0' }}>
+                {rot.priceChange7dPct >= 0 ? '+' : ''}{rot.priceChange7dPct?.toFixed(2)}%
+              </span>
+            </div>
+
+            {/* Sparkline */}
+            {rot.hourly && rot.hourly.length >= 2 && (
+              <div style={{ marginTop: 6 }}>
+                <div style={{ fontSize: 9, color: '#4a5980', marginBottom: 2 }}>Taker buy ratio 48h</div>
+                <Spark data={rot.hourly} valueKey="ratio" height={40} width={400} color={rm.color} showZero={false} />
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div style={{ padding: '5px 8px', background: '#0a1020', borderRadius: 5, fontSize: 9, color: '#5a6a8a', lineHeight: 1.5 }}>
+        <b style={{ color: '#8a9ac0' }}>Capital Map</b>: muestra donde esta el ETH — en CEX (disponible para trading) vs DeFi (productivo: staking, lending, colateral).
+        Mas ETH en DeFi = menos oferta liquida disponible.
+        <br /><b style={{ color: '#8a9ac0' }}>Rotacion</b>: taker buy ratio del par ETHBTC spot. &gt;54% = BTC holders comprando ETH (rotacion favorable). &lt;46% = ETH holders saliendo a BTC.
+        <br />DeFi data via DefiLlama (cache 1h). No incluye ETH en bridges, wallets personales, ni staking nativo sin liquid staking token.
+      </div>
+    </div>
+  )
+}
+
+
 // ── Money Quality Panel (plata nueva vs short covering) ─────────────
 function MoneyQualityPanel({ moneyQuality }) {
   const mq = moneyQuality || {}
@@ -3599,6 +3787,15 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
       {/* CEX NETFLOWS — spot exchange pressure via Dune Analytics */}
       <div style={{ ...S.card, marginBottom: 10 }}>
         <CexNetflowsPanel cexNetflows={data?.cexNetflows} />
+      </div>
+
+      {/* ETH CAPITAL MAP — where is the ETH + BTC rotation */}
+      <div style={{ ...S.card, marginBottom: 10 }}>
+        <EthCapitalMapPanel
+          defiEthMap={data?.defiEthMap}
+          ethBtcRotation={data?.ethBtcRotation}
+          cexReserves={data?.cexNetflows?.relativeContext || {}}
+        />
       </div>
 
       {/* SETUP DEL MOMENTO — stoch alignment + MQ filter */}
