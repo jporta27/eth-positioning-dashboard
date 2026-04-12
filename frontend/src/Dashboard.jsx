@@ -1642,13 +1642,24 @@ function EthCapitalMapPanel({ defiEthMap, ethBtcRotation, cexReserves }) {
               </div>
             </div>
 
-            {/* ETHBTC price change */}
-            <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <span style={{ fontSize: 9, color: '#5a6a8a' }}>ETH/BTC 7d</span>
-              <span style={{ fontSize: 12, fontWeight: 700, ...S.mono,
-                color: rot.priceChange7dPct > 0 ? '#22c55e' : rot.priceChange7dPct < 0 ? '#ef4444' : '#8a9ac0' }}>
-                {rot.priceChange7dPct >= 0 ? '+' : ''}{rot.priceChange7dPct?.toFixed(2)}%
-              </span>
+            {/* ETHBTC price + volume materiality */}
+            <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4 }}>
+              <div>
+                <div style={{ fontSize: 9, color: '#5a6a8a' }}>ETH/BTC 7d</div>
+                <div style={{ fontSize: 12, fontWeight: 700, ...S.mono,
+                  color: rot.priceChange7dPct > 0 ? '#22c55e' : rot.priceChange7dPct < 0 ? '#ef4444' : '#8a9ac0' }}>
+                  {rot.priceChange7dPct >= 0 ? '+' : ''}{rot.priceChange7dPct?.toFixed(2)}%
+                </div>
+              </div>
+              <div style={{ textAlign: 'right' }}>
+                <div style={{ fontSize: 9, color: '#5a6a8a' }}>Vol 24h ETHBTC</div>
+                <div style={{ fontSize: 12, fontWeight: 700, ...S.mono, color: '#c8d6e5' }}>
+                  {rot.volume24hEth != null ? `${(rot.volume24hEth / 1e3).toFixed(1)}k ETH` : '—'}
+                </div>
+                <div style={{ fontSize: 8, color: '#4a5980', marginTop: 1 }}>
+                  vol. bajo vs ETHUSDT — contexto, no signal
+                </div>
+              </div>
             </div>
 
             {/* Sparkline */}
@@ -1665,7 +1676,8 @@ function EthCapitalMapPanel({ defiEthMap, ethBtcRotation, cexReserves }) {
       <div style={{ padding: '5px 8px', background: '#0a1020', borderRadius: 5, fontSize: 9, color: '#5a6a8a', lineHeight: 1.5 }}>
         <b style={{ color: '#8a9ac0' }}>Capital Map</b>: muestra donde esta el ETH — en CEX (disponible para trading) vs DeFi (productivo: staking, lending, colateral).
         Mas ETH en DeFi = menos oferta liquida disponible.
-        <br /><b style={{ color: '#8a9ac0' }}>Rotacion</b>: taker buy ratio del par ETHBTC spot. &gt;54% = BTC holders comprando ETH (rotacion favorable). &lt;46% = ETH holders saliendo a BTC.
+        <br /><b style={{ color: '#8a9ac0' }}>Rotacion</b>: taker buy ratio del par ETHBTC spot (Binance). &gt;54% = BTC holders comprando ETH. &lt;46% = ETH holders saliendo a BTC.
+        <b style={{ color: '#f59e0b' }}>ATENCION</b>: ETHBTC opera ~5-8% del vol de ETHUSDT — usar como contexto complementario, no como signal principal.
         <br />DeFi data via DefiLlama (cache 1h). No incluye ETH en bridges, wallets personales, ni staking nativo sin liquid staking token.
       </div>
     </div>

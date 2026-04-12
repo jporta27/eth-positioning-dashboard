@@ -1509,6 +1509,9 @@ async def fetch_ethbtc_taker(client: httpx.AsyncClient) -> Optional[dict]:
         else:
             signal = "BALANCED"
 
+        # Volume stats for materiality assessment
+        vol_24h_eth = sum(h["volume"] for h in last_24)
+
         return {
             "currentRatio": round(current, 4),
             "avg24h": round(avg_24h, 4),
@@ -1516,6 +1519,7 @@ async def fetch_ethbtc_taker(client: httpx.AsyncClient) -> Optional[dict]:
             "priceChange7dPct": round(price_chg, 2),
             "currentPrice": hours[-1]["close"],
             "signal": signal,
+            "volume24hEth": round(vol_24h_eth, 2),
             "hourly": hours[-48:],  # last 48h for spark chart
         }
     except Exception as e:
