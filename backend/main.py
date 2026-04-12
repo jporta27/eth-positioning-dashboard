@@ -51,6 +51,7 @@ PORT = int(os.getenv("PORT", 8000))
 DUNE_API_KEY = os.getenv("DUNE_API_KEY", "")
 DUNE_QUERY_ID = os.getenv("DUNE_QUERY_ID", "6984181")
 DUNE_CACHE_TTL = 1800  # 30 min — Dune query is hourly granularity
+DUNE_MAX_AGE_HOURS = 2  # trigger re-execution if results older than this
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dashboard")
@@ -1197,26 +1198,101 @@ async def fetch_depth() -> dict:
     return current_depth
 
 
+async def _dune_trigger_and_poll(client: httpx.AsyncClient) -> Optional[dict]:
+    """Trigger a fresh Dune execution and poll until complete (max ~90s)."""
+    headers = {"X-DUNE-API-KEY": DUNE_API_KEY}
+    # Step 1: trigger execution
+    exec_resp = await client.post(
+        f"https://api.dune.com/api/v1/query/{DUNE_QUERY_ID}/execute",
+        headers=headers, timeout=15.0,
+    )
+    exec_resp.raise_for_status()
+    execution_id = exec_resp.json().get("execution_id")
+    if not execution_id:
+        logger.warning("Dune execute returned no execution_id")
+        return None
+    logger.info(f"Dune execution triggered: {execution_id}")
+
+    # Step 2: poll status (up to ~90s, 5s intervals)
+    for attempt in range(18):
+        await asyncio.sleep(5)
+        status_resp = await client.get(
+            f"https://api.dune.com/api/v1/execution/{execution_id}/status",
+            headers=headers, timeout=10.0,
+        )
+        state = status_resp.json().get("state", "")
+        if state == "QUERY_STATE_COMPLETED":
+            break
+        if state in ("QUERY_STATE_FAILED", "QUERY_STATE_CANCELLED", "QUERY_STATE_EXPIRED"):
+            logger.warning(f"Dune execution {execution_id} ended with state: {state}")
+            return None
+    else:
+        logger.warning(f"Dune execution {execution_id} timed out after 90s")
+        return None
+
+    # Step 3: fetch results of this execution
+    res_resp = await client.get(
+        f"https://api.dune.com/api/v1/execution/{execution_id}/results",
+        headers=headers, timeout=30.0,
+    )
+    res_resp.raise_for_status()
+    data = res_resp.json()
+    logger.info(f"Dune fresh execution ok: {data.get('result', {}).get('metadata', {}).get('row_count', 0)} rows")
+    return data
+
+
 async def fetch_dune_cex_netflows(client: httpx.AsyncClient) -> Optional[dict]:
-    """Fetch ETH CEX netflows from Dune Analytics (cached query result)."""
+    """Fetch ETH CEX netflows from Dune Analytics.
+
+    Strategy:
+      1. Return in-memory cache if fresh (< DUNE_CACHE_TTL).
+      2. Otherwise hit GET /results (instant, cached on Dune side).
+      3. If Dune's cached results are older than DUNE_MAX_AGE_HOURS,
+         trigger a fresh execution via POST /execute, poll until done,
+         then fetch those results.  Falls back to stale data on timeout.
+    """
     global dune_cache, dune_cache_ts
     if not DUNE_API_KEY:
         return None
     now = time.time()
     if dune_cache and (now - dune_cache_ts) < DUNE_CACHE_TTL:
         return dune_cache
+
+    headers = {"X-DUNE-API-KEY": DUNE_API_KEY}
     try:
+        # Quick read of the latest cached result on Dune
         url = f"https://api.dune.com/api/v1/query/{DUNE_QUERY_ID}/results"
-        resp = await client.get(
-            url,
-            headers={"X-DUNE-API-KEY": DUNE_API_KEY},
-            timeout=30.0,
-        )
+        resp = await client.get(url, headers=headers, timeout=30.0)
         resp.raise_for_status()
         data = resp.json()
+
+        # Check how old the execution is
+        exec_ended = data.get("execution_ended_at", "")
+        is_stale = False
+        if exec_ended:
+            try:
+                ended_dt = datetime.fromisoformat(exec_ended.replace("Z", "+00:00"))
+                age_hours = (datetime.now(timezone.utc) - ended_dt).total_seconds() / 3600
+                logger.info(f"Dune cached result age: {age_hours:.1f}h (max {DUNE_MAX_AGE_HOURS}h)")
+                if age_hours > DUNE_MAX_AGE_HOURS:
+                    is_stale = True
+            except Exception:
+                is_stale = True  # can't parse → assume stale
+        else:
+            is_stale = True  # no timestamp → assume stale
+
+        if is_stale:
+            logger.info("Dune results stale — triggering fresh execution...")
+            fresh = await _dune_trigger_and_poll(client)
+            if fresh:
+                data = fresh
+            else:
+                logger.info("Fresh execution failed/timed out — using stale results")
+
         dune_cache = data
         dune_cache_ts = now
-        logger.info(f"Dune fetch ok: {data.get('result', {}).get('metadata', {}).get('row_count', 0)} rows")
+        row_count = data.get("result", {}).get("metadata", {}).get("row_count", 0)
+        logger.info(f"Dune fetch ok: {row_count} rows")
         return data
     except Exception as e:
         logger.warning(f"Dune fetch failed: {e}")
