@@ -3671,6 +3671,15 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
         </div>
       </div>
 
+      {/* ═══════════════════════════════════════════════════════════════
+           SECCION 1: IMPORTANTE — Sesgo + Señal accionable
+           ═══════════════════════════════════════════════════════════════ */}
+      <div style={{ borderLeft: '3px solid #22c55e', paddingLeft: 10, marginBottom: 6 }}>
+        <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: 2, color: '#22c55e', fontFamily: "'IBM Plex Sans', sans-serif" }}>
+          PRINCIPAL — Sesgo + Señal
+        </span>
+      </div>
+
       {/* MARKET STATE */}
       {signals.marketState && (() => {
         const ms = signals.marketState
@@ -3791,25 +3800,6 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
         )
       })()}
 
-      {/* MONEY QUALITY — Plata Nueva vs Short Covering */}
-      <div style={{ ...S.card, marginBottom: 10 }}>
-        <MoneyQualityPanel moneyQuality={data?.moneyQuality} />
-      </div>
-
-      {/* CEX NETFLOWS — spot exchange pressure via Dune Analytics */}
-      <div style={{ ...S.card, marginBottom: 10 }}>
-        <CexNetflowsPanel cexNetflows={data?.cexNetflows} />
-      </div>
-
-      {/* ETH CAPITAL MAP — where is the ETH + BTC rotation */}
-      <div style={{ ...S.card, marginBottom: 10 }}>
-        <EthCapitalMapPanel
-          defiEthMap={data?.defiEthMap}
-          ethBtcRotation={data?.ethBtcRotation}
-          cexReserves={data?.cexNetflows?.relativeContext || {}}
-        />
-      </div>
-
       {/* SETUP DEL MOMENTO — stoch alignment + MQ filter */}
       <div style={{ ...S.card, marginBottom: 10 }}>
         <SetupPanel
@@ -3821,13 +3811,26 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
         />
       </div>
 
-      {/* STOCHASTICS */}
+      {/* MONEY QUALITY — Plata Nueva vs Short Covering */}
       <div style={{ ...S.card, marginBottom: 10 }}>
-        <div style={S.sectionTitle}>Osciladores Estocásticos · Slow (400,40,10) + Fast (100,10,4)</div>
-        <StochasticPanel stochastics={data?.stochastics} timeframe={stochTf} setTimeframe={setStochTf} />
+        <MoneyQualityPanel moneyQuality={data?.moneyQuality} />
       </div>
 
-      {/* GRID — 4 cards */}
+      {/* ═══════════════════════════════════════════════════════════════
+           SECCION 2: CONTEXTO — Data que informa el sesgo
+           ═══════════════════════════════════════════════════════════════ */}
+      <div style={{ borderLeft: '3px solid #f59e0b', paddingLeft: 10, marginBottom: 6, marginTop: 6 }}>
+        <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: 2, color: '#f59e0b', fontFamily: "'IBM Plex Sans', sans-serif" }}>
+          CONTEXTO — Flujos + Posicionamiento
+        </span>
+      </div>
+
+      {/* CEX NETFLOWS — spot exchange pressure via Dune Analytics */}
+      <div style={{ ...S.card, marginBottom: 10 }}>
+        <CexNetflowsPanel cexNetflows={data?.cexNetflows} />
+      </div>
+
+      {/* GRID — 4 cards: Funding, OI, L/S, Taker */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(270px, 1fr))', gap: 10 }}>
 
         {/* FUNDING */}
@@ -4028,6 +4031,21 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
         <LiquidationMap liqMap={data?.liquidationMap} />
       </div>
 
+      {/* KEY LEVELS */}
+      <div style={{ ...S.card, marginTop: 10 }}>
+        <div style={S.sectionTitle}>Niveles Clave Consolidados — Opciones + Volume Profile + Order Book</div>
+        <KeyLevelsPanel data={data ? { ...data, _depth: depth } : null} />
+      </div>
+
+      {/* ETH CAPITAL MAP — DeFi + BTC rotation */}
+      <div style={{ ...S.card, marginTop: 10 }}>
+        <EthCapitalMapPanel
+          defiEthMap={data?.defiEthMap}
+          ethBtcRotation={data?.ethBtcRotation}
+          cexReserves={data?.cexNetflows?.relativeContext || {}}
+        />
+      </div>
+
       {/* IV TERM STRUCTURE + IV vs RV + ETH/BTC + FUNDING SPREAD */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 10, marginTop: 10 }}>
         {/* IV Term Structure */}
@@ -4163,10 +4181,19 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
         </div>
       </div>
 
-      {/* KEY LEVELS PANEL */}
-      <div style={{ ...S.card, marginTop: 10 }}>
-        <div style={S.sectionTitle}>Niveles Clave Consolidados — Opciones + Volume Profile + Order Book</div>
-        <KeyLevelsPanel data={data ? { ...data, _depth: depth } : null} />
+      {/* ═══════════════════════════════════════════════════════════════
+           SECCION 3: HERRAMIENTAS — Analisis detallado
+           ═══════════════════════════════════════════════════════════════ */}
+      <div style={{ borderLeft: '3px solid #38bdf8', paddingLeft: 10, marginBottom: 6, marginTop: 14 }}>
+        <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: 2, color: '#38bdf8', fontFamily: "'IBM Plex Sans', sans-serif" }}>
+          HERRAMIENTAS — Analisis detallado
+        </span>
+      </div>
+
+      {/* STOCHASTICS */}
+      <div style={{ ...S.card, marginBottom: 10 }}>
+        <div style={S.sectionTitle}>Osciladores Estocásticos · Slow (400,40,10) + Fast (100,10,4)</div>
+        <StochasticPanel stochastics={data?.stochastics} timeframe={stochTf} setTimeframe={setStochTf} />
       </div>
 
       {/* VOLATILITY + VOLUME PROFILE SUMMARY */}
