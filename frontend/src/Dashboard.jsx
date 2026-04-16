@@ -3626,6 +3626,16 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
   const [statePeriod, setStatePeriod] = useState('1h')
   const [vpPeriod, setVpPeriod] = useState('8d')
   const [stochTf, setStochTf] = useState('1h')
+  const [horizon, setHorizon] = useState('intraday')
+
+  // Panel ordering per time horizon — all panels always shown, just reordered
+  const horizonOrders = {
+    scalp:    ['state','taker_grid','orderbook','liqmap','stochastics','setup','mq','funding_grid','options','levels','netflows','iv_grid','ethbtc_grid','vol_vp','takerflow','vp_chart','capitalmap','explanations'],
+    intraday: ['state','setup','mq','funding_grid','netflows','options','liqmap','levels','taker_grid','stochastics','iv_grid','ethbtc_grid','vol_vp','capitalmap','takerflow','orderbook','vp_chart','explanations'],
+    swing:    ['state','netflows','mq','options','setup','levels','capitalmap','iv_grid','ethbtc_grid','liqmap','funding_grid','stochastics','vol_vp','taker_grid','takerflow','orderbook','vp_chart','explanations'],
+    macro:    ['state','capitalmap','netflows','iv_grid','ethbtc_grid','options','mq','levels','setup','funding_grid','vol_vp','liqmap','stochastics','taker_grid','vp_chart','takerflow','orderbook','explanations'],
+  }
+  const panelOrder = horizonOrders[horizon] || horizonOrders.intraday
   const signals = useMemo(() => computeSignals(data, statePeriod, stochTf), [data, statePeriod, stochTf])
   const bn = data?.binance || {}
   const okx = data?.okx || {}
@@ -3644,7 +3654,7 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
     <div style={{ maxWidth: 1280, margin: '0 auto', padding: '16px 12px' }}>
 
       {/* HEADER */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14, flexWrap: 'wrap', gap: 8 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10, flexWrap: 'wrap', gap: 8 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <div style={{ width: 8, height: 8, borderRadius: '50%', background: error ? '#ef4444' : '#22c55e', boxShadow: error ? '0 0 10px #ef4444' : '0 0 10px #22c55e' }} />
           <span style={{ fontSize: 22, fontWeight: 700, letterSpacing: -0.5 }}>ETH PERP</span>
@@ -3656,7 +3666,29 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
         </div>
       </div>
 
-      {/* PRICE */}
+      {/* HORIZON TABS */}
+      <div style={{ display: 'flex', gap: 0, marginBottom: 12, borderRadius: 6, overflow: 'hidden', border: '1px solid #1a2544' }}>
+        {[
+          { id: 'scalp',    label: 'SCALP',    sub: '1m-15m', color: '#ef4444' },
+          { id: 'intraday', label: 'INTRADAY', sub: '1h-4h',  color: '#f59e0b' },
+          { id: 'swing',    label: 'SWING',    sub: '1d-7d',  color: '#22c55e' },
+          { id: 'macro',    label: 'MACRO',    sub: '7d-30d+', color: '#38bdf8' },
+        ].map(h => (
+          <button key={h.id} onClick={() => setHorizon(h.id)} style={{
+            flex: 1, padding: '8px 4px', border: 'none', cursor: 'pointer',
+            background: horizon === h.id ? `${h.color}18` : '#0a1020',
+            borderBottom: horizon === h.id ? `2px solid ${h.color}` : '2px solid transparent',
+            transition: 'all 0.2s',
+          }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: horizon === h.id ? h.color : '#4a5980',
+              letterSpacing: 1.5, fontFamily: "'IBM Plex Mono', monospace" }}>{h.label}</div>
+            <div style={{ fontSize: 9, color: horizon === h.id ? h.color + 'aa' : '#2a3555',
+              fontFamily: "'IBM Plex Mono', monospace", marginTop: 1 }}>{h.sub}</div>
+          </button>
+        ))}
+      </div>
+
+      {/* PRICE — always first */}
       <div style={{ ...S.card, marginBottom: 10, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 14 }}>
           <span style={{ fontSize: 36, fontWeight: 700, ...S.mono, letterSpacing: -1 }}>${fmt(bn.price)}</span>
@@ -3671,15 +3703,10 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
         </div>
       </div>
 
-      {/* ═══════════════════════════════════════════════════════════════
-           SECCION 1: IMPORTANTE — Sesgo + Señal accionable
-           ═══════════════════════════════════════════════════════════════ */}
-      <div style={{ borderLeft: '3px solid #22c55e', paddingLeft: 10, marginBottom: 6 }}>
-        <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: 2, color: '#22c55e', fontFamily: "'IBM Plex Sans', sans-serif" }}>
-          PRINCIPAL — Sesgo + Señal
-        </span>
-      </div>
+      {/* ── Panels rendered in horizon order ── */}
+      {panelOrder.map(id => <div key={id}>{({
 
+      state: (<div>
       {/* MARKET STATE */}
       {signals.marketState && (() => {
         const ms = signals.marketState
@@ -3799,8 +3826,9 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
           </div>
         )
       })()}
+      </div>),
 
-      {/* SETUP DEL MOMENTO — stoch alignment + MQ filter */}
+      setup: (
       <div style={{ ...S.card, marginBottom: 10 }}>
         <SetupPanel
           stochastics={data?.stochastics}
@@ -3809,29 +3837,20 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
           stochTf={stochTf}
           setStochTf={setStochTf}
         />
-      </div>
+      </div>),
 
-      {/* MONEY QUALITY — Plata Nueva vs Short Covering */}
+      mq: (
       <div style={{ ...S.card, marginBottom: 10 }}>
         <MoneyQualityPanel moneyQuality={data?.moneyQuality} />
-      </div>
+      </div>),
 
-      {/* ═══════════════════════════════════════════════════════════════
-           SECCION 2: CONTEXTO — Data que informa el sesgo
-           ═══════════════════════════════════════════════════════════════ */}
-      <div style={{ borderLeft: '3px solid #f59e0b', paddingLeft: 10, marginBottom: 6, marginTop: 6 }}>
-        <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: 2, color: '#f59e0b', fontFamily: "'IBM Plex Sans', sans-serif" }}>
-          CONTEXTO — Flujos + Posicionamiento
-        </span>
-      </div>
-
-      {/* CEX NETFLOWS — spot exchange pressure via Dune Analytics */}
+      netflows: (
       <div style={{ ...S.card, marginBottom: 10 }}>
         <CexNetflowsPanel cexNetflows={data?.cexNetflows} />
-      </div>
+      </div>),
 
-      {/* GRID — 4 cards: Funding, OI, L/S, Taker */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(270px, 1fr))', gap: 10 }}>
+      funding_grid: (
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(270px, 1fr))', gap: 10, marginBottom: 10 }}>
 
         {/* FUNDING */}
         <div style={S.card}>
@@ -3902,7 +3921,10 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
           </div>
           {signals.oi && <Signal level={signals.oi.level} text={signals.oi.text} />}
         </div>
+      </div>),
 
+      taker_grid: (
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(270px, 1fr))', gap: 10, marginBottom: 10 }}>
         {/* LONG/SHORT + DIVERGENCIA */}
         <div style={S.card}>
           <div style={S.sectionTitle}>Long / Short Ratio</div>
@@ -4011,43 +4033,43 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
             {signals.taker && <Signal level={signals.taker.level} text={signals.taker.text} />}
           </div>
         </div>
-      </div>
+      </div>),
 
-      {/* OPTIONS — Multi-exchange GEX */}
-      <div style={{ ...S.card, marginTop: 10 }}>
+      options: (
+      <div style={{ ...S.card, marginBottom: 10 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 12 }}>
           <div style={S.sectionTitle}>Opciones ETH — Deribit + Bybit + OKX</div>
           <div style={{ ...S.mono, fontSize: 9, color: '#3a4a6a' }}>GEX · Gamma Flip · Call/Put Walls · Max Pain · 60 días</div>
         </div>
         <OptionsPanel options={data?.options} marketVolume={data?.marketVolume} />
-      </div>
+      </div>),
 
-      {/* LIQUIDATION MAP */}
-      <div style={{ ...S.card, marginTop: 10 }}>
+      liqmap: (
+      <div style={{ ...S.card, marginBottom: 10 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 12 }}>
           <div style={S.sectionTitle}>Mapa de Liquidaciones Estimado</div>
           <div style={{ ...S.mono, fontSize: 9, color: '#3a4a6a' }}>Binance + OKX + Bybit + Hyperliquid</div>
         </div>
         <LiquidationMap liqMap={data?.liquidationMap} />
-      </div>
+      </div>),
 
-      {/* KEY LEVELS */}
-      <div style={{ ...S.card, marginTop: 10 }}>
+      levels: (
+      <div style={{ ...S.card, marginBottom: 10 }}>
         <div style={S.sectionTitle}>Niveles Clave Consolidados — Opciones + Volume Profile + Order Book</div>
         <KeyLevelsPanel data={data ? { ...data, _depth: depth } : null} />
-      </div>
+      </div>),
 
-      {/* ETH CAPITAL MAP — DeFi + BTC rotation */}
-      <div style={{ ...S.card, marginTop: 10 }}>
+      capitalmap: (
+      <div style={{ ...S.card, marginBottom: 10 }}>
         <EthCapitalMapPanel
           defiEthMap={data?.defiEthMap}
           ethBtcRotation={data?.ethBtcRotation}
           cexReserves={data?.cexNetflows?.relativeContext || {}}
         />
-      </div>
+      </div>),
 
-      {/* IV TERM STRUCTURE + IV vs RV + ETH/BTC + FUNDING SPREAD */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 10, marginTop: 10 }}>
+      iv_grid: (
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 10, marginBottom: 10 }}>
         {/* IV Term Structure */}
         <div style={S.card}>
           <div style={S.sectionTitle}>IV Term Structure</div>
@@ -4094,10 +4116,10 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
             )
           })() : <div style={{ color: '#4a5980', fontSize: 12 }}>Calculando IV vs RV...</div>}
         </div>
-      </div>
+      </div>),
 
-      {/* ETH/BTC + FUNDING SPREAD */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 10, marginTop: 10 }}>
+      ethbtc_grid: (
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 10, marginBottom: 10 }}>
         {/* ETH/BTC Relative Strength */}
         <div style={S.card}>
           <div style={S.sectionTitle}>ETH/BTC Relative Strength</div>
@@ -4179,25 +4201,16 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
             )
           })() : <div style={{ color: '#4a5980', fontSize: 12 }}>Calculando funding spread...</div>}
         </div>
-      </div>
+      </div>),
 
-      {/* ═══════════════════════════════════════════════════════════════
-           SECCION 3: HERRAMIENTAS — Analisis detallado
-           ═══════════════════════════════════════════════════════════════ */}
-      <div style={{ borderLeft: '3px solid #38bdf8', paddingLeft: 10, marginBottom: 6, marginTop: 14 }}>
-        <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: 2, color: '#38bdf8', fontFamily: "'IBM Plex Sans', sans-serif" }}>
-          HERRAMIENTAS — Analisis detallado
-        </span>
-      </div>
-
-      {/* STOCHASTICS */}
+      stochastics: (
       <div style={{ ...S.card, marginBottom: 10 }}>
         <div style={S.sectionTitle}>Osciladores Estocásticos · Slow (400,40,10) + Fast (100,10,4)</div>
         <StochasticPanel stochastics={data?.stochastics} timeframe={stochTf} setTimeframe={setStochTf} />
-      </div>
+      </div>),
 
-      {/* VOLATILITY + VOLUME PROFILE SUMMARY */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(350px, 1fr))', gap: 10, marginTop: 10 }}>
+      vol_vp: (
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(350px, 1fr))', gap: 10, marginBottom: 10 }}>
         <div style={S.card}>
           <div style={S.sectionTitle}>Volatilidad Realizada</div>
           <VolatilityPanel volatility={data?.volatility} />
@@ -4211,22 +4224,22 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
             setPeriod={setVpPeriod}
           />
         </div>
-      </div>
+      </div>),
 
-      {/* TAKER FLOW — cumulative delta by period */}
-      <div style={{ ...S.card, marginTop: 10 }}>
+      takerflow: (
+      <div style={{ ...S.card, marginBottom: 10 }}>
         <div style={S.sectionTitle}>Flujo Acumulado Taker — Buy vs Sell por período</div>
         <TakerFlow flow={bn.takerBuySell?.flow} />
-      </div>
+      </div>),
 
-      {/* ORDER BOOK DEPTH */}
-      <div style={{ ...S.card, marginTop: 10 }}>
+      orderbook: (
+      <div style={{ ...S.card, marginBottom: 10 }}>
         <div style={S.sectionTitle}>Order Book — Liquidez y Paredes (±3% del precio)</div>
         <DepthHeatmap depth={depth} depthHistory={depthHistory} />
-      </div>
+      </div>),
 
-      {/* VOLUME PROFILE */}
-      <div style={{ ...S.card, marginTop: 10 }}>
+      vp_chart: (
+      <div style={{ ...S.card, marginBottom: 10 }}>
         <div style={S.sectionTitle}>Volume Profile ±10%</div>
         <VolumeProfile
           data={bn.volumeProfile}
@@ -4237,10 +4250,10 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
           pocInfo={data?.volumeProfile}
           pocByPeriod={data?.volumeProfileByPeriod}
         />
-      </div>
+      </div>),
 
-      {/* INDICATOR EXPLANATIONS */}
-      <div style={{ ...S.card, marginTop: 10 }}>
+      explanations: (
+      <div style={{ ...S.card, marginBottom: 10 }}>
         <div style={S.sectionTitle}>¿Qué significa cada indicador?</div>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 20, fontSize: 12, color: '#6a7aa0', lineHeight: 1.7 }}>
           <div>
@@ -4295,7 +4308,9 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
             </div>
           </div>
         </div>
-      </div>
+      </div>),
+
+      })[id]}</div>)}
 
       <div style={{ textAlign: 'center', marginTop: 14, fontSize: 9, color: '#2a3555', letterSpacing: 0.5 }}>
         ETH POSITIONING DASHBOARD v3 · BINANCE + OKX + BYBIT + HYPERLIQUID + DERIBIT · NO ES ASESORAMIENTO FINANCIERO
