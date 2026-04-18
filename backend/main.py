@@ -1845,16 +1845,48 @@ def _series_realized_vol_20d(rows: list) -> Optional[float]:
 
 
 # ── Risk-free rate (US 3M T-bill via Yahoo ^IRX; FRED DTB3 fallback) ──
+def _sanity_bound_yield_pct(v: Optional[float], max_pct: float, label: str = "yield") -> Optional[float]:
+    """Guard against provider-convention drift (e.g. Yahoo sometimes quotes yields as pct×10).
+
+    If the raw value is above `max_pct` but `v/10` is within bounds, the source is
+    almost certainly using the ×10 convention — divide. If even /10 is out of range,
+    return None (caller treats as missing rather than propagating a bad number).
+    T-bill/Treasury yields have never exceeded ~17% historically (1981 peak),
+    so max_pct=20 for short-dated and 25 for long-dated is safely conservative.
+    """
+    if v is None:
+        return None
+    if v > max_pct:
+        scaled = v / 10.0
+        if 0 < scaled <= max_pct:
+            logger.warning(f"Sanity bound triggered for {label}: raw={v:.3f} → using /10 = {scaled:.3f}")
+            return scaled
+        logger.error(f"Sanity bound FAILED for {label}: raw={v:.3f} (even /10 = {scaled:.3f} out of range). Dropping.")
+        return None
+    if v < 0:
+        logger.warning(f"Sanity bound: negative {label}={v:.3f}; dropping")
+        return None
+    return v
+
+
 async def fetch_risk_free_rate(client: httpx.AsyncClient) -> Optional[dict]:
     """US 3-month T-bill yield as proxy for risk-free rate. Cached 1 day.
 
     Primary source: Yahoo Finance ^IRX (CBOE 13-week T-bill; same infra as /macro).
     Fallback: FRED DTB3 CSV (reachable from most environments, but not all).
+
+    Sanity bounds applied (TAREA 1):
+      - Post-fetch: values > 20% are treated as ×10 convention and divided;
+        values that remain out-of-band after /10 are dropped as corrupt.
+      - Cross-check at warmup: if Yahoo value diverges > 50% from FRED,
+        log ERROR and prefer FRED. Silently skipped if FRED unreachable.
     """
     global risk_free_cache, risk_free_cache_ts
     now_ts = time.time()
     if risk_free_cache and (now_ts - risk_free_cache_ts) < RISK_FREE_CACHE_TTL:
         return risk_free_cache
+
+    is_warmup = not risk_free_cache_ts
 
     # Primary: Yahoo
     rows = await _fetch_yahoo_daily(client, RISK_FREE_YAHOO_SYM, range_="1mo")
@@ -1869,8 +1901,34 @@ async def fetch_risk_free_rate(client: httpx.AsyncClient) -> Optional[dict]:
     if not rows:
         return risk_free_cache or None
     last = rows[-1].get("close")
+    last = _sanity_bound_yield_pct(last, max_pct=20.0, label="3M T-bill")
     if last is None:
         return risk_free_cache or None
+
+    # Cross-check Yahoo vs FRED at warmup — catches silent convention drift
+    if source == "yahoo" and is_warmup:
+        try:
+            fred_rows = await _fetch_fred_csv(client, RISK_FREE_FRED_ID)
+            if fred_rows:
+                fred_last = _sanity_bound_yield_pct(fred_rows[-1].get("close"), 20.0, "FRED DTB3")
+                if fred_last and fred_last > 0:
+                    divergence = abs(last - fred_last) / fred_last
+                    if divergence > 0.5:
+                        logger.error(
+                            f"Risk-free CROSS-CHECK FAILED: yahoo={last:.3f}% fred={fred_last:.3f}% "
+                            f"(divergence {divergence*100:.1f}% > 50%). Preferring FRED."
+                        )
+                        last = fred_last
+                        source, series = "fred", RISK_FREE_FRED_ID
+                    else:
+                        logger.info(
+                            f"Risk-free cross-check ok: yahoo={last:.3f}% fred={fred_last:.3f}% "
+                            f"(divergence {divergence*100:.1f}%)"
+                        )
+        except Exception as e:
+            # FRED unreachable is common; skip cross-check silently
+            logger.debug(f"FRED cross-check skipped: {e}")
+
     r_dec = last / 100.0
     result = {
         "rate":      round(r_dec, 5),
@@ -2297,8 +2355,14 @@ async def fetch_stables_supply(client: httpx.AsyncClient) -> Optional[dict]:
             }
             id_map[symbol] = item.get("id")
 
+    # TAREA 2: verified 2026-04 — /stablecoincharts/all?stablecoin=<id> returns
+    # a per-stable series (3062 points for USDT) distinct from aggregate.
+    # If the endpoint ever regresses and returns the aggregate again, this
+    # guard compares head values and marks the entry as stale rather than
+    # propagating duplicate numbers.
     async def _single(symbol, sid):
         if sid is None:
+            by_stable[symbol]["note"] = "per-stable id missing"
             return
         try:
             r = await client.get(
@@ -2309,10 +2373,25 @@ async def fetch_stables_supply(client: httpx.AsyncClient) -> Optional[dict]:
             r.raise_for_status()
             series = _to_series(r.json())
         except Exception as e:
-            logger.warning(f"Stables chart fetch failed for {symbol}: {e}")
+            logger.warning(f"Stables per-stable chart fetch failed for {symbol} (id={sid}): {e}")
+            by_stable[symbol]["note"] = "per-stable series unavailable"
             return
         if not series:
+            logger.warning(f"Stables per-stable chart empty for {symbol} (id={sid})")
+            by_stable[symbol]["note"] = "per-stable series unavailable"
             return
+        # Guard: if per-stable latest ≈ aggregate latest, the endpoint is regressed
+        # (it's returning the aggregate ignoring the stablecoin param).
+        if agg_series and series:
+            agg_latest = agg_series[-1]["usd"]
+            our_latest = series[-1]["usd"]
+            if agg_latest and our_latest and abs(our_latest / agg_latest - 1.0) < 0.02:
+                logger.error(
+                    f"Stables per-stable endpoint regressed: {symbol} latest={our_latest/1e9:.1f}B "
+                    f"matches aggregate={agg_latest/1e9:.1f}B within 2%. Dropping per-stable values."
+                )
+                by_stable[symbol]["note"] = "per-stable endpoint returning aggregate — dropped"
+                return
         by_stable[symbol].update({
             "delta1dUsd":  _delta_abs(series, 1),
             "delta7dUsd":  _delta_abs(series, 7),
@@ -2327,6 +2406,17 @@ async def fetch_stables_supply(client: httpx.AsyncClient) -> Optional[dict]:
         })
 
     await asyncio.gather(*(_single(s, sid) for s, sid in id_map.items()), return_exceptions=True)
+
+    # Coverage diagnostic: what % of aggregate do the tracked stables cover?
+    if agg_out.get("currentUsd") and by_stable:
+        tracked_sum = sum((v.get("currentUsd") or 0) for v in by_stable.values())
+        coverage_pct = 100 * tracked_sum / agg_out["currentUsd"]
+        if coverage_pct < 50:
+            logger.warning(
+                f"Stables tracked coverage low: {coverage_pct:.1f}% "
+                f"(tracked=${tracked_sum/1e9:.1f}B vs aggregate=${agg_out['currentUsd']/1e9:.1f}B). "
+                f"Tracked list: {list(STABLES_TRACKED.keys())}"
+            )
 
     result = {
         "aggregate":    agg_out,
@@ -2530,8 +2620,18 @@ async def fetch_macro(client: httpx.AsyncClient) -> Optional[dict]:
         close = rows[-1].get("close")
         if close is None:
             return label, None
-        # Note: US10Y on Yahoo is quoted as yield×10 (e.g. 4.512 → 45.12)
-        # Users consume "value" as-is; we surface the raw Yahoo number with a note.
+        # Sanity bound for Treasury yields (Yahoo has historically switched between
+        # % and ×10 conventions). 25% is a safely conservative cap — 1981 peak was ~17%.
+        if label == "US10Y":
+            close = _sanity_bound_yield_pct(close, max_pct=25.0, label=label)
+            if close is None:
+                return label, None
+            # Also normalize the series we pass to _series_change_pct / vol so pct
+            # changes remain comparable across convention switches:
+            for r in rows:
+                if r.get("close") is not None:
+                    bounded = _sanity_bound_yield_pct(r["close"], max_pct=25.0, label=label)
+                    r["close"] = bounded
         return label, {
             "symbol":         symbol,
             "value":          close,
