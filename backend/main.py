@@ -6,15 +6,22 @@ Designed for Railway deployment.
 """
 
 import os
+import re
+import csv
+import io
+import json
 import time
 import math
+import shutil
 import statistics
 import asyncio
 import logging
+import subprocess
 from typing import Optional
 from contextlib import asynccontextmanager
 from collections import deque
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote as urlquote
 
 import httpx
 from fastapi import FastAPI
@@ -67,6 +74,61 @@ DEFILLAMA_CACHE_TTL = 3600  # 1h — reserves change slowly
 DEFILLAMA_ETH_KEYS = {"ETH", "WETH", "STETH", "BETH", "CBETH", "EETH", "WEETH", "RETH"}
 DEFILLAMA_STABLE_KEYS = {"USDT", "USDC", "DAI", "FDUSD", "BUSD", "TUSD", "USDD", "PYUSD", "USDE"}
 
+# ── New data sources (Fase 1) ─────────────────────────────────────────
+# Farside ETF flows (primary) → scrape HTML → SoSoValue (tertiary) → stale
+FARSIDE_CSV_URL  = "https://farside.co.uk/wp-content/uploads/ETH.csv"
+FARSIDE_HTML_URL = "https://farside.co.uk/eth/"
+SOSOVALUE_ETF_URL = "https://api.sosovalue.com/openapi/v2/etf/historicalInflowChart"  # fallback; may require key
+ETF_CACHE_TTL = 21600  # 6h — daily cadence, no need to hit source more often
+
+# Stablecoin supply (DefiLlama /stablecoincharts)
+STABLES_API_URL = "https://stablecoins.llama.fi/stablecoincharts/all"
+STABLES_TRACKED = {"USDT": "Tether", "USDC": "USD Coin"}
+STABLES_CACHE_TTL = 1800  # 30 min
+
+# Macro context — Yahoo Finance v8 chart API (no-key, public) + FRED CSV for risk-free
+# Stooq required an API key as of 2026 — replaced with Yahoo v8, which remains free.
+YAHOO_CHART_BASE = "https://query2.finance.yahoo.com/v8/finance/chart/"
+FRED_CSV_BASE    = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+MACRO_SYMBOLS = {
+    "DXY":   "DX-Y.NYB",
+    "SPX":   "^GSPC",      # S&P 500
+    "VIX":   "^VIX",
+    "US10Y": "^TNX",       # 10Y Treasury yield (x10, divide by 10 for pct)
+    "BTC":   "BTC-USD",
+}
+RISK_FREE_FRED_ID   = "DTB3"   # FRED 3-Month T-bill (secondary fallback)
+RISK_FREE_YAHOO_SYM = "^IRX"   # Yahoo CBOE 13-week T-bill yield (primary; same instrument)
+MACRO_CACHE_TTL     = 300      # 5 min
+RISK_FREE_CACHE_TTL = 86400    # 1d — r is stable intraday
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+# Deribit futures (for basis + expiry calendar)
+DERIBIT_FUTURES_KIND = "future"
+DERIBIT_BASIS_CACHE_TTL = 30  # aligned with CACHE_TTL-ish; basis tracks spot
+
+# Schema version for persistence (Fase 2 parquet writer)
+SCHEMA_VERSION = 1
+
+# Fase 2 — Persistence (opt-in)
+PERSIST_ENABLED = os.getenv("PERSIST_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+PERSIST_PATH    = os.getenv("PERSIST_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data"))
+PERSIST_SNAPSHOT_INTERVAL = 60  # one row per minute
+PERSIST_MICRO_INTERVAL    = 5   # one order-book row every 5s
+
+# PyArrow is optional at import time; the persister self-disables if missing
+try:
+    import pyarrow as _pa
+    import pyarrow.parquet as _pq
+    PERSIST_AVAILABLE = True
+except Exception:
+    _pa = None
+    _pq = None
+    PERSIST_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dashboard")
 
@@ -81,6 +143,25 @@ dune_cache_ts: float = 0
 # DefiLlama reserves cache
 llama_cache: dict = {}
 llama_cache_ts: float = 0
+
+# New caches (Fase 1) — each has its own TTL, module-level for background refresh access
+etf_cache: dict = {}
+etf_cache_ts: float = 0
+
+stables_cache: dict = {}
+stables_cache_ts: float = 0
+
+macro_cache: dict = {}
+macro_cache_ts: float = 0
+
+risk_free_cache: dict = {}
+risk_free_cache_ts: float = 0
+
+deribit_basis_cache: dict = {}
+deribit_basis_cache_ts: float = 0
+
+deribit_futures_raw: list = []  # shared between basis + expiry calendar
+deribit_futures_raw_ts: float = 0
 
 # ── Order Book State ──────────────────────────────────────────────────
 current_depth: dict = {}
@@ -1632,6 +1713,1084 @@ async def fetch_defi_eth_map(client: httpx.AsyncClient) -> Optional[dict]:
     return result
 
 
+# ╔════════════════════════════════════════════════════════════════════════╗
+# ║ NEW DATA SOURCES — Fase 1                                              ║
+# ║ ETF flows · Stablecoin supply · Deribit futures basis · Perp basis     ║
+# ║ Macro cross-asset · Risk-free rate · Options skew · Options expiries   ║
+# ║                                                                        ║
+# ║ TODO fase 2: CME settlement scrape (tradfi segmentation), daily cadence║
+# ║ TODO fase 2: replicate fetchers to api/index.py serverless mirror      ║
+# ╚════════════════════════════════════════════════════════════════════════╝
+
+
+# ── Shared helpers: Yahoo v8 chart + FRED CSV (macro + risk-free) ─────
+async def _fetch_yahoo_daily(client: httpx.AsyncClient, symbol: str, range_: str = "3mo") -> Optional[list]:
+    """Fetch daily OHLCV from Yahoo v8 chart API. No key required.
+
+    Returns list of {date, open, high, low, close, volume} sorted ascending, or None.
+    """
+    try:
+        url = f"{YAHOO_CHART_BASE}{urlquote(symbol, safe='')}"
+        r = await client.get(
+            url,
+            params={"interval": "1d", "range": range_},
+            timeout=15.0,
+            headers={
+                "User-Agent": BROWSER_UA,
+                "Accept": "application/json, text/plain, */*",
+            },
+        )
+        r.raise_for_status()
+        payload = r.json()
+        chart = (payload.get("chart") or {}).get("result")
+        if not chart or not isinstance(chart, list):
+            return None
+        result = chart[0]
+        timestamps = result.get("timestamp") or []
+        quote = (result.get("indicators", {}).get("quote") or [{}])[0]
+        opens   = quote.get("open")   or []
+        highs   = quote.get("high")   or []
+        lows    = quote.get("low")    or []
+        closes  = quote.get("close")  or []
+        volumes = quote.get("volume") or []
+
+        rows = []
+        for i, ts in enumerate(timestamps):
+            if ts is None:
+                continue
+            def _safe(arr, idx):
+                if idx < len(arr):
+                    v = arr[idx]
+                    return None if v is None else float(v)
+                return None
+            c = _safe(closes, i)
+            if c is None:
+                continue  # Yahoo occasionally nulls some cells; skip
+            rows.append({
+                "date":   datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d"),
+                "open":   _safe(opens, i),
+                "high":   _safe(highs, i),
+                "low":    _safe(lows, i),
+                "close":  c,
+                "volume": _safe(volumes, i),
+            })
+        return rows if rows else None
+    except Exception as e:
+        logger.warning(f"Yahoo fetch failed for {symbol}: {e}")
+        return None
+
+
+async def _fetch_fred_csv(client: httpx.AsyncClient, series_id: str) -> Optional[list]:
+    """Fetch a FRED series via the public fredgraph CSV endpoint (no key needed)."""
+    try:
+        # FRED endpoint is slow; generous timeout
+        r = await client.get(
+            FRED_CSV_BASE,
+            params={"id": series_id},
+            timeout=45.0,
+            headers={"User-Agent": BROWSER_UA},
+        )
+        r.raise_for_status()
+        text = r.text
+        if not text or "<html" in text.lower()[:200]:
+            return None
+        reader = csv.reader(io.StringIO(text))
+        header = next(reader, None)
+        if not header or len(header) < 2:
+            return None
+        rows = []
+        for row in reader:
+            if len(row) < 2:
+                continue
+            date_str, val = row[0].strip(), row[1].strip()
+            if not date_str or val in ("", ".", "-"):
+                continue
+            try:
+                rows.append({"date": date_str, "close": float(val)})
+            except ValueError:
+                continue
+        return rows if rows else None
+    except Exception as e:
+        logger.warning(f"FRED fetch failed for {series_id}: {e}")
+        return None
+
+
+def _series_change_pct(rows: list, days: int) -> Optional[float]:
+    """% change over last N trading days."""
+    closes = [r["close"] for r in rows if r.get("close") is not None]
+    if len(closes) < days + 1:
+        return None
+    latest, past = closes[-1], closes[-(days + 1)]
+    if past <= 0:
+        return None
+    return round((latest / past - 1) * 100, 3)
+
+
+def _series_realized_vol_20d(rows: list) -> Optional[float]:
+    """Annualized realized vol (log returns, 20-day window, 252-day year)."""
+    closes = [r["close"] for r in rows if r.get("close") is not None]
+    if len(closes) < 21:
+        return None
+    log_rets = []
+    for i in range(len(closes) - 20, len(closes)):
+        c0, c1 = closes[i - 1], closes[i]
+        if c0 > 0 and c1 > 0:
+            log_rets.append(math.log(c1 / c0))
+    if len(log_rets) < 10:
+        return None
+    try:
+        return round(statistics.stdev(log_rets) * math.sqrt(252), 5)
+    except statistics.StatisticsError:
+        return None
+
+
+# ── Risk-free rate (US 3M T-bill via Yahoo ^IRX; FRED DTB3 fallback) ──
+async def fetch_risk_free_rate(client: httpx.AsyncClient) -> Optional[dict]:
+    """US 3-month T-bill yield as proxy for risk-free rate. Cached 1 day.
+
+    Primary source: Yahoo Finance ^IRX (CBOE 13-week T-bill; same infra as /macro).
+    Fallback: FRED DTB3 CSV (reachable from most environments, but not all).
+    """
+    global risk_free_cache, risk_free_cache_ts
+    now_ts = time.time()
+    if risk_free_cache and (now_ts - risk_free_cache_ts) < RISK_FREE_CACHE_TTL:
+        return risk_free_cache
+
+    # Primary: Yahoo
+    rows = await _fetch_yahoo_daily(client, RISK_FREE_YAHOO_SYM, range_="1mo")
+    source, series = "yahoo", RISK_FREE_YAHOO_SYM
+
+    # Fallback: FRED
+    if not rows:
+        rows = await _fetch_fred_csv(client, RISK_FREE_FRED_ID)
+        if rows:
+            source, series = "fred", RISK_FREE_FRED_ID
+
+    if not rows:
+        return risk_free_cache or None
+    last = rows[-1].get("close")
+    if last is None:
+        return risk_free_cache or None
+    r_dec = last / 100.0
+    result = {
+        "rate":      round(r_dec, 5),
+        "ratePct":   round(last, 3),
+        "source":    source,
+        "series":    series,
+        "date":      rows[-1]["date"],
+        "fetchedAt": int(now_ts * 1000),
+    }
+    risk_free_cache = result
+    risk_free_cache_ts = now_ts
+    logger.info(f"Risk-free rate ok ({source} {series}): {last:.3f}%")
+    return result
+
+
+def get_risk_free_rate_value(fallback: float = 0.04) -> float:
+    """Return cached r as decimal, or fallback if cache empty."""
+    if risk_free_cache and "rate" in risk_free_cache:
+        return risk_free_cache["rate"]
+    return fallback
+
+
+# ── Curl fallback for TLS-fingerprinted sites (Farside/Cloudflare) ────
+async def _curl_get(url: str, headers: dict, timeout: int = 25) -> Optional[str]:
+    """Fetch a URL via subprocess curl. Used when httpx is blocked by TLS fingerprinting.
+
+    curl uses the OS-level TLS stack, which matches real browsers better than
+    Python's httpx/httpcore. Returns response body as text, or None on failure.
+    """
+    curl_bin = shutil.which("curl")
+    if not curl_bin:
+        logger.warning("_curl_get: curl binary not found in PATH")
+        return None
+    args = [curl_bin, "-s", "-L", "--max-time", str(timeout), url]
+    for k, v in headers.items():
+        args.extend(["-H", f"{k}: {v}"])
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout + 5)
+        if proc.returncode != 0:
+            logger.warning(f"_curl_get: curl rc={proc.returncode} err={err[:200]!r}")
+            return None
+        text = out.decode("utf-8", errors="replace")
+        return text if text else None
+    except Exception as e:
+        logger.warning(f"_curl_get subprocess failed: {e}")
+        return None
+
+
+# ── ETF flows (Farside CSV → Farside HTML → SoSoValue → stale) ────────
+async def fetch_etf_flows(client: httpx.AsyncClient) -> Optional[dict]:
+    """Spot ETH ETF flows. Tries CSV → scrape HTML → SoSoValue, falls back to stale.
+
+    Returns daily per-issuer flows + total + rolling 5d/20d aggregates.
+    Cached 6h (daily cadence data).
+    """
+    global etf_cache, etf_cache_ts
+    now_ts = time.time()
+    if etf_cache and (now_ts - etf_cache_ts) < ETF_CACHE_TTL:
+        return etf_cache
+
+    data = None
+
+    browser_headers = {
+        "User-Agent":      BROWSER_UA,
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # 1) Farside CSV (sometimes published, often 404)
+    try:
+        r = await client.get(FARSIDE_CSV_URL, timeout=15.0, headers=browser_headers)
+        if r.status_code == 200 and r.text.strip() and not r.text.lstrip().startswith("<"):
+            data = _parse_farside_csv(r.text)
+            if data:
+                data["source"] = "farside_csv"
+    except Exception as e:
+        logger.warning(f"Farside CSV fetch failed: {e}")
+
+    # 2) Farside HTML table scrape via httpx; if 403 (TLS fingerprint),
+    #    retry once via curl subprocess which mimics a real browser handshake.
+    if not data:
+        try:
+            r = await client.get(FARSIDE_HTML_URL, timeout=20.0, headers=browser_headers)
+            if r.status_code == 200 and r.text:
+                data = _parse_farside_html(r.text)
+                if data:
+                    data["source"] = "farside_html"
+            elif r.status_code == 403:
+                logger.info("Farside 403 via httpx; falling back to curl subprocess")
+                html = await _curl_get(FARSIDE_HTML_URL, browser_headers)
+                if html:
+                    data = _parse_farside_html(html)
+                    if data:
+                        data["source"] = "farside_html_curl"
+        except Exception as e:
+            logger.warning(f"Farside HTML fetch failed: {e}")
+            html = await _curl_get(FARSIDE_HTML_URL, browser_headers)
+            if html:
+                data = _parse_farside_html(html)
+                if data:
+                    data["source"] = "farside_html_curl"
+
+    # 3) SoSoValue fallback (may require key — best-effort)
+    if not data:
+        try:
+            r = await client.get(
+                SOSOVALUE_ETF_URL,
+                params={"type": "us-eth-spot"},
+                timeout=15.0,
+                headers={"User-Agent": BROWSER_UA},
+            )
+            if r.status_code == 200:
+                data = _parse_sosovalue(r.json())
+                if data:
+                    data["source"] = "sosovalue"
+        except Exception as e:
+            logger.warning(f"SoSoValue ETF fetch failed: {e}")
+
+    # 4) Stale cache
+    if not data:
+        if etf_cache:
+            logger.warning("ETF flows: all sources failed, serving stale cache")
+            return etf_cache
+        return None
+
+    daily = data.get("daily", [])
+    data["rolling5d"]  = _etf_rolling(daily, 5)
+    data["rolling20d"] = _etf_rolling(daily, 20)
+    data["fetchedAt"]  = int(now_ts * 1000)
+    etf_cache = data
+    etf_cache_ts = now_ts
+    last = daily[-1] if daily else None
+    logger.info(f"ETF flows ok ({data['source']}): {len(daily)} days · latest total = {last.get('total') if last else '—'} M$")
+    return data
+
+
+def _parse_farside_csv(text: str) -> Optional[dict]:
+    """Parse Farside CSV if it exists. Columns: Date, <issuers...>, Total."""
+    try:
+        reader = csv.reader(io.StringIO(text))
+        rows = list(reader)
+        if len(rows) < 2:
+            return None
+        header = [h.strip() for h in rows[0]]
+        if not header or header[0].lower() not in ("date", ""):
+            return None
+        issuers = header[1:-1]
+        daily = []
+        for row in rows[1:]:
+            if len(row) != len(header):
+                continue
+            date_str = row[0].strip()
+            if not date_str or date_str.lower().startswith("total") or "seed" in date_str.lower():
+                continue
+            flows = {iss: _parse_farside_number(v) for iss, v in zip(issuers, row[1:-1])}
+            total = _parse_farside_number(row[-1])
+            daily.append({"date": date_str, "byIssuer": flows, "total": total})
+        if not daily:
+            return None
+        return {"daily": _sort_etf_rows_ascending(daily), "issuers": issuers}
+    except Exception as e:
+        logger.warning(f"Farside CSV parse failed: {e}")
+        return None
+
+
+def _parse_farside_html(html: str) -> Optional[dict]:
+    """Parse Farside HTML. Iterates tables, picks the one with most date rows,
+    and detects the issuer-header row as the row with most uppercase tickers."""
+    try:
+        html_clean = html.replace("&nbsp;", " ")
+        tables = re.findall(r"<table[^>]*>(.*?)</table>", html_clean, re.DOTALL | re.IGNORECASE)
+        if not tables:
+            return None
+
+        row_pat    = re.compile(r"<tr[^>]*>(.*?)</tr>", re.DOTALL | re.IGNORECASE)
+        cell_pat   = re.compile(r"<t[hd][^>]*>(.*?)</t[hd]>", re.DOTALL | re.IGNORECASE)
+        ticker_re  = re.compile(r"^[A-Z]{3,5}$")
+
+        def _rows(table_html):
+            return [
+                [re.sub(r"<[^>]+>", "", c).strip() for c in cell_pat.findall(rm.group(1))]
+                for rm in row_pat.finditer(table_html)
+            ]
+
+        best = None  # (date_row_count, daily, issuers)
+        for table_html in tables:
+            rows = _rows(table_html)
+            if not rows:
+                continue
+
+            # Find issuer header row: max count of uppercase 3-5 letter tickers
+            issuers, header_idx = [], -1
+            best_hit = 0
+            for i, cells in enumerate(rows):
+                tickers = [c for c in cells
+                           if ticker_re.match(c) and c not in ("TOTAL", "DATE", "ETF", "USD")]
+                if len(tickers) >= 3 and len(tickers) > best_hit:
+                    best_hit = len(tickers)
+                    issuers = tickers
+                    header_idx = i
+
+            # Parse date rows (from anywhere in the table — they come after header)
+            daily = []
+            for cells in rows:
+                if len(cells) < 3:
+                    continue
+                date_str = cells[0]
+                if not _looks_like_date(date_str):
+                    continue
+                body = cells[1:]
+                flows = {}
+                if issuers:
+                    # Flows columns are the first len(issuers) body cells;
+                    # total is the last body cell (skipping any empty trailing cells).
+                    for j, iss in enumerate(issuers):
+                        v = body[j] if j < len(body) else ""
+                        flows[iss] = _parse_farside_number(v)
+                # Find total: rightmost non-empty body cell (or sum)
+                total = None
+                for v in reversed(body):
+                    if v and v not in ("-", "—"):
+                        total = _parse_farside_number(v)
+                        if total is not None:
+                            break
+                if total is None and flows:
+                    vals = [v for v in flows.values() if v is not None]
+                    total = round(sum(vals), 2) if vals else None
+                daily.append({"date": date_str, "byIssuer": flows, "total": total})
+
+            if best is None or len(daily) > best[0]:
+                best = (len(daily), daily, issuers)
+
+        if not best or not best[1]:
+            return None
+        daily, issuers = best[1], best[2]
+        return {"daily": _sort_etf_rows_ascending(daily), "issuers": issuers}
+    except Exception as e:
+        logger.warning(f"Farside HTML parse failed: {e}")
+        return None
+
+
+def _parse_sosovalue(payload) -> Optional[dict]:
+    """Parse SoSoValue historical inflow chart. Best-effort shape inference."""
+    try:
+        if not isinstance(payload, dict):
+            return None
+        data = payload.get("data") or payload.get("result") or payload
+        items = data.get("list", data) if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            return None
+        daily = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            date_str = item.get("date") or item.get("time") or item.get("timestamp")
+            val = item.get("inflow") or item.get("netInflow") or item.get("value")
+            try:
+                total = float(val) / 1e6 if val is not None else None  # USD → M$
+            except (TypeError, ValueError):
+                total = None
+            if date_str and total is not None:
+                daily.append({"date": str(date_str), "byIssuer": {}, "total": round(total, 2)})
+        if not daily:
+            return None
+        return {"daily": _sort_etf_rows_ascending(daily), "issuers": []}
+    except Exception as e:
+        logger.warning(f"SoSoValue parse failed: {e}")
+        return None
+
+
+def _parse_farside_number(s) -> Optional[float]:
+    """Parse number cell: '123.4', '(45.6)' → -45.6, '-' → 0, '' → None, '1,234.5' → 1234.5."""
+    if s is None:
+        return None
+    s = str(s).strip().replace(",", "").replace("$", "")
+    if not s or s in ("-", "—", "N/A", "n/a"):
+        return 0.0
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True
+        s = s[1:-1]
+    try:
+        v = float(s)
+        return -v if neg else v
+    except ValueError:
+        return None
+
+
+def _looks_like_date(s: str) -> bool:
+    if not s:
+        return False
+    s = s.strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return True
+    if re.match(r"^\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}$", s):
+        return True
+    if re.match(r"^\d{1,2}\s+[A-Za-z]{3,}\s+\d{2,4}$", s):
+        return True
+    return False
+
+
+def _sort_etf_rows_ascending(daily: list) -> list:
+    def _key(row):
+        try:
+            return _parse_farside_date_to_epoch(row["date"])
+        except Exception:
+            return 0
+    return sorted(daily, key=_key)
+
+
+def _parse_farside_date_to_epoch(s: str) -> int:
+    s = s.strip()
+    for fmt in ("%Y-%m-%d", "%d %b %Y", "%d %B %Y", "%d/%m/%Y", "%m/%d/%Y"):
+        try:
+            return int(datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp())
+        except ValueError:
+            continue
+    return 0
+
+
+def _etf_rolling(daily: list, window: int) -> Optional[dict]:
+    totals = [r.get("total") for r in daily if r.get("total") is not None]
+    if len(totals) < window:
+        return None
+    w = totals[-window:]
+    return {
+        "sum":           round(sum(w), 2),
+        "avg":           round(sum(w) / window, 2),
+        "positiveDays":  sum(1 for v in w if v > 0),
+        "negativeDays":  sum(1 for v in w if v < 0),
+        "window":        window,
+    }
+
+
+# ── Stablecoin supply (DefiLlama /stablecoincharts) ───────────────────
+async def fetch_stables_supply(client: httpx.AsyncClient) -> Optional[dict]:
+    """Aggregate stablecoin supply + per-stablecoin deltas (1d/7d/30d). Cached 30 min."""
+    global stables_cache, stables_cache_ts
+    now_ts = time.time()
+    if stables_cache and (now_ts - stables_cache_ts) < STABLES_CACHE_TTL:
+        return stables_cache
+
+    try:
+        agg_resp = await client.get(STABLES_API_URL, timeout=30.0)
+        agg_resp.raise_for_status()
+        agg_chart = agg_resp.json()
+        list_resp = await client.get(
+            "https://stablecoins.llama.fi/stablecoins",
+            params={"includePrices": "false"},
+            timeout=30.0,
+        )
+        list_resp.raise_for_status()
+        stables_list = list_resp.json()
+    except Exception as e:
+        logger.warning(f"Stables supply fetch failed: {e}")
+        return stables_cache or None
+
+    def _to_series(chart):
+        out = []
+        if not isinstance(chart, list):
+            return out
+        for pt in chart:
+            try:
+                ts_s = int(pt.get("date"))
+                tc = pt.get("totalCirculating", {})
+                usd = tc.get("peggedUSD") if isinstance(tc, dict) else tc
+                usd_val = float(usd) if usd is not None else None
+                if usd_val:
+                    out.append({"ts": ts_s, "usd": usd_val})
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _delta_abs(series, days):
+        if not series or len(series) < days + 1:
+            return None
+        return round(series[-1]["usd"] - series[-(days + 1)]["usd"], 0)
+
+    def _delta_pct(series, days):
+        if not series or len(series) < days + 1:
+            return None
+        past = series[-(days + 1)]["usd"]
+        if past <= 0:
+            return None
+        return round((series[-1]["usd"] / past - 1) * 100, 4)
+
+    agg_series = _to_series(agg_chart)
+    agg_out = {
+        "currentUsd":  agg_series[-1]["usd"] if agg_series else None,
+        "delta1dUsd":  _delta_abs(agg_series, 1),
+        "delta7dUsd":  _delta_abs(agg_series, 7),
+        "delta30dUsd": _delta_abs(agg_series, 30),
+        "delta1dPct":  _delta_pct(agg_series, 1),
+        "delta7dPct":  _delta_pct(agg_series, 7),
+        "delta30dPct": _delta_pct(agg_series, 30),
+        "series": [
+            {"ts": p["ts"] * 1000, "usd": p["usd"]}
+            for p in agg_series[-90:]
+        ],
+    }
+
+    # Resolve IDs for tracked stables from /stablecoins listing
+    by_stable, id_map = {}, {}
+    if isinstance(stables_list, dict):
+        for item in stables_list.get("peggedAssets", []):
+            symbol = item.get("symbol")
+            if symbol not in STABLES_TRACKED:
+                continue
+            circ = item.get("circulating", {})
+            usd = circ.get("peggedUSD") if isinstance(circ, dict) else circ
+            try:
+                usd_val = float(usd) if usd is not None else None
+            except (TypeError, ValueError):
+                usd_val = None
+            by_stable[symbol] = {
+                "currentUsd": usd_val,
+                "name":       STABLES_TRACKED[symbol],
+                "id":         item.get("id"),
+            }
+            id_map[symbol] = item.get("id")
+
+    async def _single(symbol, sid):
+        if sid is None:
+            return
+        try:
+            r = await client.get(
+                STABLES_API_URL,
+                params={"stablecoin": str(sid)},
+                timeout=20.0,
+            )
+            r.raise_for_status()
+            series = _to_series(r.json())
+        except Exception as e:
+            logger.warning(f"Stables chart fetch failed for {symbol}: {e}")
+            return
+        if not series:
+            return
+        by_stable[symbol].update({
+            "delta1dUsd":  _delta_abs(series, 1),
+            "delta7dUsd":  _delta_abs(series, 7),
+            "delta30dUsd": _delta_abs(series, 30),
+            "delta1dPct":  _delta_pct(series, 1),
+            "delta7dPct":  _delta_pct(series, 7),
+            "delta30dPct": _delta_pct(series, 30),
+            "series": [
+                {"ts": p["ts"] * 1000, "usd": p["usd"]}
+                for p in series[-90:]
+            ],
+        })
+
+    await asyncio.gather(*(_single(s, sid) for s, sid in id_map.items()), return_exceptions=True)
+
+    result = {
+        "aggregate":    agg_out,
+        "byStablecoin": by_stable,
+        "tracked":      list(STABLES_TRACKED.keys()),
+        "source":       "defillama",
+        "fetchedAt":    int(now_ts * 1000),
+    }
+    stables_cache    = result
+    stables_cache_ts = now_ts
+    if agg_out["currentUsd"]:
+        logger.info(f"Stables supply ok: aggregate = ${agg_out['currentUsd']/1e9:,.1f}B")
+    return result
+
+
+# ── Deribit futures basis (dated contracts) ──────────────────────────
+async def fetch_deribit_basis(client: httpx.AsyncClient, spot: Optional[float] = None) -> Optional[dict]:
+    """Deribit ETH dated-futures basis per expiry. Cached 30s. Persists raw for expiry calendar."""
+    global deribit_basis_cache, deribit_basis_cache_ts
+    global deribit_futures_raw, deribit_futures_raw_ts
+    now_ts = time.time()
+    if deribit_basis_cache and (now_ts - deribit_basis_cache_ts) < DERIBIT_BASIS_CACHE_TTL:
+        return deribit_basis_cache
+
+    try:
+        r = await client.get(
+            f"{DERIBIT_API}/api/v2/public/get_book_summary_by_currency",
+            params={"currency": "ETH", "kind": DERIBIT_FUTURES_KIND},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        summaries = r.json().get("result", [])
+    except Exception as e:
+        logger.warning(f"Deribit futures fetch failed: {e}")
+        return deribit_basis_cache or None
+
+    deribit_futures_raw    = summaries
+    deribit_futures_raw_ts = now_ts
+
+    # Infer spot from PERPETUAL mark if not provided
+    if spot is None or spot <= 0:
+        for s in summaries:
+            if s.get("instrument_name") == "ETH-PERPETUAL":
+                try:
+                    spot = float(s.get("mark_price") or s.get("last") or 0)
+                except (TypeError, ValueError):
+                    spot = None
+                break
+    if spot is None or spot <= 0:
+        return None
+
+    now_dt = datetime.now(timezone.utc)
+    by_expiry = []
+    for s in summaries:
+        name = s.get("instrument_name", "")
+        if "PERPETUAL" in name or "_" in name:
+            continue
+        parsed = _parse_deribit_future_expiry(name)
+        if not parsed:
+            continue
+        exp_dt = parsed
+        dte = (exp_dt - now_dt).total_seconds() / 86400
+        if dte <= 0:
+            continue
+        mark = s.get("mark_price") or s.get("last")
+        try:
+            mark = float(mark) if mark is not None else None
+        except (TypeError, ValueError):
+            mark = None
+        if not mark:
+            continue
+        basis_abs = mark - spot
+        basis_pct = basis_abs / spot
+        basis_ann = basis_pct * (365.0 / dte) if dte > 0 else None
+        by_expiry.append({
+            "instrument":  name,
+            "expiry":      exp_dt.strftime("%Y-%m-%d"),
+            "expiryTs":    int(exp_dt.timestamp() * 1000),
+            "dte":         round(dte, 2),
+            "mark":        round(mark, 2),
+            "spot":        round(spot, 2),
+            "basisAbs":    round(basis_abs, 2),
+            "basisPct":    round(basis_pct * 100, 4),
+            "basisAnnualizedPct": round(basis_ann * 100, 2) if basis_ann is not None else None,
+            "openInterest": s.get("open_interest"),
+            "volume24h":    s.get("volume"),
+        })
+    by_expiry.sort(key=lambda x: x["dte"])
+
+    front = by_expiry[0] if by_expiry else None
+    term_mid = None
+    if len(by_expiry) >= 3:
+        vals = [b["basisAnnualizedPct"] for b in by_expiry[:3] if b["basisAnnualizedPct"] is not None]
+        if vals:
+            term_mid = round(sum(vals) / len(vals), 2)
+
+    result = {
+        "spot":                 round(spot, 2),
+        "byExpiry":             by_expiry,
+        "front":                front,
+        "termAvgAnnualizedPct": term_mid,
+        "source":               "deribit",
+        "fetchedAt":            int(now_ts * 1000),
+    }
+    deribit_basis_cache    = result
+    deribit_basis_cache_ts = now_ts
+    if front:
+        logger.info(f"Deribit basis ok: front {front['expiry']} dte={front['dte']:.1f}d "
+                    f"basis_ann={front['basisAnnualizedPct']}%")
+    return result
+
+
+def _parse_deribit_future_expiry(name: str) -> Optional[datetime]:
+    """'ETH-29DEC24' → datetime at 08:00 UTC (Deribit expiry time)."""
+    m = re.match(r"^ETH-(\d{1,2})([A-Z]{3})(\d{2})$", name)
+    if not m:
+        return None
+    day, mon, yr = m.groups()
+    months = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+              "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+    if mon not in months:
+        return None
+    try:
+        return datetime(2000 + int(yr), months[mon], int(day), 8, 0, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+# ── Spot-perp basis (pure compute, reuses cached prices) ──────────────
+def compute_perp_basis(
+    spot_price: Optional[float],
+    perp_prices: dict,
+    front_future_data: Optional[dict] = None,
+) -> Optional[dict]:
+    """Compute spot-perp spread and perp-quarterly basis. No network."""
+    if not spot_price or spot_price <= 0:
+        return None
+    spot_perp = {}
+    for venue, perp in perp_prices.items():
+        try:
+            perp_val = float(perp) if perp is not None else None
+        except (TypeError, ValueError):
+            perp_val = None
+        if not perp_val or perp_val <= 0:
+            continue
+        spread    = perp_val - spot_price
+        basis_pct = (spread / spot_price) * 100
+        spot_perp[venue] = {
+            "perp":     round(perp_val, 2),
+            "spread":   round(spread, 4),
+            "basisPct": round(basis_pct, 4),
+        }
+
+    perp_quarterly = None
+    if front_future_data and spot_perp:
+        perp_values = [v["perp"] for v in spot_perp.values()]
+        if perp_values:
+            perp_avg = sum(perp_values) / len(perp_values)
+            future   = front_future_data.get("mark")
+            dte      = front_future_data.get("dte")
+            if future and dte and dte > 0:
+                spread_q    = future - perp_avg
+                basis_pct_q = (spread_q / perp_avg) * 100
+                basis_ann_q = basis_pct_q * (365.0 / dte)
+                perp_quarterly = {
+                    "perpAvg":   round(perp_avg, 2),
+                    "quarterly": round(future, 2),
+                    "dte":       round(dte, 2),
+                    "spread":    round(spread_q, 2),
+                    "basisPct":  round(basis_pct_q, 4),
+                    "basisAnnualizedPct": round(basis_ann_q, 2),
+                }
+
+    max_spread = max((v["spread"] for v in spot_perp.values()), default=None)
+    min_spread = min((v["spread"] for v in spot_perp.values()), default=None)
+
+    return {
+        "spot":          round(spot_price, 2),
+        "spotPerp":      spot_perp,
+        "perpQuarterly": perp_quarterly,
+        "spreadRange":   {
+            "max": round(max_spread, 4) if max_spread is not None else None,
+            "min": round(min_spread, 4) if min_spread is not None else None,
+        },
+        "fetchedAt":     int(time.time() * 1000),
+    }
+
+
+# ── Macro cross-asset (Yahoo Finance v8 chart API) ────────────────────
+async def fetch_macro(client: httpx.AsyncClient) -> Optional[dict]:
+    """DXY, SPX, VIX, US10Y, BTC: spot + 1d/7d/30d change + 20d realized vol. Cached 5 min."""
+    global macro_cache, macro_cache_ts
+    now_ts = time.time()
+    if macro_cache and (now_ts - macro_cache_ts) < MACRO_CACHE_TTL:
+        return macro_cache
+
+    async def _one(label, symbol):
+        rows = await _fetch_yahoo_daily(client, symbol, range_="3mo")
+        if not rows:
+            return label, None
+        close = rows[-1].get("close")
+        if close is None:
+            return label, None
+        # Note: US10Y on Yahoo is quoted as yield×10 (e.g. 4.512 → 45.12)
+        # Users consume "value" as-is; we surface the raw Yahoo number with a note.
+        return label, {
+            "symbol":         symbol,
+            "value":          close,
+            "date":           rows[-1]["date"],
+            "change1dPct":    _series_change_pct(rows, 1),
+            "change7dPct":    _series_change_pct(rows, 5),
+            "change30dPct":   _series_change_pct(rows, 21),
+            "realizedVol20d": _series_realized_vol_20d(rows),
+        }
+
+    pairs = list(MACRO_SYMBOLS.items())
+    results = await asyncio.gather(*(_one(l, s) for l, s in pairs), return_exceptions=True)
+    by_asset = {}
+    for item in results:
+        if isinstance(item, tuple) and len(item) == 2:
+            lab, val = item
+            if val is not None:
+                by_asset[lab] = val
+
+    if not by_asset:
+        return macro_cache or None
+
+    result = {
+        "byAsset":   by_asset,
+        "source":    "yahoo",
+        "fetchedAt": int(now_ts * 1000),
+    }
+    macro_cache    = result
+    macro_cache_ts = now_ts
+    logger.info(f"Macro ok: {len(by_asset)}/{len(MACRO_SYMBOLS)} assets fetched")
+    return result
+
+
+# ── Black-Scholes delta helpers (for options skew) ────────────────────
+def _bs_delta(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
+    """Black-Scholes delta. T in years, sigma as decimal."""
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    cdf = 0.5 * (1 + math.erf(d1 / math.sqrt(2)))
+    return cdf if is_call else cdf - 1.0
+
+
+def _parse_deribit_option_instrument(name: str):
+    """'ETH-29DEC24-3000-C' → (expiry_dt, strike, is_call) or None."""
+    m = re.match(r"^ETH-(\d{1,2})([A-Z]{3})(\d{2})-(\d+(?:\.\d+)?)-([CP])$", name)
+    if not m:
+        return None
+    day, mon, yr, strike, cp = m.groups()
+    months = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+              "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+    if mon not in months:
+        return None
+    try:
+        exp_dt = datetime(2000 + int(yr), months[mon], int(day), 8, 0, tzinfo=timezone.utc)
+        return (exp_dt, float(strike), cp == "C")
+    except ValueError:
+        return None
+
+
+def _interp_iv_at_delta(opts_sorted_by_strike: list, target_delta: float) -> Optional[float]:
+    """Linear interp of IV between two strikes bracketing the target delta."""
+    if not opts_sorted_by_strike:
+        return None
+    opts = opts_sorted_by_strike
+    for i in range(len(opts) - 1):
+        d0, d1 = opts[i]["delta"], opts[i + 1]["delta"]
+        if (d0 >= target_delta >= d1) or (d0 <= target_delta <= d1):
+            if d1 == d0:
+                return opts[i]["iv"]
+            w = (target_delta - d0) / (d1 - d0)
+            return opts[i]["iv"] + w * (opts[i + 1]["iv"] - opts[i]["iv"])
+    nearest = min(opts, key=lambda x: abs(x["delta"] - target_delta))
+    if abs(nearest["delta"] - target_delta) > 0.12:
+        return None  # too far, unreliable
+    return nearest["iv"]
+
+
+def compute_options_skew(
+    deribit_book_summary: list,
+    spot: Optional[float],
+    r: Optional[float] = None,
+    strike_filter_pct: float = 0.30,
+) -> Optional[dict]:
+    """RR25 and BF25 per expiry from Deribit book_summary.
+
+    - r: risk-free rate (decimal). If None, read from cached ^irx (fallback 0.04).
+    - strike_filter_pct: skip strikes outside ±30% of spot (fast + reliable for interp).
+    """
+    if not deribit_book_summary or not spot or spot <= 0:
+        return None
+    if r is None:
+        r = get_risk_free_rate_value(0.04)
+
+    low_bound  = spot * (1 - strike_filter_pct)
+    high_bound = spot * (1 + strike_filter_pct)
+
+    now_dt = datetime.now(timezone.utc)
+    by_expiry: dict = {}
+    for s in deribit_book_summary:
+        name = s.get("instrument_name", "")
+        parsed = _parse_deribit_option_instrument(name)
+        if not parsed:
+            continue
+        exp_dt, strike, is_call = parsed
+        if strike < low_bound or strike > high_bound:
+            continue
+        iv_pct = s.get("mark_iv")
+        try:
+            iv = float(iv_pct) / 100.0 if iv_pct is not None else None
+        except (TypeError, ValueError):
+            iv = None
+        if not iv or iv <= 0:
+            continue
+        T = (exp_dt - now_dt).total_seconds() / (365.25 * 86400)
+        if T <= 0:
+            continue
+        by_expiry.setdefault(exp_dt, {"calls": [], "puts": []})
+        entry = {"strike": strike, "iv": iv, "T": T}
+        (by_expiry[exp_dt]["calls"] if is_call else by_expiry[exp_dt]["puts"]).append(entry)
+
+    term = []
+    for exp_dt, groups in by_expiry.items():
+        calls = sorted(groups["calls"], key=lambda x: x["strike"])
+        puts  = sorted(groups["puts"],  key=lambda x: x["strike"])
+        if not calls or not puts:
+            continue
+        for c in calls:
+            c["delta"] = _bs_delta(spot, c["strike"], c["T"], r, c["iv"], True)
+        for p in puts:
+            p["delta"] = _bs_delta(spot, p["strike"], p["T"], r, p["iv"], False)
+        iv_call25 = _interp_iv_at_delta(calls, target_delta=0.25)
+        iv_put25  = _interp_iv_at_delta(puts,  target_delta=-0.25)
+
+        all_strikes = calls + puts
+        atm = min(all_strikes, key=lambda x: abs(x["strike"] - spot))
+        iv_atm = atm["iv"]
+
+        rr25 = bf25 = None
+        if iv_call25 is not None and iv_put25 is not None:
+            rr25 = iv_call25 - iv_put25
+            bf25 = 0.5 * (iv_call25 + iv_put25) - iv_atm
+
+        dte_days = (exp_dt - now_dt).total_seconds() / 86400
+        term.append({
+            "expiry":        exp_dt.strftime("%Y-%m-%d"),
+            "expiryTs":      int(exp_dt.timestamp() * 1000),
+            "dte":           round(dte_days, 2),
+            "ivAtm":         round(iv_atm, 5),
+            "ivCall25":      round(iv_call25, 5) if iv_call25 is not None else None,
+            "ivPut25":       round(iv_put25, 5)  if iv_put25  is not None else None,
+            "rr25":          round(rr25, 5) if rr25 is not None else None,
+            "bf25":          round(bf25, 5) if bf25 is not None else None,
+            "strikesInScope": len(all_strikes),
+        })
+
+    term.sort(key=lambda x: x["dte"])
+
+    def _pick(target):
+        return min(term, key=lambda x: abs(x["dte"] - target)) if term else None
+
+    return {
+        "spot":             round(spot, 2),
+        "riskFreeRate":     round(r, 5),
+        "strikeFilterPct":  strike_filter_pct,
+        "term":             term,
+        "canonical": {
+            "t7d":  _pick(7),
+            "t30d": _pick(30),
+            "t60d": _pick(60),
+            "t90d": _pick(90),
+        },
+        "source":    "deribit",
+        "fetchedAt": int(time.time() * 1000),
+    }
+
+
+# ── Options expiry calendar (notional + put/call + pin risk) ──────────
+def compute_options_expiries(
+    deribit_book_summary: list,
+    spot: Optional[float],
+    max_expiries: int = 8,
+    pin_strike_range_pct: float = 0.02,
+) -> Optional[dict]:
+    """Next N expiries with notional USD, put/call ratio, pin risk (OI in ±2%/DTE)."""
+    if not deribit_book_summary or not spot or spot <= 0:
+        return None
+
+    now_dt = datetime.now(timezone.utc)
+    by_expiry: dict = {}
+    for s in deribit_book_summary:
+        name = s.get("instrument_name", "")
+        parsed = _parse_deribit_option_instrument(name)
+        if not parsed:
+            continue
+        exp_dt, strike, is_call = parsed
+        dte = (exp_dt - now_dt).total_seconds() / 86400
+        if dte <= 0:
+            continue
+        oi = s.get("open_interest")
+        try:
+            oi_val = float(oi) if oi is not None else 0.0
+        except (TypeError, ValueError):
+            oi_val = 0.0
+        slot = by_expiry.setdefault(exp_dt, {"callOi": 0.0, "putOi": 0.0, "strikes": [], "dte": dte})
+        if is_call:
+            slot["callOi"] += oi_val
+        else:
+            slot["putOi"]  += oi_val
+        slot["strikes"].append({"strike": strike, "is_call": is_call, "oi": oi_val})
+
+    pin_low  = spot * (1 - pin_strike_range_pct)
+    pin_high = spot * (1 + pin_strike_range_pct)
+
+    upcoming = []
+    for exp_dt, info in by_expiry.items():
+        total_oi = info["callOi"] + info["putOi"]
+        if total_oi <= 0:
+            continue
+        notional_usd = total_oi * spot
+        pc = (info["putOi"] / info["callOi"]) if info["callOi"] > 0 else None
+        pin_oi = sum(x["oi"] for x in info["strikes"]
+                     if pin_low <= x["strike"] <= pin_high)
+        dte_clamped = max(info["dte"], 0.25)
+        pin_risk = pin_oi / dte_clamped
+        upcoming.append({
+            "expiry":        exp_dt.strftime("%Y-%m-%d"),
+            "expiryTs":      int(exp_dt.timestamp() * 1000),
+            "dte":           round(info["dte"], 2),
+            "callOi":        round(info["callOi"], 2),
+            "putOi":         round(info["putOi"], 2),
+            "totalOi":       round(total_oi, 2),
+            "notionalUsd":   round(notional_usd, 0),
+            "putCallRatio":  round(pc, 4) if pc is not None else None,
+            "pinOi":         round(pin_oi, 2),
+            "pinRisk":       round(pin_risk, 2),
+        })
+
+    upcoming.sort(key=lambda x: x["dte"])
+    upcoming = upcoming[:max_expiries]
+
+    total_notional = sum(x["notionalUsd"] for x in upcoming)
+    total_call_oi  = sum(x["callOi"] for x in upcoming)
+    total_put_oi   = sum(x["putOi"]  for x in upcoming)
+    agg_pc = (total_put_oi / total_call_oi) if total_call_oi > 0 else None
+    largest = max(upcoming, key=lambda x: x["notionalUsd"]) if upcoming else None
+
+    return {
+        "spot":                    round(spot, 2),
+        "upcoming":                upcoming,
+        "totalNotionalUsd":        total_notional,
+        "aggregatePutCallRatio":   round(agg_pc, 4) if agg_pc is not None else None,
+        "largestExpiry":           largest,
+        "pinStrikeRangePct":       pin_strike_range_pct,
+        "source":                  "deribit",
+        "fetchedAt":               int(time.time() * 1000),
+    }
+
+
 def process_dune_netflows(
     raw: Optional[dict],
     current_eth_price: Optional[float],
@@ -1987,6 +3146,10 @@ async def fetch_all_data() -> dict:
             fetch_ethbtc_taker(client),
             # DeFi ETH distribution (Lido, Aave, Maker, EigenLayer, etc.)
             fetch_defi_eth_map(client),
+            # Risk-free rate (US 3M T-bill, cached 1d) — needed for options skew BS delta
+            fetch_risk_free_rate(client),
+            # Deribit futures basis (cached 30s) — also stores raw for expiry calendar
+            fetch_deribit_basis(client),
             return_exceptions=True,
         )
 
@@ -2012,6 +3175,8 @@ async def fetch_all_data() -> dict:
         defillama_reserves_raw,                              # 42
         ethbtc_taker_raw,                                    # 43
         defi_eth_map_raw,                                    # 44
+        risk_free_raw,                                       # 45
+        deribit_basis_raw,                                   # 46
     ) = results
 
     def safe_float(obj, key, default=None):
@@ -2480,6 +3645,71 @@ async def fetch_all_data() -> dict:
         "spotPrice": spot,
     }
 
+    # ── Fase 1 · Derived basis / skew / expiries (pure compute, no network) ──
+    # Extract perp last prices per venue from already-fetched tickers
+    try:
+        bybit_perp_last = None
+        if isinstance(bybit_perp_ticker, dict):
+            lst = (bybit_perp_ticker.get("result", {}) or {}).get("list", [])
+            if lst:
+                bybit_perp_last = safe_float(lst[0], "lastPrice")
+    except Exception:
+        bybit_perp_last = None
+    try:
+        okx_perp_last = None
+        if isinstance(okx_perp_ticker, dict):
+            okx_data = okx_perp_ticker.get("data", []) or []
+            if okx_data:
+                okx_perp_last = safe_float(okx_data[0], "last")
+    except Exception:
+        okx_perp_last = None
+    # Hyperliquid mark price for ETH
+    hl_mark = None
+    try:
+        if isinstance(hyperliquid_raw, list) and len(hyperliquid_raw) == 2:
+            meta, asset_ctxs = hyperliquid_raw
+            if isinstance(meta, dict) and isinstance(asset_ctxs, list):
+                for i, coin in enumerate(meta.get("universe", [])):
+                    if isinstance(coin, dict) and coin.get("name") == "ETH":
+                        if i < len(asset_ctxs) and isinstance(asset_ctxs[i], dict):
+                            hl_mark = safe_float(asset_ctxs[i], "markPx")
+                        break
+    except Exception:
+        hl_mark = None
+
+    perp_prices_by_venue = {
+        "binance":     safe_float(bn_premium, "markPrice"),
+        "okx":         okx_perp_last,
+        "bybit":       bybit_perp_last,
+        "hyperliquid": hl_mark,
+    }
+
+    front_future = None
+    if isinstance(deribit_basis_raw, dict):
+        front_future = deribit_basis_raw.get("front")
+
+    perp_basis_computed = compute_perp_basis(
+        spot_price=current_price,
+        perp_prices=perp_prices_by_venue,
+        front_future_data=front_future,
+    )
+
+    # Options skew + expiry calendar from the Deribit book_summary already in memory
+    deribit_book_list = []
+    if isinstance(deribit_options_raw, dict):
+        deribit_book_list = deribit_options_raw.get("result", []) or []
+
+    r_for_skew = risk_free_raw.get("rate") if isinstance(risk_free_raw, dict) else None
+    options_skew_computed = compute_options_skew(
+        deribit_book_summary=deribit_book_list,
+        spot=current_price,
+        r=r_for_skew,
+    )
+    options_expiries_computed = compute_options_expiries(
+        deribit_book_summary=deribit_book_list,
+        spot=current_price,
+    )
+
     data = {
         "timestamp": int(time.time() * 1000),
         "binance": {
@@ -2588,6 +3818,18 @@ async def fetch_all_data() -> dict:
         ),
         "ethBtcRotation": ethbtc_taker_raw if isinstance(ethbtc_taker_raw, dict) else None,
         "defiEthMap": defi_eth_map_raw if isinstance(defi_eth_map_raw, dict) else None,
+        # ── Fase 1 · new sources ──────────────────────────────────────
+        # Cache-backed (populated by background refresher); read as-is.
+        "etfFlows":       etf_cache     or None,
+        "stablesSupply":  stables_cache or None,
+        "macro":          macro_cache   or None,
+        "riskFreeRate":   risk_free_raw if isinstance(risk_free_raw, dict) else (risk_free_cache or None),
+        # Fetched inside this gather:
+        "deribitBasis":   deribit_basis_raw if isinstance(deribit_basis_raw, dict) else None,
+        # Pure-compute derivatives over already-fetched data:
+        "perpBasis":       perp_basis_computed,
+        "optionsSkew":     options_skew_computed,
+        "optionsExpiries": options_expiries_computed,
     }
 
     cache = data
@@ -2607,6 +3849,224 @@ async def depth_collector():
         await asyncio.sleep(DEPTH_INTERVAL)
 
 
+# ── Fase 2 · Parquet persister (append-only daily partitions) ────────
+# Layout:
+#   {PERSIST_PATH}/YYYY-MM-DD/snapshot.parquet       (1 row per minute, wide flat schema)
+#   {PERSIST_PATH}/YYYY-MM-DD/microstructure.parquet (1 row per 5s, order book + CVD)
+#
+# Snapshot schema rules (hybrid):
+#   • ts_utc_ms      (BIGINT)  — primary key, epoch ms UTC
+#   • schema_version (INT)     — bump when flat columns change
+#   • scalars        (DOUBLE/INT/STRING/BOOL as appropriate) — filterable
+#   • fixed-TF dicts → expanded flat cols (e.g. mq_1h_ratio, stochastics_4h_k)
+#   • arrays/histories → JSON string columns (hydrate on demand)
+
+_FLAT_TIMEFRAMES = {"1m", "5m", "15m", "30m", "1h", "4h", "12h", "1d", "3d", "7d", "14d", "30d", "90d"}
+
+
+def _flatten_snapshot(snap: dict) -> dict:
+    """Flatten a cache dict to single-level columns. Fixed-TF keys stay expanded as
+    separate scalar columns; arrays / deep nesting become JSON string columns."""
+    ts_ms = snap.get("timestamp") or int(time.time() * 1000)
+    out: dict = {
+        "ts_utc_ms":      int(ts_ms),
+        "schema_version": SCHEMA_VERSION,
+    }
+
+    def _as_json(v):
+        try:
+            return json.dumps(v, default=str, separators=(",", ":"))
+        except Exception:
+            return None
+
+    def _walk(prefix: str, obj, depth: int = 0):
+        if obj is None:
+            out[prefix] = None
+            return
+        if isinstance(obj, bool):
+            out[prefix] = 1 if obj else 0
+            return
+        if isinstance(obj, (int, float)):
+            out[prefix] = obj
+            return
+        if isinstance(obj, str):
+            out[prefix] = obj
+            return
+        if isinstance(obj, list):
+            # Arrays → JSON column (histories, deciles, per-strike, expiries, etc.)
+            out[prefix] = _as_json(obj)
+            return
+        if isinstance(obj, dict):
+            # Allow expansion for up to 2 levels; deeper → JSON
+            if depth >= 2:
+                out[prefix] = _as_json(obj)
+                return
+            # Special case: fixed-TF dict → keep all timeframes as flat columns
+            # (already handled by normal expansion; this comment documents intent)
+            for k, v in obj.items():
+                key = f"{prefix}_{k}" if prefix else str(k)
+                _walk(key, v, depth + 1)
+            return
+        out[prefix] = str(obj)
+
+    for k, v in snap.items():
+        _walk(str(k), v)
+    return out
+
+
+def _write_parquet_append(path: str, row: dict) -> None:
+    """Append a single row to a parquet file by read → concat → atomic rewrite.
+
+    Schema evolution: if row has new columns vs existing, both are padded with nulls
+    and unified via pyarrow.concat_tables(promote=True).
+    Atomic: write to path.tmp then rename.
+    """
+    if not PERSIST_AVAILABLE:
+        return
+    new_table = _pa.Table.from_pydict({k: [v] for k, v in row.items()})
+    if os.path.isfile(path):
+        try:
+            existing = _pq.read_table(path)
+            # Add missing columns to each side with nulls
+            for col in existing.column_names:
+                if col not in new_table.column_names:
+                    new_table = new_table.append_column(col, _pa.array([None]))
+            for col in new_table.column_names:
+                if col not in existing.column_names:
+                    existing = existing.append_column(col, _pa.array([None] * len(existing)))
+            new_table = new_table.select(existing.column_names)
+            combined = _pa.concat_tables([existing, new_table], promote_options="default")
+        except Exception as e:
+            logger.warning(f"Parquet read failed for {path}, overwriting: {e}")
+            combined = new_table
+    else:
+        combined = new_table
+    tmp = path + ".tmp"
+    _pq.write_table(combined, tmp, compression="zstd")
+    os.replace(tmp, path)
+
+
+_last_snapshot_minute: Optional[int] = None
+_last_micro_write_ts: float = 0
+
+
+async def snapshot_persister():
+    """Append flattened cache snapshot once per minute to YYYY-MM-DD/snapshot.parquet."""
+    global _last_snapshot_minute
+    if not PERSIST_ENABLED:
+        logger.info("Snapshot persister disabled (PERSIST_ENABLED != true)")
+        return
+    if not PERSIST_AVAILABLE:
+        logger.warning("pyarrow not available — snapshot persister disabled")
+        return
+    try:
+        os.makedirs(PERSIST_PATH, exist_ok=True)
+    except Exception as e:
+        logger.warning(f"Persister: cannot create {PERSIST_PATH}: {e}")
+        return
+    logger.info(f"Snapshot persister started at {PERSIST_PATH}")
+    while True:
+        try:
+            await asyncio.sleep(15)
+            if not cache:
+                continue
+            now = datetime.now(timezone.utc)
+            current_minute = int(now.timestamp() // 60)
+            if _last_snapshot_minute == current_minute:
+                continue
+            flat = _flatten_snapshot(cache)
+            day_dir = os.path.join(PERSIST_PATH, now.strftime("%Y-%m-%d"))
+            os.makedirs(day_dir, exist_ok=True)
+            await asyncio.to_thread(
+                _write_parquet_append,
+                os.path.join(day_dir, "snapshot.parquet"),
+                flat,
+            )
+            _last_snapshot_minute = current_minute
+        except Exception as e:
+            logger.warning(f"Snapshot persist error: {e}")
+            await asyncio.sleep(30)
+
+
+async def microstructure_persister():
+    """Append order book + derived microstructure snapshot every 5s."""
+    global _last_micro_write_ts
+    if not PERSIST_ENABLED or not PERSIST_AVAILABLE:
+        return
+    logger.info(f"Microstructure persister started at {PERSIST_PATH}")
+    while True:
+        try:
+            await asyncio.sleep(PERSIST_MICRO_INTERVAL)
+            if not current_depth:
+                continue
+            now_s = time.time()
+            if now_s - _last_micro_write_ts < PERSIST_MICRO_INTERVAL * 0.9:
+                continue
+            now = datetime.now(timezone.utc)
+            row = {
+                "ts_utc_ms":       int(now.timestamp() * 1000),
+                "schema_version":  SCHEMA_VERSION,
+                "midPrice":        current_depth.get("midPrice"),
+                "spread":          current_depth.get("spread"),
+                "bidAskImbalance": current_depth.get("bidAskImbalance"),
+                "totalBidQty":     current_depth.get("totalBidQty"),
+                "totalAskQty":     current_depth.get("totalAskQty"),
+                # JSON columns (arrays)
+                "bids_json":     json.dumps(current_depth.get("bids", [])[:30],     default=str),
+                "asks_json":     json.dumps(current_depth.get("asks", [])[:30],     default=str),
+                "bidWalls_json": json.dumps(current_depth.get("bidWalls", []),      default=str),
+                "askWalls_json": json.dumps(current_depth.get("askWalls", []),      default=str),
+            }
+            day_dir = os.path.join(PERSIST_PATH, now.strftime("%Y-%m-%d"))
+            os.makedirs(day_dir, exist_ok=True)
+            await asyncio.to_thread(
+                _write_parquet_append,
+                os.path.join(day_dir, "microstructure.parquet"),
+                row,
+            )
+            _last_micro_write_ts = now_s
+        except Exception as e:
+            logger.warning(f"Microstructure persist error: {e}")
+            await asyncio.sleep(10)
+
+
+# ── Background task for slow data sources (non-blocking warmup) ───────
+async def slow_data_refresher():
+    """Background task that keeps Farside / Stooq / DefiLlama stables caches fresh.
+
+    Each fetch_* function has its own TTL check so this loop is a thin tick;
+    work only happens when a cache expires. Kept out of fetch_all_data so
+    Farside HTML scrapes can't block user requests.
+    """
+    # First pass to warm caches (won't block lifespan; runs concurrently)
+    try:
+        async with httpx.AsyncClient() as client:
+            await asyncio.gather(
+                fetch_risk_free_rate(client),
+                fetch_etf_flows(client),
+                fetch_stables_supply(client),
+                fetch_macro(client),
+                return_exceptions=True,
+            )
+        logger.info("Slow data caches warmed")
+    except Exception as e:
+        logger.warning(f"Slow data initial warmup error: {e}")
+
+    while True:
+        await asyncio.sleep(60)  # 1-min tick; per-fetcher TTL gates real work
+        try:
+            async with httpx.AsyncClient() as client:
+                await asyncio.gather(
+                    fetch_risk_free_rate(client),
+                    fetch_etf_flows(client),
+                    fetch_stables_supply(client),
+                    fetch_macro(client),
+                    return_exceptions=True,
+                )
+        except Exception as e:
+            logger.warning(f"Slow data refresh error: {e}")
+
+
 # ── App ───────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -2616,16 +4076,28 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Cache warm-up failed: {e}")
 
-    task = asyncio.create_task(depth_collector())
+    task_depth = asyncio.create_task(depth_collector())
     logger.info("Depth collector started")
+
+    task_slow = asyncio.create_task(slow_data_refresher())
+    logger.info("Slow data refresher started (non-blocking)")
+
+    tasks = [task_depth, task_slow]
+    if PERSIST_ENABLED:
+        tasks.append(asyncio.create_task(snapshot_persister()))
+        tasks.append(asyncio.create_task(microstructure_persister()))
+        logger.info(f"Persistence tasks started (path={PERSIST_PATH})")
+    else:
+        logger.info("Persistence disabled (PERSIST_ENABLED=false)")
 
     yield
 
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    for t in tasks:
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="ETH Positioning Dashboard", version="2.0.0", lifespan=lifespan)
@@ -2655,12 +4127,104 @@ async def get_depth_history():
 
 @app.get("/api/health")
 async def health():
+    now = time.time()
+    def _age(ts):
+        return round(now - ts, 1) if ts else None
     return {
         "status": "ok",
-        "cache_age": round(time.time() - cache_ts, 1) if cache_ts else None,
-        "depth_age": round(time.time() - current_depth_ts, 1) if current_depth_ts else None,
-        "depth_history_size": len(depth_history),
+        "cache_age":           _age(cache_ts),
+        "depth_age":           _age(current_depth_ts),
+        "depth_history_size":  len(depth_history),
+        # Fase 1 cache ages (None if warming)
+        "etf_age":             _age(etf_cache_ts),
+        "stables_age":         _age(stables_cache_ts),
+        "macro_age":           _age(macro_cache_ts),
+        "risk_free_age":       _age(risk_free_cache_ts),
+        "deribit_basis_age":   _age(deribit_basis_cache_ts),
+        "dune_age":            _age(dune_cache_ts),
+        "llama_age":           _age(llama_cache_ts),
+        "defi_age":            _age(defi_cache_ts),
     }
+
+
+# ── Fase 1 · Dedicated endpoints (thin readers over cache) ────────────
+# All return {"status": "warming"} if the cache hasn't been populated yet.
+
+@app.get("/api/etf/flows")
+async def get_etf_flows():
+    if not etf_cache:
+        return {"status": "warming"}
+    return etf_cache
+
+
+@app.get("/api/stables/supply")
+async def get_stables_supply():
+    if not stables_cache:
+        return {"status": "warming"}
+    return stables_cache
+
+
+@app.get("/api/basis/deribit")
+async def get_deribit_basis():
+    """Deribit dated-futures basis. Triggers a fetch if cache cold (TTL 30s)."""
+    if not deribit_basis_cache:
+        async with httpx.AsyncClient() as client:
+            await fetch_deribit_basis(client)
+    if not deribit_basis_cache:
+        return {"status": "warming"}
+    return deribit_basis_cache
+
+
+@app.get("/api/basis/cme")
+async def get_cme_basis():
+    """TODO fase 2: scrape CME ETH settlement for TradFi-segmented basis.
+
+    Rationale: CME basis reflects institutional USA positioning during RTH,
+    which is economically distinct from crypto-native futures like Deribit.
+    Daily cadence; 10-min delay of the public settlement page is fine.
+    """
+    return {
+        "status":     "not_implemented",
+        "todo":       "CME ETH settlement scrape — fase 2",
+        "fallback":   "/api/basis/deribit",
+    }
+
+
+@app.get("/api/basis/perp")
+async def get_perp_basis():
+    """Spot-perp and perp-quarterly basis. Derived inside fetch_all_data (TTL 10s)."""
+    if not cache or cache.get("perpBasis") is None:
+        return {"status": "warming"}
+    return cache["perpBasis"]
+
+
+@app.get("/api/options/skew")
+async def get_options_skew():
+    if not cache or cache.get("optionsSkew") is None:
+        return {"status": "warming"}
+    return cache["optionsSkew"]
+
+
+@app.get("/api/options/expiries")
+async def get_options_expiries():
+    if not cache or cache.get("optionsExpiries") is None:
+        return {"status": "warming"}
+    return cache["optionsExpiries"]
+
+
+@app.get("/api/macro")
+async def get_macro():
+    if not macro_cache:
+        return {"status": "warming"}
+    return macro_cache
+
+
+@app.get("/api/riskfree")
+async def get_risk_free():
+    """US 3M T-bill yield used as risk-free rate for BS delta. Cached 1d."""
+    if not risk_free_cache:
+        return {"status": "warming"}
+    return risk_free_cache
 
 
 # Serve frontend static files in production

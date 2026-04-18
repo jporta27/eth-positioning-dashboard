@@ -2,6 +2,8 @@ node_modules/
 dist/
 __pycache__/
 *.pyc
+# Fase 2 persistence output + Fase 3 backfill parquets (large, reproducible)
+data/
 # .env is intentionally tracked — repo is private and keys are needed for backend to work
 .venv
 .DS_Store
