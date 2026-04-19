@@ -2083,16 +2083,37 @@ async def fetch_etf_flows(client: httpx.AsyncClient) -> Optional[dict]:
 
 
 def _etf_rolling(daily: list, window: int) -> Optional[dict]:
-    totals = [r.get("total") for r in daily if r.get("total") is not None]
-    if len(totals) < window:
+    """Rolling aggregate over the last `window` daily rows.
+
+    QW4: if the window contains any None totals (Farside omits a column or
+    the cell is blank), set hasGaps=True and report nullCount so the frontend
+    can show a data-quality flag. The sum/avg still use only the non-null
+    values, but hasGaps tells consumers the rolling isn't a full window.
+    """
+    if len(daily) < window:
         return None
-    w = totals[-window:]
+    daily_window = daily[-window:]
+    totals = [r.get("total") for r in daily_window]
+    null_count = sum(1 for t in totals if t is None)
+    valid = [t for t in totals if t is not None]
+    if not valid:
+        return {
+            "sum":           None,
+            "avg":           None,
+            "positiveDays":  0,
+            "negativeDays":  0,
+            "window":        window,
+            "hasGaps":       True,
+            "nullCount":     null_count,
+        }
     return {
-        "sum":           round(sum(w), 2),
-        "avg":           round(sum(w) / window, 2),
-        "positiveDays":  sum(1 for v in w if v > 0),
-        "negativeDays":  sum(1 for v in w if v < 0),
+        "sum":           round(sum(valid), 2),
+        "avg":           round(sum(valid) / len(valid), 2),
+        "positiveDays":  sum(1 for v in valid if v > 0),
+        "negativeDays":  sum(1 for v in valid if v < 0),
         "window":        window,
+        "hasGaps":       null_count > 0,
+        "nullCount":     null_count,
     }
 
 
