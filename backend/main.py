@@ -29,6 +29,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
+# Farside parser split out to its own module so scripts/backfill.py can reuse
+# the same implementation (QW2). Aliased to preserve internal call sites.
+from farside_parse import (
+    parse_farside_csv as _parse_farside_csv,
+    parse_farside_html as _parse_farside_html,
+    parse_sosovalue as _parse_sosovalue,
+    parse_farside_number as _parse_farside_number,
+    looks_like_date as _looks_like_date,
+    sort_etf_rows_ascending as _sort_etf_rows_ascending,
+    parse_farside_date_to_epoch as _parse_farside_date_to_epoch,
+)
+
 # Minimal .env loader (no extra dep). Looks for .env next to this file.
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 if os.path.exists(_env_path):
@@ -2068,190 +2080,6 @@ async def fetch_etf_flows(client: httpx.AsyncClient) -> Optional[dict]:
     last = daily[-1] if daily else None
     logger.info(f"ETF flows ok ({data['source']}): {len(daily)} days · latest total = {last.get('total') if last else '—'} M$")
     return data
-
-
-def _parse_farside_csv(text: str) -> Optional[dict]:
-    """Parse Farside CSV if it exists. Columns: Date, <issuers...>, Total."""
-    try:
-        reader = csv.reader(io.StringIO(text))
-        rows = list(reader)
-        if len(rows) < 2:
-            return None
-        header = [h.strip() for h in rows[0]]
-        if not header or header[0].lower() not in ("date", ""):
-            return None
-        issuers = header[1:-1]
-        daily = []
-        for row in rows[1:]:
-            if len(row) != len(header):
-                continue
-            date_str = row[0].strip()
-            if not date_str or date_str.lower().startswith("total") or "seed" in date_str.lower():
-                continue
-            flows = {iss: _parse_farside_number(v) for iss, v in zip(issuers, row[1:-1])}
-            total = _parse_farside_number(row[-1])
-            daily.append({"date": date_str, "byIssuer": flows, "total": total})
-        if not daily:
-            return None
-        return {"daily": _sort_etf_rows_ascending(daily), "issuers": issuers}
-    except Exception as e:
-        logger.warning(f"Farside CSV parse failed: {e}")
-        return None
-
-
-def _parse_farside_html(html: str) -> Optional[dict]:
-    """Parse Farside HTML. Iterates tables, picks the one with most date rows,
-    and detects the issuer-header row as the row with most uppercase tickers."""
-    try:
-        html_clean = html.replace("&nbsp;", " ")
-        tables = re.findall(r"<table[^>]*>(.*?)</table>", html_clean, re.DOTALL | re.IGNORECASE)
-        if not tables:
-            return None
-
-        row_pat    = re.compile(r"<tr[^>]*>(.*?)</tr>", re.DOTALL | re.IGNORECASE)
-        cell_pat   = re.compile(r"<t[hd][^>]*>(.*?)</t[hd]>", re.DOTALL | re.IGNORECASE)
-        ticker_re  = re.compile(r"^[A-Z]{3,5}$")
-
-        def _rows(table_html):
-            return [
-                [re.sub(r"<[^>]+>", "", c).strip() for c in cell_pat.findall(rm.group(1))]
-                for rm in row_pat.finditer(table_html)
-            ]
-
-        best = None  # (date_row_count, daily, issuers)
-        for table_html in tables:
-            rows = _rows(table_html)
-            if not rows:
-                continue
-
-            # Find issuer header row: max count of uppercase 3-5 letter tickers
-            issuers, header_idx = [], -1
-            best_hit = 0
-            for i, cells in enumerate(rows):
-                tickers = [c for c in cells
-                           if ticker_re.match(c) and c not in ("TOTAL", "DATE", "ETF", "USD")]
-                if len(tickers) >= 3 and len(tickers) > best_hit:
-                    best_hit = len(tickers)
-                    issuers = tickers
-                    header_idx = i
-
-            # Parse date rows (from anywhere in the table — they come after header)
-            daily = []
-            for cells in rows:
-                if len(cells) < 3:
-                    continue
-                date_str = cells[0]
-                if not _looks_like_date(date_str):
-                    continue
-                body = cells[1:]
-                flows = {}
-                if issuers:
-                    # Flows columns are the first len(issuers) body cells;
-                    # total is the last body cell (skipping any empty trailing cells).
-                    for j, iss in enumerate(issuers):
-                        v = body[j] if j < len(body) else ""
-                        flows[iss] = _parse_farside_number(v)
-                # Find total: rightmost non-empty body cell (or sum)
-                total = None
-                for v in reversed(body):
-                    if v and v not in ("-", "—"):
-                        total = _parse_farside_number(v)
-                        if total is not None:
-                            break
-                if total is None and flows:
-                    vals = [v for v in flows.values() if v is not None]
-                    total = round(sum(vals), 2) if vals else None
-                daily.append({"date": date_str, "byIssuer": flows, "total": total})
-
-            if best is None or len(daily) > best[0]:
-                best = (len(daily), daily, issuers)
-
-        if not best or not best[1]:
-            return None
-        daily, issuers = best[1], best[2]
-        return {"daily": _sort_etf_rows_ascending(daily), "issuers": issuers}
-    except Exception as e:
-        logger.warning(f"Farside HTML parse failed: {e}")
-        return None
-
-
-def _parse_sosovalue(payload) -> Optional[dict]:
-    """Parse SoSoValue historical inflow chart. Best-effort shape inference."""
-    try:
-        if not isinstance(payload, dict):
-            return None
-        data = payload.get("data") or payload.get("result") or payload
-        items = data.get("list", data) if isinstance(data, dict) else data
-        if not isinstance(items, list):
-            return None
-        daily = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            date_str = item.get("date") or item.get("time") or item.get("timestamp")
-            val = item.get("inflow") or item.get("netInflow") or item.get("value")
-            try:
-                total = float(val) / 1e6 if val is not None else None  # USD → M$
-            except (TypeError, ValueError):
-                total = None
-            if date_str and total is not None:
-                daily.append({"date": str(date_str), "byIssuer": {}, "total": round(total, 2)})
-        if not daily:
-            return None
-        return {"daily": _sort_etf_rows_ascending(daily), "issuers": []}
-    except Exception as e:
-        logger.warning(f"SoSoValue parse failed: {e}")
-        return None
-
-
-def _parse_farside_number(s) -> Optional[float]:
-    """Parse number cell: '123.4', '(45.6)' → -45.6, '-' → 0, '' → None, '1,234.5' → 1234.5."""
-    if s is None:
-        return None
-    s = str(s).strip().replace(",", "").replace("$", "")
-    if not s or s in ("-", "—", "N/A", "n/a"):
-        return 0.0
-    neg = False
-    if s.startswith("(") and s.endswith(")"):
-        neg = True
-        s = s[1:-1]
-    try:
-        v = float(s)
-        return -v if neg else v
-    except ValueError:
-        return None
-
-
-def _looks_like_date(s: str) -> bool:
-    if not s:
-        return False
-    s = s.strip()
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
-        return True
-    if re.match(r"^\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}$", s):
-        return True
-    if re.match(r"^\d{1,2}\s+[A-Za-z]{3,}\s+\d{2,4}$", s):
-        return True
-    return False
-
-
-def _sort_etf_rows_ascending(daily: list) -> list:
-    def _key(row):
-        try:
-            return _parse_farside_date_to_epoch(row["date"])
-        except Exception:
-            return 0
-    return sorted(daily, key=_key)
-
-
-def _parse_farside_date_to_epoch(s: str) -> int:
-    s = s.strip()
-    for fmt in ("%Y-%m-%d", "%d %b %Y", "%d %B %Y", "%d/%m/%Y", "%m/%d/%Y"):
-        try:
-            return int(datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp())
-        except ValueError:
-            continue
-    return 0
 
 
 def _etf_rolling(daily: list, window: int) -> Optional[dict]:

@@ -42,6 +42,14 @@ except ImportError:
     print("pyarrow is required: pip install pyarrow", file=sys.stderr)
     sys.exit(1)
 
+# Share the runtime's Farside parser (QW2) — single source of truth
+_backend_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend")
+sys.path.insert(0, _backend_dir)
+from farside_parse import (  # noqa: E402
+    parse_farside_html,
+    parse_farside_date_to_epoch,
+)
+
 # ── Config ───────────────────────────────────────────────────────────
 DEFAULT_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "backfill")
 
@@ -182,6 +190,8 @@ async def backfill_binance_oi_hist(client: httpx.AsyncClient, days: int = 30) ->
 
 
 # ── Farside ETF flows (full history since July 2024) ─────────────────
+# Uses the shared parser from backend/farside_parse.py (QW2 — single source
+# of truth with the live runtime).
 async def backfill_farside_etf(client: httpx.AsyncClient) -> list:
     print("[farside_etf] scraping full ETF flow history ...")
     r = await client.get(FARSIDE_URL, timeout=30.0, headers={
@@ -190,72 +200,25 @@ async def backfill_farside_etf(client: httpx.AsyncClient) -> list:
         "Accept-Language": "en-US,en;q=0.9",
     })
     r.raise_for_status()
-    html = r.text
-    first_tbl = re.search(r"<table[^>]*>(.*?)</table>", html, re.DOTALL | re.IGNORECASE)
-    if not first_tbl:
-        print("  no table found in Farside response")
+    parsed = parse_farside_html(r.text)
+    if not parsed or not parsed.get("daily"):
+        print("  shared parser returned no rows from Farside HTML")
         return []
-    table_html = first_tbl.group(1)
-
-    header_pat = re.compile(r"<t[hd][^>]*>\s*([A-Z]{3,5})\s*</t[hd]>")
-    seen, issuers = set(), []
-    for code in header_pat.findall(table_html[:4000]):
-        if code in seen or code in ("TOTAL", "DATE", "ETF", "USD"):
-            continue
-        seen.add(code)
-        issuers.append(code)
-    if not issuers:
-        print("  no issuer tickers parsed from Farside table")
-        return []
-
-    row_pat  = re.compile(r"<tr[^>]*>(.*?)</tr>", re.DOTALL | re.IGNORECASE)
-    cell_pat = re.compile(r"<t[hd][^>]*>(.*?)</t[hd]>", re.DOTALL | re.IGNORECASE)
-
-    def _num(s):
-        if s is None:
-            return None
-        s = str(s).strip().replace(",", "").replace("$", "")
-        if not s or s in ("-", "—", "N/A", "n/a"):
-            return 0.0
-        neg = s.startswith("(") and s.endswith(")")
-        if neg:
-            s = s[1:-1]
-        try:
-            v = float(s)
-            return -v if neg else v
-        except ValueError:
-            return None
-
-    def _date_ms(s):
-        s = s.strip()
-        for fmt in ("%Y-%m-%d", "%d %b %Y", "%d %B %Y", "%d/%m/%Y", "%m/%d/%Y"):
-            try:
-                return int(datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp() * 1000)
-            except ValueError:
-                continue
-        return None
-
+    issuers = parsed.get("issuers", [])
     rows = []
-    for rm in row_pat.finditer(table_html):
-        cells = [re.sub(r"<[^>]+>", "", c).strip() for c in cell_pat.findall(rm.group(1))]
-        if len(cells) < 3:
+    for day in parsed["daily"]:
+        ts_sec = parse_farside_date_to_epoch(day["date"])
+        if ts_sec == 0:
             continue
-        date_str = cells[0]
-        ts_ms = _date_ms(date_str)
-        if ts_ms is None:
-            continue
-        body = cells[1:]
         row = {
-            "ts_utc_ms":      ts_ms,
+            "ts_utc_ms":      ts_sec * 1000,
             "schema_version": SCHEMA_VERSION,
             "source":         "farside",
-            "date":           date_str,
+            "date":           day["date"],
         }
-        for i, iss in enumerate(issuers):
-            v = body[i] if i < len(body) else ""
-            row[f"flow_{iss}"] = _num(v)
-        if body:
-            row["flow_total"] = _num(body[-1])
+        for iss in issuers:
+            row[f"flow_{iss}"] = day.get("byIssuer", {}).get(iss)
+        row["flow_total"] = day.get("total")
         rows.append(row)
     return rows
 
