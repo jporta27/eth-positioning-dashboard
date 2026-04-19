@@ -2856,7 +2856,11 @@ def compute_options_expiries(
         pin_oi = sum(x["oi"] for x in info["strikes"]
                      if pin_low <= x["strike"] <= pin_high)
         dte_clamped = max(info["dte"], 0.25)
-        pin_risk = pin_oi / dte_clamped
+        # Gamma scales as 1/√T, not 1/T — under a linear 1/T weighting, a weekly
+        # (DTE≈7) with 10k OI got the same score as a monthly (DTE≈30) with 4.3k OI,
+        # which massively over-weighted ultra-short expiries. With √T the
+        # weekly/monthly ratio matches physical gamma exposure (≈1.9× instead of ~4×).
+        pin_risk = pin_oi / math.sqrt(dte_clamped)
         upcoming.append({
             "expiry":        exp_dt.strftime("%Y-%m-%d"),
             "expiryTs":      int(exp_dt.timestamp() * 1000),
