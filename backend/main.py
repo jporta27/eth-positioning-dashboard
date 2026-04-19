@@ -3849,8 +3849,10 @@ def _flatten_snapshot(snap: dict) -> dict:
 def _write_parquet_append(path: str, row: dict) -> None:
     """Append a single row to a parquet file by read → concat → atomic rewrite.
 
-    Schema evolution: if row has new columns vs existing, both are padded with nulls
-    and unified via pyarrow.concat_tables(promote=True).
+    Schema evolution (QW3): when padding a side with nulls for a missing column,
+    the null array is built with the OTHER side's concrete type. Otherwise
+    pyarrow creates `null`-typed arrays that fail to unify with int64/float64
+    columns on concat, silently dropping the new value in some edge cases.
     Atomic: write to path.tmp then rename.
     """
     if not PERSIST_AVAILABLE:
@@ -3859,13 +3861,18 @@ def _write_parquet_append(path: str, row: dict) -> None:
     if os.path.isfile(path):
         try:
             existing = _pq.read_table(path)
-            # Add missing columns to each side with nulls
+            # Pad new_table with existing columns it lacks, typed to existing schema.
             for col in existing.column_names:
                 if col not in new_table.column_names:
-                    new_table = new_table.append_column(col, _pa.array([None]))
+                    target_type = existing.schema.field(col).type
+                    null_arr = _pa.array([None], type=target_type)
+                    new_table = new_table.append_column(col, null_arr)
+            # Pad existing with new columns, typed to new_table schema.
             for col in new_table.column_names:
                 if col not in existing.column_names:
-                    existing = existing.append_column(col, _pa.array([None] * len(existing)))
+                    target_type = new_table.schema.field(col).type
+                    null_arr = _pa.array([None] * len(existing), type=target_type)
+                    existing = existing.append_column(col, null_arr)
             new_table = new_table.select(existing.column_names)
             combined = _pa.concat_tables([existing, new_table], promote_options="default")
         except Exception as e:
