@@ -44,7 +44,7 @@ DUNE_API_KEY = os.getenv("DUNE_API_KEY", "")
 DUNE_QUERY_ID = os.getenv("DUNE_QUERY_ID", "6984181")
 DUNE_CACHE_TTL = 300  # 5 min — short so we pick up Dune-side re-executions promptly
 DUNE_MAX_AGE_HOURS = 1  # trigger fresh execution if Dune's last result is older than 1h
-DUNE_POLL_MAX_ATTEMPTS = 6  # 30s ceiling (6×5s) — fits Vercel maxDuration=60s budget
+# (Vercel uses fire-and-forget for the fresh-execution trigger; see _dune_trigger_fire_and_forget.)
 
 # DefiLlama — CEX ETH reserves (absolute stock)
 DEFILLAMA_CEX_SLUGS = {
@@ -1012,58 +1012,41 @@ async def fetch_depth_data() -> dict:
     return depth_cache
 
 
-async def _dune_trigger_and_poll(client: httpx.AsyncClient) -> Optional[dict]:
-    """Trigger a fresh Dune execution and poll until complete (max ~90s)."""
+async def _dune_trigger_fire_and_forget(client: httpx.AsyncClient) -> None:
+    """Kick off a fresh Dune execution without waiting for it to finish.
+
+    Serverless caveat: polling Dune (30–60s typical run time) blocks the Lambda
+    and can push past Vercel's maxDuration budget once you add all the other
+    parallel fetches. Instead we POST /execute with a short timeout — Dune
+    accepts the trigger in ~1s — and return. The *next* request (within
+    DUNE_CACHE_TTL) picks up the new result via GET /results. Trade-off: the
+    current request still serves slightly-stale data; freshness catches up one
+    cycle later instead of same-request.
+    """
+    if not DUNE_API_KEY:
+        return
     headers = {"X-DUNE-API-KEY": DUNE_API_KEY}
-    # Step 1: trigger execution
-    exec_resp = await client.post(
-        f"https://api.dune.com/api/v1/query/{DUNE_QUERY_ID}/execute",
-        headers=headers, timeout=15.0,
-    )
-    exec_resp.raise_for_status()
-    execution_id = exec_resp.json().get("execution_id")
-    if not execution_id:
-        logger.warning("Dune execute returned no execution_id")
-        return None
-    logger.info(f"Dune execution triggered: {execution_id}")
-
-    # Step 2: poll status (capped by DUNE_POLL_MAX_ATTEMPTS, 5s intervals)
-    for attempt in range(DUNE_POLL_MAX_ATTEMPTS):
-        await asyncio.sleep(5)
-        status_resp = await client.get(
-            f"https://api.dune.com/api/v1/execution/{execution_id}/status",
-            headers=headers, timeout=10.0,
+    try:
+        resp = await client.post(
+            f"https://api.dune.com/api/v1/query/{DUNE_QUERY_ID}/execute",
+            headers=headers, timeout=5.0,
         )
-        state = status_resp.json().get("state", "")
-        if state == "QUERY_STATE_COMPLETED":
-            break
-        if state in ("QUERY_STATE_FAILED", "QUERY_STATE_CANCELLED", "QUERY_STATE_EXPIRED"):
-            logger.warning(f"Dune execution {execution_id} ended with state: {state}")
-            return None
-    else:
-        logger.warning(f"Dune execution {execution_id} did not finish within {DUNE_POLL_MAX_ATTEMPTS*5}s — next request will pick it up")
-        return None
-
-    # Step 3: fetch results of this execution
-    res_resp = await client.get(
-        f"https://api.dune.com/api/v1/execution/{execution_id}/results",
-        headers=headers, timeout=30.0,
-    )
-    res_resp.raise_for_status()
-    data = res_resp.json()
-    logger.info(f"Dune fresh execution ok: {data.get('result', {}).get('metadata', {}).get('row_count', 0)} rows")
-    return data
+        resp.raise_for_status()
+        execution_id = resp.json().get("execution_id", "")
+        logger.info(f"Dune fresh execution fired (id={execution_id}) — will land in next request")
+    except Exception as e:
+        logger.warning(f"Dune trigger fire failed: {e}")
 
 
 async def fetch_dune_cex_netflows(client: httpx.AsyncClient) -> Optional[dict]:
     """Fetch ETH CEX netflows from Dune Analytics.
 
-    Strategy:
+    Strategy (serverless):
       1. Return in-memory cache if fresh (< DUNE_CACHE_TTL).
-      2. Otherwise hit GET /results (instant, cached on Dune side).
+      2. Otherwise hit GET /results (Dune-side cached, ~1s).
       3. If Dune's cached results are older than DUNE_MAX_AGE_HOURS,
-         trigger a fresh execution via POST /execute, poll until done,
-         then fetch those results.  Falls back to stale data on timeout.
+         FIRE (don't await) a POST /execute so the next request lands fresher.
+         We always return whatever Dune currently has — never block on a fresh run.
     """
     global dune_cache, dune_cache_ts
     if not DUNE_API_KEY:
@@ -1096,12 +1079,9 @@ async def fetch_dune_cex_netflows(client: httpx.AsyncClient) -> Optional[dict]:
             is_stale = True  # no timestamp → assume stale
 
         if is_stale:
-            logger.info("Dune results stale — triggering fresh execution...")
-            fresh = await _dune_trigger_and_poll(client)
-            if fresh:
-                data = fresh
-            else:
-                logger.info("Fresh execution failed/timed out — using stale results")
+            logger.info("Dune results stale — firing fresh execution (next request will pick it up)")
+            await _dune_trigger_fire_and_forget(client)
+            # Keep using `data` (the stale-but-real result we just fetched).
 
         dune_cache = data
         dune_cache_ts = now
