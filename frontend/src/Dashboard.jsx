@@ -1016,6 +1016,7 @@ function CexNetflowsPanel({ cexNetflows }) {
   const magnitude = cn.magnitude || 'NOISE'
   const rc = cn.relativeContext || {}
   const lastUpdate = cn.lastUpdate
+  const executionEndedAt = cn.executionEndedAt
 
   const hasData = byEx.length > 0 && Object.keys(aggs).length > 0
 
@@ -1106,14 +1107,22 @@ function CexNetflowsPanel({ cexNetflows }) {
 
   // Max for top exchange row width scaling
   const maxAbsNet = Math.max(...byEx.map(e => Math.abs(e.netInflowEth || 0)), 1)
-  const ageMin = lastUpdate ? Math.floor((Date.now() - lastUpdate) / 60000) : null
+  const bucketAgeMin = lastUpdate ? Math.floor((Date.now() - lastUpdate) / 60000) : null
+  const duneAgeMin = executionEndedAt ? Math.floor((Date.now() - executionEndedAt) / 60000) : null
+  // Dune is "live" when its last execution is recent; bucket-age is structurally
+  // 60-120m even on perfectly fresh data due to source indexing + hourly bucket end.
+  const duneStaleColor = duneAgeMin == null ? '#4a5980' : duneAgeMin > 75 ? '#ef4444' : duneAgeMin > 30 ? '#f59e0b' : '#10b981'
 
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
         <div style={S.sectionTitle}>EXCHANGE NETFLOWS · CEX Spot Pressure (vía Dune)</div>
         <div style={{ fontSize: 9, color: '#4a5980', ...S.mono }}>
-          {cn.exchangeCount || 0} exchanges · update {ageMin != null ? `${ageMin}m` : '—'}
+          {cn.exchangeCount || 0} exchanges · bucket {bucketAgeMin != null ? `${bucketAgeMin}m` : '—'}
+          {' · '}
+          <span style={{ color: duneStaleColor }} title="Edad de la última ejecución de Dune (no del bucket)">
+            Dune {duneAgeMin != null ? `${duneAgeMin}m` : '—'}
+          </span>
         </div>
       </div>
 

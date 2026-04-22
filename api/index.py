@@ -42,8 +42,9 @@ DEPTH_CLUSTER_SIZE = 0.25
 # Dune Analytics — ETH CEX netflows (query 6984181)
 DUNE_API_KEY = os.getenv("DUNE_API_KEY", "")
 DUNE_QUERY_ID = os.getenv("DUNE_QUERY_ID", "6984181")
-DUNE_CACHE_TTL = 1800  # 30 min — Dune query is hourly granularity
-DUNE_MAX_AGE_HOURS = 2  # trigger re-execution if results older than this
+DUNE_CACHE_TTL = 300  # 5 min — short so we pick up Dune-side re-executions promptly
+DUNE_MAX_AGE_HOURS = 1  # trigger fresh execution if Dune's last result is older than 1h
+DUNE_POLL_MAX_ATTEMPTS = 6  # 30s ceiling (6×5s) — fits Vercel maxDuration=60s budget
 
 # DefiLlama — CEX ETH reserves (absolute stock)
 DEFILLAMA_CEX_SLUGS = {
@@ -1026,8 +1027,8 @@ async def _dune_trigger_and_poll(client: httpx.AsyncClient) -> Optional[dict]:
         return None
     logger.info(f"Dune execution triggered: {execution_id}")
 
-    # Step 2: poll status (up to ~90s, 5s intervals)
-    for attempt in range(18):
+    # Step 2: poll status (capped by DUNE_POLL_MAX_ATTEMPTS, 5s intervals)
+    for attempt in range(DUNE_POLL_MAX_ATTEMPTS):
         await asyncio.sleep(5)
         status_resp = await client.get(
             f"https://api.dune.com/api/v1/execution/{execution_id}/status",
@@ -1040,7 +1041,7 @@ async def _dune_trigger_and_poll(client: httpx.AsyncClient) -> Optional[dict]:
             logger.warning(f"Dune execution {execution_id} ended with state: {state}")
             return None
     else:
-        logger.warning(f"Dune execution {execution_id} timed out after 90s")
+        logger.warning(f"Dune execution {execution_id} did not finish within {DUNE_POLL_MAX_ATTEMPTS*5}s — next request will pick it up")
         return None
 
     # Step 3: fetch results of this execution
@@ -1434,6 +1435,16 @@ def process_dune_netflows(
     HOUR_MS = 3600 * 1000
     max_ts = max(p["ts"] for p in parsed)
 
+    # When did Dune actually run the query? Lets the frontend distinguish
+    # "freshest bucket is naturally lagged" from "Dune cache hasn't refreshed".
+    exec_ended_ms: Optional[int] = None
+    exec_ended_str = raw.get("execution_ended_at", "")
+    if exec_ended_str:
+        try:
+            exec_ended_ms = int(datetime.fromisoformat(exec_ended_str.replace("Z", "+00:00")).timestamp() * 1000)
+        except (ValueError, TypeError):
+            exec_ended_ms = None
+
     windows = {"1h": 1, "6h": 6, "24h": 24, "7d": 168}
     aggregates = {}
     for label, hours in windows.items():
@@ -1562,6 +1573,7 @@ def process_dune_netflows(
 
     return {
         "lastUpdate": max_ts,
+        "executionEndedAt": exec_ended_ms,
         "exchangeCount": len(set(p["cex"] for p in parsed)),
         "aggregates": aggregates,
         "byExchange24h": by_exchange,
