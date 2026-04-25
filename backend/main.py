@@ -2969,14 +2969,23 @@ def process_dune_netflows(
     else:
         magnitude = "NOISE"
 
-    # Direction from sign (with small noise band)
-    noise_band = max(abs(mean_24h), 500)  # at least ±500 ETH of deadband
-    if net_24h_eth < -noise_band:
-        direction = "BULLISH"   # withdrawal → potential HODL / buy pressure
-    elif net_24h_eth > noise_band:
-        direction = "BEARISH"   # deposit → potential sell pressure
+    # Direction:
+    #  - When the flow is statistically significant (|z|>=1) we trust the z sign:
+    #    "more inflow than typical regime" = BEARISH, vice-versa BULLISH.
+    #    This avoids the trap where mean_24h is structurally large (e.g. a 7d
+    #    inflow regime) and the noise_band absorbs even clearly elevated flows.
+    #  - Otherwise we fall back to absolute-net vs a noise band so tiny flips
+    #    near zero don't swing direction.
+    if abs_z >= 1.0:
+        direction = "BEARISH" if z_score > 0 else "BULLISH"
     else:
-        direction = "NEUTRAL"
+        noise_band = max(abs(mean_24h), 500)  # at least ±500 ETH of deadband
+        if net_24h_eth < -noise_band:
+            direction = "BULLISH"   # withdrawal → potential HODL / buy pressure
+        elif net_24h_eth > noise_band:
+            direction = "BEARISH"   # deposit → potential sell pressure
+        else:
+            direction = "NEUTRAL"
 
     # Flow-price divergence over 24h window
     # Flow dir (bullish=+1, bearish=-1) vs realized price dir

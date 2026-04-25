@@ -1544,13 +1544,23 @@ def process_dune_netflows(
     else:
         magnitude = "NOISE"
 
-    noise_band = max(abs(mean_24h), 500)
-    if net_24h_eth < -noise_band:
-        direction = "BULLISH"
-    elif net_24h_eth > noise_band:
-        direction = "BEARISH"
+    # Direction:
+    #  - When the flow is statistically significant (|z|>=1) we trust the z sign:
+    #    "more inflow than typical regime" = BEARISH, vice-versa BULLISH.
+    #    This avoids the trap where mean_24h is structurally large (e.g. 7d of
+    #    inflow regime) and drowns out a clearly-elevated reading.
+    #  - Otherwise we fall back to absolute-net vs a noise band so tiny flips
+    #    near zero don't swing direction.
+    if abs_z >= 1.0:
+        direction = "BEARISH" if z_score > 0 else "BULLISH"
     else:
-        direction = "NEUTRAL"
+        noise_band = max(abs(mean_24h), 500)
+        if net_24h_eth < -noise_band:
+            direction = "BULLISH"
+        elif net_24h_eth > noise_band:
+            direction = "BEARISH"
+        else:
+            direction = "NEUTRAL"
 
     divergence = None
     if price_change_pct_24h is not None and direction != "NEUTRAL":
