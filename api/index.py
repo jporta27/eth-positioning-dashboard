@@ -44,6 +44,7 @@ DUNE_API_KEY = os.getenv("DUNE_API_KEY", "")
 DUNE_QUERY_ID = os.getenv("DUNE_QUERY_ID", "6984181")
 DUNE_CACHE_TTL = 300  # 5 min — short so we pick up Dune-side re-executions promptly
 DUNE_MAX_AGE_HOURS = 1  # trigger fresh execution if Dune's last result is older than 1h
+DUNE_PAGE_LIMIT = 200  # rows per /results call. 200 × 7 cols = 1400 datapoints, under Dune per-request cap.
 # (Vercel uses fire-and-forget for the fresh-execution trigger; see _dune_trigger_fire_and_forget.)
 
 # DefiLlama — CEX ETH reserves (absolute stock)
@@ -1039,14 +1040,17 @@ async def _dune_trigger_fire_and_forget(client: httpx.AsyncClient) -> None:
 
 
 async def fetch_dune_cex_netflows(client: httpx.AsyncClient) -> Optional[dict]:
-    """Fetch ETH CEX netflows from Dune Analytics.
+    """Fetch ETH CEX netflows from Dune Analytics, paginating to stay under per-request cap.
 
     Strategy (serverless):
       1. Return in-memory cache if fresh (< DUNE_CACHE_TTL).
-      2. Otherwise hit GET /results (Dune-side cached, ~1s).
-      3. If Dune's cached results are older than DUNE_MAX_AGE_HOURS,
+      2. GET /query/{id}/results?limit=DUNE_PAGE_LIMIT — first page also returns
+         total_row_count + execution_id. Without `limit`, large queries return 402
+         "datapoint limit per billing cycle" because the full payload exceeds the cap.
+      3. Fan-out the remaining pages in parallel via /execution/{id}/results?offset=N.
+      4. Merge rows into one combined payload with the original metadata shape.
+      5. If Dune's cached results are older than DUNE_MAX_AGE_HOURS,
          FIRE (don't await) a POST /execute so the next request lands fresher.
-         We always return whatever Dune currently has — never block on a fresh run.
     """
     global dune_cache, dune_cache_ts
     if not DUNE_API_KEY:
@@ -1057,11 +1061,33 @@ async def fetch_dune_cex_netflows(client: httpx.AsyncClient) -> Optional[dict]:
 
     headers = {"X-DUNE-API-KEY": DUNE_API_KEY}
     try:
-        # Quick read of the latest cached result on Dune
-        url = f"https://api.dune.com/api/v1/query/{DUNE_QUERY_ID}/results"
+        # Page 1 — gives us execution_id, total_row_count, first DUNE_PAGE_LIMIT rows.
+        url = f"https://api.dune.com/api/v1/query/{DUNE_QUERY_ID}/results?limit={DUNE_PAGE_LIMIT}"
         resp = await client.get(url, headers=headers, timeout=30.0)
         resp.raise_for_status()
         data = resp.json()
+
+        exec_id = data.get("execution_id")
+        meta = (data.get("result") or {}).get("metadata") or {}
+        total_rows = meta.get("total_row_count", 0)
+        rows = list((data.get("result") or {}).get("rows") or [])
+
+        # Fetch remaining pages in parallel.
+        if exec_id and total_rows > len(rows):
+            offsets = list(range(len(rows), total_rows, DUNE_PAGE_LIMIT))
+            async def _fetch_page(off: int) -> list:
+                pg_url = f"https://api.dune.com/api/v1/execution/{exec_id}/results?limit={DUNE_PAGE_LIMIT}&offset={off}"
+                r = await client.get(pg_url, headers=headers, timeout=30.0)
+                r.raise_for_status()
+                return ((r.json().get("result") or {}).get("rows") or [])
+            extra = await asyncio.gather(*[_fetch_page(o) for o in offsets], return_exceptions=True)
+            for chunk in extra:
+                if isinstance(chunk, list):
+                    rows.extend(chunk)
+
+        # Reshape so process_dune_netflows sees the full row set under data["result"]["rows"].
+        data["result"]["rows"] = rows
+        data["result"]["metadata"]["row_count"] = len(rows)
 
         # Check how old the execution is
         exec_ended = data.get("execution_ended_at", "")
@@ -1074,19 +1100,17 @@ async def fetch_dune_cex_netflows(client: httpx.AsyncClient) -> Optional[dict]:
                 if age_hours > DUNE_MAX_AGE_HOURS:
                     is_stale = True
             except Exception:
-                is_stale = True  # can't parse → assume stale
+                is_stale = True
         else:
-            is_stale = True  # no timestamp → assume stale
+            is_stale = True
 
         if is_stale:
             logger.info("Dune results stale — firing fresh execution (next request will pick it up)")
             await _dune_trigger_fire_and_forget(client)
-            # Keep using `data` (the stale-but-real result we just fetched).
 
         dune_cache = data
         dune_cache_ts = now
-        row_count = data.get("result", {}).get("metadata", {}).get("row_count", 0)
-        logger.info(f"Dune fetch ok: {row_count} rows")
+        logger.info(f"Dune fetch ok: {len(rows)} rows (paginated, total reported {total_rows})")
         return data
     except Exception as e:
         logger.warning(f"Dune fetch failed: {e}")
