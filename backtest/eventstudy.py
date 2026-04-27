@@ -183,7 +183,13 @@ def purged_split_indices(
     purge_ms = int(horizon_hours_max * 3_600_000)
     ts = np.asarray(event_ts_ms, dtype=np.int64)
     in_test = (ts >= test_start_ms) & (ts < test_end_ms)
-    train_mask = ~in_test & (ts + purge_ms < test_start_ms) | (ts > test_end_ms + purge_ms)
+    # Train = outside test AND outside the purge band on either side. Without
+    # the outer parens, `&`/`|` precedence makes the right-side clause apply
+    # regardless of in_test — currently harmless given the test-window invariant,
+    # but breaks if purge becomes asymmetric or test windows are redefined.
+    train_mask = (~in_test) & (
+        (ts + purge_ms < test_start_ms) | (ts > test_end_ms + purge_ms)
+    )
     return np.where(train_mask)[0], np.where(in_test)[0]
 
 
