@@ -75,6 +75,29 @@ MACRO_SYMBOLS = {
 
 SCHEMA_VERSION = 1
 
+# Earliest available history on Binance perp ETHUSDT.
+# Listing date for the perpetual contract: 2019-11-27 UTC.
+# Both klines and funding-rate history start at the same boundary; requesting
+# earlier just returns empty pages, but we still want to cap silently so
+# `--years 5` from 2026-04 doesn't keep paginating against a no-data window.
+BINANCE_ETHUSDT_PERP_LISTING_MS = int(
+    datetime(2019, 11, 27, tzinfo=timezone.utc).timestamp() * 1000
+)
+
+
+def _start_ms_capped(years: int, source_label: str) -> int:
+    """Compute the start_ms for a `years` request, capping at the Binance perp
+    listing date when the requested window pre-dates it. Logs at INFO level so
+    the silent cap is auditable (visible in stdout)."""
+    end_ms = int(time.time() * 1000)
+    requested = end_ms - years * 365 * 86400 * 1000
+    if requested < BINANCE_ETHUSDT_PERP_LISTING_MS:
+        capped_dt = datetime.fromtimestamp(BINANCE_ETHUSDT_PERP_LISTING_MS / 1000, tz=timezone.utc)
+        print(f"  [{source_label}] INFO requested {years}y exceeds Binance perp ETHUSDT history; "
+              f"capping start at {capped_dt:%Y-%m-%d}")
+        return BINANCE_ETHUSDT_PERP_LISTING_MS
+    return requested
+
 
 # ── Parquet writer ───────────────────────────────────────────────────
 def write_parquet(path: str, rows: list) -> None:
@@ -95,7 +118,7 @@ def write_parquet(path: str, rows: list) -> None:
 async def backfill_binance_klines_1h(client: httpx.AsyncClient, years: int) -> list:
     print(f"[binance_klines_1h] {years}y of 1h ETHUSDT futures klines ...")
     end_ms   = int(time.time() * 1000)
-    start_ms = end_ms - years * 365 * 86400 * 1000
+    start_ms = _start_ms_capped(years, "binance_klines_1h")
     rows = []
     cursor = start_ms
     while cursor < end_ms:
@@ -138,7 +161,7 @@ async def backfill_binance_klines_1h(client: httpx.AsyncClient, years: int) -> l
 async def backfill_binance_funding(client: httpx.AsyncClient, years: int) -> list:
     print(f"[binance_funding] {years}y of funding-rate history ...")
     end_ms   = int(time.time() * 1000)
-    start_ms = end_ms - years * 365 * 86400 * 1000
+    start_ms = _start_ms_capped(years, "binance_funding")
     rows = []
     cursor = start_ms
     while cursor < end_ms:
