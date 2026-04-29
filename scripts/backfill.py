@@ -26,11 +26,13 @@ import os
 import sys
 import argparse
 import asyncio
+import shutil
 import time
 import csv
 import io
 import re
 from datetime import datetime, timezone
+from typing import Optional
 from urllib.parse import quote as urlquote
 
 import httpx
@@ -58,6 +60,9 @@ DEFILLAMA_STABLES_BASE = "https://stablecoins.llama.fi"
 YAHOO_CHART_BASE       = "https://query2.finance.yahoo.com/v8/finance/chart/"
 FRED_CSV_URL           = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 FARSIDE_URL            = "https://farside.co.uk/eth/"
+# /eth/ only renders the last ~14 days — for the full history (since 23 Jul 2024)
+# Farside publishes a dedicated archive page that contains every daily row.
+FARSIDE_ALL_DATA_URL   = "https://farside.co.uk/ethereum-etf-flow-all-data/"
 
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -215,15 +220,75 @@ async def backfill_binance_oi_hist(client: httpx.AsyncClient, days: int = 30) ->
 # ── Farside ETF flows (full history since July 2024) ─────────────────
 # Uses the shared parser from backend/farside_parse.py (QW2 — single source
 # of truth with the live runtime).
+#
+# TLS-fingerprint workaround: Farside's Cloudflare layer rejects httpx (403)
+# but accepts the OS-level curl stack. The runtime backend has the same
+# pattern in backend/main.py::_curl_get; we duplicate it here (instead of
+# importing) because backend pulls in FastAPI/uvicorn just to expose that
+# helper, and the backfill script is meant to stay dependency-light.
+async def _curl_get_text(url: str, headers: dict, timeout: int = 25) -> Optional[str]:
+    """Fetch a URL via subprocess curl. Returns body as text, or None on failure."""
+    curl_bin = shutil.which("curl")
+    if not curl_bin:
+        print("  [_curl_get_text] curl not in PATH — cannot fall back")
+        return None
+    args = [curl_bin, "-s", "-L", "--max-time", str(timeout), url]
+    for k, v in headers.items():
+        args.extend(["-H", f"{k}: {v}"])
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout + 5)
+        if proc.returncode != 0:
+            print(f"  [_curl_get_text] curl rc={proc.returncode} err={err[:200]!r}")
+            return None
+        text = out.decode("utf-8", errors="replace")
+        return text if text else None
+    except Exception as e:
+        print(f"  [_curl_get_text] subprocess failed: {e}")
+        return None
+
+
 async def backfill_farside_etf(client: httpx.AsyncClient) -> list:
     print("[farside_etf] scraping full ETF flow history ...")
-    r = await client.get(FARSIDE_URL, timeout=30.0, headers={
+    farside_headers = {
         "User-Agent":      BROWSER_UA,
         "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9",
         "Accept-Language": "en-US,en;q=0.9",
-    })
-    r.raise_for_status()
-    parsed = parse_farside_html(r.text)
+    }
+    # Try the all-data archive first (full history since 2024-07). The /eth/
+    # landing page only renders the last ~14 days. Fall back to /eth/ as a
+    # second-best so backfills still succeed when the archive page moves.
+    target_urls = [FARSIDE_ALL_DATA_URL, FARSIDE_URL]
+    html: Optional[str] = None
+    chosen_url: Optional[str] = None
+    for url in target_urls:
+        try:
+            r = await client.get(url, timeout=30.0, headers=farside_headers)
+            if r.status_code == 200 and r.text:
+                html = r.text
+                chosen_url = url
+                break
+            print(f"  httpx {url} returned status={r.status_code}; trying curl fallback")
+        except Exception as e:
+            print(f"  httpx {url} failed ({e!r}); trying curl fallback")
+        # Curl fallback for this URL before moving on
+        text = await _curl_get_text(url, farside_headers, timeout=25)
+        if text:
+            html = text
+            chosen_url = url
+            print(f"  curl fallback succeeded for {url}")
+            break
+
+    if not html:
+        print("  all URLs failed (httpx and curl) — giving up")
+        return []
+    print(f"  scraped {chosen_url}")
+
+    parsed = parse_farside_html(html)
     if not parsed or not parsed.get("daily"):
         print("  shared parser returned no rows from Farside HTML")
         return []
