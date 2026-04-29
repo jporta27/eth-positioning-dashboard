@@ -1,0 +1,97 @@
+{
+  "signal": {
+    "name": "stables_contracting",
+    "preset": true,
+    "start": null,
+    "end": null,
+    "n_trials_for_dsr": 10,
+    "n_trials_source": "auto-tracked",
+    "n_trials_auto_tracked": 10,
+    "strategies_tested_known": [
+      "funding_hot_inflow",
+      "funding_hot_outflow",
+      "funding_hot_abs",
+      "funding_extreme_inflow",
+      "funding_extreme_outflow",
+      "funding_extreme_abs",
+      "stables_expanding",
+      "stables_contracting",
+      "etf_buying",
+      "etf_selling"
+    ],
+    "bootstrap_iter": 5000,
+    "conditions": [
+      "stables_30d_sign"
+    ]
+  },
+  "n_observations": 77,
+  "n_events_pre_purge": 77,
+  "n_events_purged": 66,
+  "purge_applied": true,
+  "years_in_sample": 7.006160164271047,
+  "event_frequency_per_year": 1.5700468933177023,
+  "horizons": {
+    "1h": {
+      "n_valid": 9,
+      "note": "insufficient"
+    },
+    "4h": {
+      "n_valid": 9,
+      "note": "insufficient"
+    },
+    "1d": {
+      "n_valid": 9,
+      "note": "insufficient"
+    },
+    "3d": {
+      "n_valid": 9,
+      "note": "insufficient"
+    },
+    "7d": {
+      "n_valid": 9,
+      "note": "insufficient"
+    }
+  },
+  "regimes": {
+    "stables_30d_sign=flat": {
+      "n_events": 11,
+      "n_events_pre_purge": 33,
+      "n_events_purged": 22,
+      "purge_applied": true,
+      "years_in_sample": 7.047227926078029,
+      "event_frequency_per_year": 1.560897435897436,
+      "horizons": {
+        "1h": {
+          "n_valid": 8,
+          "note": "insufficient"
+        },
+        "4h": {
+          "n_valid": 8,
+          "note": "insufficient"
+        },
+        "1d": {
+          "n_valid": 8,
+          "note": "insufficient"
+        },
+        "3d": {
+          "n_valid": 8,
+          "note": "insufficient"
+        },
+        "7d": {
+          "n_valid": 8,
+          "note": "insufficient"
+        }
+      }
+    },
+    "stables_30d_sign=contracting": {
+      "n_events": 21,
+      "note": "insufficient for conditioning"
+    },
+    "stables_30d_sign=expanding": {
+      "n_events": 23,
+      "note": "insufficient for conditioning"
+    }
+  },
+  "generated_at": 1777467825990,
+  "code_version": "b4004f7d4256182060cc7b89b578b5b822ae5666"
+}

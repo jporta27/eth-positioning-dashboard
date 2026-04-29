@@ -1,0 +1,100 @@
+{
+  "signal": {
+    "name": "stables_expanding",
+    "preset": true,
+    "start": null,
+    "end": null,
+    "n_trials_for_dsr": 10,
+    "n_trials_source": "auto-tracked",
+    "n_trials_auto_tracked": 10,
+    "strategies_tested_known": [
+      "funding_hot_inflow",
+      "funding_hot_outflow",
+      "funding_hot_abs",
+      "funding_extreme_inflow",
+      "funding_extreme_outflow",
+      "funding_extreme_abs",
+      "stables_expanding",
+      "stables_contracting",
+      "etf_buying",
+      "etf_selling"
+    ],
+    "bootstrap_iter": 5000,
+    "conditions": [
+      "vix_quartile",
+      "etf_7d_sign"
+    ]
+  },
+  "n_observations": 68,
+  "n_events_pre_purge": 68,
+  "n_events_purged": 56,
+  "purge_applied": true,
+  "years_in_sample": 4.851471594798084,
+  "event_frequency_per_year": 2.4734762979683973,
+  "horizons": {
+    "1h": {
+      "n_valid": 7,
+      "note": "insufficient"
+    },
+    "4h": {
+      "n_valid": 7,
+      "note": "insufficient"
+    },
+    "1d": {
+      "n_valid": 7,
+      "note": "insufficient"
+    },
+    "3d": {
+      "n_valid": 7,
+      "note": "insufficient"
+    },
+    "7d": {
+      "n_valid": 7,
+      "note": "insufficient"
+    }
+  },
+  "regimes": {
+    "vix_quartile=unknown & etf_7d_sign=unknown": {
+      "n_events": 12,
+      "note": "insufficient for conditioning"
+    },
+    "vix_quartile=q1_calm & etf_7d_sign=unknown": {
+      "n_events": 25,
+      "note": "insufficient for conditioning"
+    },
+    "vix_quartile=q2 & etf_7d_sign=unknown": {
+      "n_events": 11,
+      "note": "insufficient for conditioning"
+    },
+    "vix_quartile=q3 & etf_7d_sign=unknown": {
+      "n_events": 6,
+      "note": "insufficient for conditioning"
+    },
+    "vix_quartile=q4_stress & etf_7d_sign=unknown": {
+      "n_events": 3,
+      "note": "insufficient for conditioning"
+    },
+    "vix_quartile=q3 & etf_7d_sign=inflow": {
+      "n_events": 4,
+      "note": "insufficient for conditioning"
+    },
+    "vix_quartile=q4_stress & etf_7d_sign=outflow": {
+      "n_events": 1,
+      "note": "insufficient for conditioning"
+    },
+    "vix_quartile=q2 & etf_7d_sign=inflow": {
+      "n_events": 4,
+      "note": "insufficient for conditioning"
+    },
+    "vix_quartile=q4_stress & etf_7d_sign=inflow": {
+      "n_events": 1,
+      "note": "insufficient for conditioning"
+    },
+    "vix_quartile=q3 & etf_7d_sign=neutral": {
+      "n_events": 1,
+      "note": "insufficient for conditioning"
+    }
+  },
+  "generated_at": 1777467821724,
+  "code_version": "b4004f7d4256182060cc7b89b578b5b822ae5666"
+}
