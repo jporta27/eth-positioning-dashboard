@@ -20,8 +20,9 @@ from typing import Optional
 import numpy as np
 
 from . import load
+from . import regime as regime_mod
 from .features import SIGNAL_REGISTRY
-from .eventstudy import run_event_study
+from .eventstudy import run_event_study, run_with_regimes
 
 
 STRATEGY_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_log.json")
@@ -127,18 +128,68 @@ def cmd_run(args):
         print(f"DSR using n_trials={n_trials} (manual override; auto-tracked would be "
               f"{auto_n_trials})")
 
-    print(f"Running event study over {len(ts_ms)} events, horizons={horizons} ...")
-    t0 = time.time()
-    res = run_event_study(
-        event_ts_ms=ts_ms,
-        signal_values=sig_vals,
-        horizons=horizons,
-        bootstrap_iter=args.bootstrap_iter,
-        n_trials=n_trials,
-        rng_seed=args.seed,
-    )
-    dt = time.time() - t0
-    print(f"  done in {dt:.1f}s")
+    # Optional regime conditioning
+    conditions = [c.strip() for c in (args.conditions or "").split(",") if c.strip()]
+
+    if conditions:
+        # Validate names early
+        unknown = [c for c in conditions if c not in regime_mod.LABELERS]
+        if unknown:
+            print(f"Unknown regime labelers: {unknown}. Available: {list(regime_mod.LABELERS)}",
+                  file=sys.stderr)
+            sys.exit(2)
+
+        print(f"Conditioning on: {conditions}")
+        labels = regime_mod.label_events(ts_ms, conditions)
+        for cname, arr in labels.items():
+            unique, counts = np.unique(arr, return_counts=True)
+            dist = ", ".join(f"{u}:{c}" for u, c in zip(unique, counts))
+            print(f"  {cname}: {dist}")
+
+        print(f"Running conditioned event study over {len(ts_ms)} events, "
+              f"horizons={horizons} ...")
+        t0 = time.time()
+        regimes_out = run_with_regimes(
+            event_ts_ms=ts_ms,
+            signal_values=sig_vals,
+            regime_labels=labels,
+            horizons=horizons,
+            bootstrap_iter=args.bootstrap_iter,
+            n_trials=n_trials,
+            rng_seed=args.seed,
+        )
+        # n_trials is passed through so per-combo DSR deflates against the same
+        # global search width as the unconditioned baseline.
+        dt = time.time() - t0
+        print(f"  done in {dt:.1f}s ({len(regimes_out)} regime combinations)")
+        # Also compute the unconditioned baseline so the report can compare.
+        baseline_res = run_event_study(
+            event_ts_ms=ts_ms,
+            signal_values=sig_vals,
+            horizons=horizons,
+            bootstrap_iter=args.bootstrap_iter,
+            n_trials=n_trials,
+            rng_seed=args.seed,
+        )
+        res = {"horizons": baseline_res["horizons"], "regimes": regimes_out,
+               "n_events_pre_purge":       baseline_res.get("n_events_pre_purge"),
+               "n_events_purged":          baseline_res.get("n_events_purged"),
+               "purge_applied":            baseline_res.get("purge_applied"),
+               "years_in_sample":          baseline_res.get("years_in_sample"),
+               "event_frequency_per_year": baseline_res.get("event_frequency_per_year")}
+    else:
+        print(f"Running event study over {len(ts_ms)} events, horizons={horizons} ...")
+        t0 = time.time()
+        res = run_event_study(
+            event_ts_ms=ts_ms,
+            signal_values=sig_vals,
+            horizons=horizons,
+            bootstrap_iter=args.bootstrap_iter,
+            n_trials=n_trials,
+            rng_seed=args.seed,
+        )
+        dt = time.time() - t0
+        print(f"  done in {dt:.1f}s")
 
     payload = {
         "signal": {
@@ -151,6 +202,7 @@ def cmd_run(args):
             "n_trials_auto_tracked":    auto_n_trials,
             "strategies_tested_known":  list(log),
             "bootstrap_iter":           args.bootstrap_iter,
+            "conditions":               conditions,
         },
         "n_observations":           int(len(ts_ms)),
         "n_events_pre_purge":       res.get("n_events_pre_purge"),
@@ -159,6 +211,7 @@ def cmd_run(args):
         "years_in_sample":          res.get("years_in_sample"),
         "event_frequency_per_year": res.get("event_frequency_per_year"),
         "horizons":                 res["horizons"],
+        "regimes":                  res.get("regimes"),
         "generated_at":             int(time.time() * 1000),
         "code_version":             _git_sha(),
     }
@@ -210,6 +263,11 @@ def main():
     p.add_argument("--n-trials", type=int, default=None,
                    help="Number of strategies tested (for DSR). Default: auto-tracked "
                         "from backtest/strategy_log.json — every --signal run appends to it.")
+    p.add_argument("--conditions", type=str, default=None,
+                   help="Comma-separated regime labelers from backtest/regime.py "
+                        "(e.g. vix_quartile,etf_7d_sign). When set, a per-regime-combo "
+                        "event study runs alongside the unconditioned baseline; combos "
+                        "with <30 events are marked insufficient.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output", type=str, default=None, help="Write JSON report to path")
     args = p.parse_args()

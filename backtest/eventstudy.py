@@ -243,6 +243,7 @@ def run_with_regimes(
     klines_table: Optional[pa.Table] = None,
     bootstrap_iter: int = 5000,
     rng_seed: int = 42,
+    n_trials: int = 1,
     purge_overlapping_events: bool = True,
 ) -> dict:
     """Like run_event_study but split by regime combinations.
@@ -272,6 +273,7 @@ def run_with_regimes(
             horizons=horizons,
             klines_table=klines_table,
             bootstrap_iter=bootstrap_iter,
+            n_trials=n_trials,
             rng_seed=rng_seed,
             purge_overlapping_events=purge_overlapping_events,
         )
