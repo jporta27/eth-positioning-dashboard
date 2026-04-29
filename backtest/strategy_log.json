@@ -1,10 +1,14 @@
 {
   "strategies_tested": [
-    "funding_extreme_abs",
-    "funding_hot_abs",
     "funding_hot_inflow",
     "funding_hot_outflow",
+    "funding_hot_abs",
+    "funding_extreme_inflow",
+    "funding_extreme_outflow",
+    "funding_extreme_abs",
+    "stables_expanding",
     "stables_contracting",
-    "stables_expanding"
+    "etf_buying",
+    "etf_selling"
   ]
 }
