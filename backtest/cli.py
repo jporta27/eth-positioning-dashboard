@@ -152,10 +152,15 @@ def cmd_run(args):
             "strategies_tested_known":  list(log),
             "bootstrap_iter":           args.bootstrap_iter,
         },
-        "n_observations": int(len(ts_ms)),
-        "horizons":       res["horizons"],
-        "generated_at":   int(time.time() * 1000),
-        "code_version":   _git_sha(),
+        "n_observations":           int(len(ts_ms)),
+        "n_events_pre_purge":       res.get("n_events_pre_purge"),
+        "n_events_purged":          res.get("n_events_purged"),
+        "purge_applied":            res.get("purge_applied"),
+        "years_in_sample":          res.get("years_in_sample"),
+        "event_frequency_per_year": res.get("event_frequency_per_year"),
+        "horizons":                 res["horizons"],
+        "generated_at":             int(time.time() * 1000),
+        "code_version":             _git_sha(),
     }
 
     # Pretty summary

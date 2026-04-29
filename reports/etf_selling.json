@@ -1,0 +1,41 @@
+{
+  "signal": {
+    "name": "etf_selling",
+    "preset": true,
+    "start": null,
+    "end": null,
+    "n_trials_for_dsr": 10,
+    "n_trials_source": "auto-tracked",
+    "n_trials_auto_tracked": 10,
+    "bootstrap_iter": 5000,
+    "note": "event study skipped: only 19 events available, framework requires >=30"
+  },
+  "n_observations": 19,
+  "n_events_pre_purge": 19,
+  "n_events_purged": 0,
+  "purge_applied": true,
+  "horizons": {
+    "1h": {
+      "n_valid": 19,
+      "note": "insufficient"
+    },
+    "4h": {
+      "n_valid": 19,
+      "note": "insufficient"
+    },
+    "1d": {
+      "n_valid": 19,
+      "note": "insufficient"
+    },
+    "3d": {
+      "n_valid": 19,
+      "note": "insufficient"
+    },
+    "7d": {
+      "n_valid": 19,
+      "note": "insufficient"
+    }
+  },
+  "generated_at": 1777466325321,
+  "code_version": "e09508d8ffe4540aefe9cb13de5bcf3906c92bb1"
+}
