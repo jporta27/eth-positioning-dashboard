@@ -1,0 +1,10 @@
+{
+  "strategies_tested": [
+    "funding_extreme_abs",
+    "funding_hot_abs",
+    "funding_hot_inflow",
+    "funding_hot_outflow",
+    "stables_contracting",
+    "stables_expanding"
+  ]
+}

@@ -24,6 +24,9 @@ from .features import SIGNAL_REGISTRY
 from .eventstudy import run_event_study
 
 
+STRATEGY_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_log.json")
+
+
 def _git_sha() -> Optional[str]:
     try:
         sha = subprocess.check_output(
@@ -35,6 +38,33 @@ def _git_sha() -> Optional[str]:
         return sha
     except Exception:
         return None
+
+
+def _load_strategy_log() -> list:
+    """Read backtest/strategy_log.json. Returns [] if missing/malformed."""
+    if not os.path.exists(STRATEGY_LOG_PATH):
+        return []
+    try:
+        with open(STRATEGY_LOG_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return list(data.get("strategies_tested", []))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _record_strategy_tested(name: str) -> list:
+    """Append `name` to strategy_log.json if not already present, then return
+    the updated list. The list length is the operationally-correct n_trials
+    for DSR — every distinct signal we have ever evaluated counts as one trial,
+    so DSR can correctly deflate for the search we actually performed.
+    """
+    log = _load_strategy_log()
+    if name not in log:
+        log.append(name)
+        os.makedirs(os.path.dirname(STRATEGY_LOG_PATH), exist_ok=True)
+        with open(STRATEGY_LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"strategies_tested": log}, f, indent=2)
+    return log
 
 
 def cmd_audit(args):
@@ -80,6 +110,23 @@ def cmd_run(args):
         print(f"After date filter: only {len(ts_ms)} events. Skipped.", file=sys.stderr)
         sys.exit(1)
 
+    # n_trials for DSR: auto-track every distinct signal we have ever evaluated
+    # via backtest/strategy_log.json. The current run's signal is appended now
+    # so DSR for *this* report includes itself in the trial count. --n-trials
+    # on the command line still overrides the auto-tracked value.
+    log = _record_strategy_tested(args.signal)
+    auto_n_trials = len(log)
+    if args.n_trials is None:
+        n_trials = auto_n_trials
+        n_trials_source = "auto-tracked"
+        print(f"DSR using n_trials={n_trials} (auto-tracked from strategy_log.json, "
+              f"override with --n-trials)")
+    else:
+        n_trials = int(args.n_trials)
+        n_trials_source = "manual override"
+        print(f"DSR using n_trials={n_trials} (manual override; auto-tracked would be "
+              f"{auto_n_trials})")
+
     print(f"Running event study over {len(ts_ms)} events, horizons={horizons} ...")
     t0 = time.time()
     res = run_event_study(
@@ -87,7 +134,7 @@ def cmd_run(args):
         signal_values=sig_vals,
         horizons=horizons,
         bootstrap_iter=args.bootstrap_iter,
-        n_trials=args.n_trials,
+        n_trials=n_trials,
         rng_seed=args.seed,
     )
     dt = time.time() - t0
@@ -99,8 +146,11 @@ def cmd_run(args):
             "preset": True,
             "start":  args.start,
             "end":    args.end,
-            "n_trials_for_dsr": args.n_trials,
-            "bootstrap_iter":   args.bootstrap_iter,
+            "n_trials_for_dsr":         n_trials,
+            "n_trials_source":          n_trials_source,
+            "n_trials_auto_tracked":    auto_n_trials,
+            "strategies_tested_known":  list(log),
+            "bootstrap_iter":           args.bootstrap_iter,
         },
         "n_observations": int(len(ts_ms)),
         "horizons":       res["horizons"],
@@ -152,7 +202,9 @@ def main():
     p.add_argument("--start", type=str, default=None, help="YYYY-MM-DD filter")
     p.add_argument("--end",   type=str, default=None, help="YYYY-MM-DD filter")
     p.add_argument("--bootstrap-iter", type=int, default=5000)
-    p.add_argument("--n-trials", type=int, default=1, help="Number of strategies tested (for DSR)")
+    p.add_argument("--n-trials", type=int, default=None,
+                   help="Number of strategies tested (for DSR). Default: auto-tracked "
+                        "from backtest/strategy_log.json — every --signal run appends to it.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output", type=str, default=None, help="Write JSON report to path")
     args = p.parse_args()
