@@ -42,6 +42,42 @@ def _horizon_to_hours(h: str) -> float:
     raise ValueError(f"bad horizon {h}")
 
 
+def _purge_overlapping_events(
+    sorted_event_ts_ms: np.ndarray,
+    horizon_max_hours: float,
+) -> np.ndarray:
+    """Greedy non-overlap filter: walk sorted events, drop event i whenever the
+    next event lands inside its forward horizon window.
+
+    Concretely: keep event i iff (event_ts[i+1] - event_ts[i]) > horizon_max_hours
+    (the last event is always kept — there is no "next" to overlap with).
+
+    Why we need this: when the same signal fires several times within a horizon,
+    their forward-return windows overlap. Treating the overlapping returns as
+    independent draws shrinks bootstrap CIs and inflates Sharpe — both reflecting
+    serial correlation that is not present in genuinely independent observations.
+
+    Parameters
+    ----------
+    sorted_event_ts_ms : (N,) int64 — MUST be ascending.
+    horizon_max_hours : the largest horizon being evaluated. Smaller horizons
+                       are also covered because their windows are subsets.
+
+    Returns
+    -------
+    keep : (N,) bool mask aligned with input order.
+    """
+    horizon_ms = int(horizon_max_hours * 3_600_000)
+    n = len(sorted_event_ts_ms)
+    keep = np.ones(n, dtype=bool)
+    if n <= 1:
+        return keep
+    gaps = np.diff(sorted_event_ts_ms)
+    # event i overlaps with i+1 iff gap[i] <= horizon_ms — drop event i.
+    keep[:-1] = gaps > horizon_ms
+    return keep
+
+
 def run_event_study(
     event_ts_ms: np.ndarray,
     signal_values: np.ndarray,
@@ -50,6 +86,7 @@ def run_event_study(
     bootstrap_iter: int = 5000,
     n_trials: int = 1,
     rng_seed: int = 42,
+    purge_overlapping_events: bool = True,
 ) -> dict:
     """Core event-study runner over one unconditioned sample.
 
@@ -62,18 +99,47 @@ def run_event_study(
     bootstrap_iter : iterations for CI and permutation p-value.
     n_trials : number of strategies searched (for Deflated Sharpe).
     rng_seed : reproducibility.
+    purge_overlapping_events : if True (default), drop events whose forward
+        horizon window overlaps the next event's anchor. Prevents serial-correlation
+        leakage that artificially tightens CIs and inflates Sharpe. The number of
+        events purged is reported as `n_events_purged` in the output.
 
     Returns
     -------
-    dict with per-horizon statistics. Shape matches the CLI contract.
+    dict with per-horizon statistics. Shape matches the CLI contract. Includes
+    `n_events`, `n_events_pre_purge`, `n_events_purged`, and `horizons`.
     """
     if klines_table is None:
         klines_table = load_klines_1h()
     hours = [_horizon_to_hours(h) for h in horizons]
     rng = np.random.default_rng(rng_seed)
 
+    # Purging requires sorted input — sort everything together so signal/ts stay aligned.
+    event_ts_ms = np.asarray(event_ts_ms, dtype=np.int64)
+    signal_values = np.asarray(signal_values, dtype=np.float64) if signal_values is not None else None
+    order = np.argsort(event_ts_ms, kind="stable")
+    event_ts_ms = event_ts_ms[order]
+    if signal_values is not None:
+        signal_values = signal_values[order]
+
+    n_pre_purge = int(len(event_ts_ms))
+    if purge_overlapping_events and len(event_ts_ms) > 1:
+        h_max = max(hours)
+        keep_mask = _purge_overlapping_events(event_ts_ms, h_max)
+        event_ts_ms = event_ts_ms[keep_mask]
+        if signal_values is not None:
+            signal_values = signal_values[keep_mask]
+    n_post_purge = int(len(event_ts_ms))
+    n_purged = n_pre_purge - n_post_purge
+
     ret_matrix = forward_log_returns(event_ts_ms, hours, klines_table=klines_table)
-    out: Dict[str, Any] = {"n_events": int(len(event_ts_ms)), "horizons": {}}
+    out: Dict[str, Any] = {
+        "n_events":           n_post_purge,
+        "n_events_pre_purge": n_pre_purge,
+        "n_events_purged":    n_purged,
+        "purge_applied":      bool(purge_overlapping_events),
+        "horizons":           {},
+    }
 
     for j, h in enumerate(horizons):
         col = ret_matrix[:, j]
@@ -137,6 +203,7 @@ def run_with_regimes(
     klines_table: Optional[pa.Table] = None,
     bootstrap_iter: int = 5000,
     rng_seed: int = 42,
+    purge_overlapping_events: bool = True,
 ) -> dict:
     """Like run_event_study but split by regime combinations.
 
@@ -166,6 +233,7 @@ def run_with_regimes(
             klines_table=klines_table,
             bootstrap_iter=bootstrap_iter,
             rng_seed=rng_seed,
+            purge_overlapping_events=purge_overlapping_events,
         )
     return out
 
