@@ -114,12 +114,16 @@ def cmd_run(args):
         if hh.get("note"):
             print(f"  {h}: {hh['note']} (n_valid={hh.get('n_valid')})")
             continue
+        # Sharpe printed is the operationally-correct event-frequency variant.
+        # The horizon-frequency variant lives in `sharpe_annualized_by_horizon_freq`
+        # for backwards compatibility with older reports.
         print(f"  {h}: n={hh['n_valid']:>4}  "
               f"mean={hh['mean_return']:+.4f} "
               f"CI95=[{hh['ci95_bootstrap'][0]:+.4f}, {hh['ci95_bootstrap'][1]:+.4f}]  "
               f"IC={hh['ic_spearman']:+.3f} p={hh['ic_pvalue_bootstrap']:.3f}  "
               f"hit={hh['hit_rate']:.3f} (base {hh['hit_rate_baseline_random']:.3f})  "
-              f"sharpe={hh['sharpe_annualized']:+.2f}  "
+              f"sharpe_evf={hh['sharpe_annualized_by_event_freq']:+.2f}  "
+              f"sharpe/ev={hh['sharpe_per_event']:+.3f}  "
               f"DSR={hh['deflated_sharpe']:.3f}  MDD={hh['max_drawdown']:.3f}")
 
     if args.output:

@@ -100,7 +100,7 @@ def test_synthetic_edge():
     print(f"test_synthetic_edge PASS:")
     print(f"  4h mean_return = {h4['mean_return']:+.4f}  ci95={h4['ci95_bootstrap']}")
     print(f"  hit_rate={h4['hit_rate']:.3f}  baseline={h4['hit_rate_baseline_random']:.3f}")
-    print(f"  sharpe_ann={h4['sharpe_annualized']:.2f}")
+    print(f"  sharpe_evf={h4['sharpe_annualized_by_event_freq']:.2f}  sharpe/ev={h4['sharpe_per_event']:.3f}")
 
 
 def test_continuous_signal_edge():

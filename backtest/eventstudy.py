@@ -15,6 +15,7 @@ look-ahead leakage when the signal is sampled at sub-horizon frequency.
 
 from __future__ import annotations
 
+import math
 from typing import Optional, Dict, List, Any
 import numpy as np
 import pyarrow as pa
@@ -133,12 +134,29 @@ def run_event_study(
     n_purged = n_pre_purge - n_post_purge
 
     ret_matrix = forward_log_returns(event_ts_ms, hours, klines_table=klines_table)
+
+    # Annualization frequency from event spacing (operationally correct).
+    # The legacy `sharpe_annualized` used HORIZON_PERIODS_PER_YEAR which assumes
+    # the strategy could re-fire every horizon period (8760/year for 1h). That's
+    # only true for an always-on signal. A signal that fires 77 times in 2 years
+    # has 38.5 opportunities per year — annualizing by horizon-frequency multiplies
+    # the per-event Sharpe by sqrt(8760/77) ≈ 10.7 vs the operationally honest
+    # sqrt(38.5) ≈ 6.2, so the old number was inflated/deflated by ~70%.
+    if n_post_purge >= 2:
+        years_in_sample = (event_ts_ms.max() - event_ts_ms.min()) / (365.25 * 86400 * 1000)
+        event_freq_per_year = (n_post_purge / years_in_sample) if years_in_sample > 0 else float("nan")
+    else:
+        years_in_sample = float("nan")
+        event_freq_per_year = float("nan")
+
     out: Dict[str, Any] = {
-        "n_events":           n_post_purge,
-        "n_events_pre_purge": n_pre_purge,
-        "n_events_purged":    n_purged,
-        "purge_applied":      bool(purge_overlapping_events),
-        "horizons":           {},
+        "n_events":                n_post_purge,
+        "n_events_pre_purge":      n_pre_purge,
+        "n_events_purged":         n_purged,
+        "purge_applied":           bool(purge_overlapping_events),
+        "years_in_sample":         years_in_sample,
+        "event_frequency_per_year": event_freq_per_year,
+        "horizons":                {},
     }
 
     for j, h in enumerate(horizons):
@@ -161,35 +179,57 @@ def run_event_study(
         hit_pos = M.hit_rate(ret, direction=+1)
         baseline_hit = _baseline_hit_rate(klines_table, hours[j])
 
-        # Sharpe — horizon-frequency → annualized
+        # Sharpe variants:
+        #   sharpe_per_event              — raw mean/std of per-event log returns,
+        #                                    no annualization. Used for DSR.
+        #   sharpe_annualized_by_event_freq — operationally correct: scales by
+        #                                    sqrt(events per year). Tells you the
+        #                                    Sharpe you'd actually realize trading
+        #                                    this signal.
+        #   sharpe_annualized_by_horizon_freq — legacy. Scales by sqrt(periods of
+        #                                    size `horizon` per year), assuming the
+        #                                    signal could re-fire every horizon.
+        #                                    Kept for backwards compatibility.
+        ret_std = float(ret.std(ddof=1)) if len(ret) > 1 else 0.0
+        sharpe_per_event = float(ret.mean() / ret_std) if ret_std > 0 else float("nan")
+        sharpe_event_freq = (
+            sharpe_per_event * math.sqrt(event_freq_per_year)
+            if (event_freq_per_year and event_freq_per_year > 0 and math.isfinite(sharpe_per_event))
+            else float("nan")
+        )
         ppy = HORIZON_PERIODS_PER_YEAR.get(h, 365)
-        sharpe = M.annualized_sharpe(ret, periods_per_year=ppy)
+        sharpe_horizon_freq = M.annualized_sharpe(ret, periods_per_year=ppy)
 
         # Equity + DD
         equity = M.equity_curve(ret, side="long")
         mdd = M.max_drawdown(equity)
 
-        # DSR
+        # DSR — must consume the per-event Sharpe with n_obs = n_valid. The DSR
+        # formula's variance term assumes per-period (un-annualized) Sharpe;
+        # passing the annualized value (as before) injected a sqrt(ppy) scale
+        # error that made DSR pin to ~1.0 on signals with weak per-event edge.
         skew = _skew(ret)
         kurt = _excess_kurt(ret)
-        dsr = M.deflated_sharpe(sharpe, n_valid, n_trials, skew=skew, kurt_excess=kurt)
+        dsr = M.deflated_sharpe(sharpe_per_event, n_valid, n_trials, skew=skew, kurt_excess=kurt)
 
         percentiles = M.percentiles(ret)
 
         out["horizons"][h] = {
-            "n_valid":                  n_valid,
-            "mean_return":              mean_r,
-            "median_return":            median_r,
-            "ci95_bootstrap":           [ci_lo, ci_hi],
-            "ic_spearman":              ic,
-            "ic_pvalue_bootstrap":      ic_p,
-            "hit_rate":                 hit_pos,
-            "hit_rate_baseline_random": baseline_hit,
-            "sharpe_annualized":        sharpe,
-            "max_drawdown":             mdd,
-            "deflated_sharpe":          dsr,
-            "percentiles":              percentiles,
-            "equity_curve_pts":         [float(v) for v in equity[::max(1, len(equity) // 200)]],
+            "n_valid":                          n_valid,
+            "mean_return":                      mean_r,
+            "median_return":                    median_r,
+            "ci95_bootstrap":                   [ci_lo, ci_hi],
+            "ic_spearman":                      ic,
+            "ic_pvalue_bootstrap":              ic_p,
+            "hit_rate":                         hit_pos,
+            "hit_rate_baseline_random":         baseline_hit,
+            "sharpe_per_event":                 sharpe_per_event,
+            "sharpe_annualized_by_event_freq":  sharpe_event_freq,
+            "sharpe_annualized_by_horizon_freq": sharpe_horizon_freq,
+            "max_drawdown":                     mdd,
+            "deflated_sharpe":                  dsr,
+            "percentiles":                      percentiles,
+            "equity_curve_pts":                 [float(v) for v in equity[::max(1, len(equity) // 200)]],
         }
 
     return out
