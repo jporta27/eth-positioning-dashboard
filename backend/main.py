@@ -66,19 +66,29 @@ DEPTH_CLUSTER_SIZE = 0.25  # group price levels into $0.25 buckets
 VOLATILITY_LOOKBACK_DAYS = 30  # for percentile calculation
 PORT = int(os.getenv("PORT", 8000))
 
-# Dune Analytics — ETH CEX netflows (query 6984181)
+# Dune Analytics — ETH CEX netflows
+# Each (key, query_id) pair is tried in order; the first that returns data wins.
+# Fallback's query is typically a fork of the primary's, owned by the fallback
+# account, so when the primary's quota is exhausted the fallback can read AND
+# trigger fresh executions. If you only set the fallback key but not its query_id,
+# we'll try the primary query with the fallback key — that only works if the
+# primary query is public, otherwise Dune returns 404.
 DUNE_API_KEY = os.getenv("DUNE_API_KEY", "")
 DUNE_API_KEY_FALLBACK = os.getenv("DUNE_API_KEY_FALLBACK", "")
-# Keys are tried in order; on HTTP 402 (datapoint cap exhausted) we rotate to
-# the next one and remember which one is dry for ~6h so we don't re-spam it.
-DUNE_API_KEYS = [k for k in [DUNE_API_KEY, DUNE_API_KEY_FALLBACK] if k]
 DUNE_QUERY_ID = os.getenv("DUNE_QUERY_ID", "6984181")
+DUNE_QUERY_ID_FALLBACK = os.getenv("DUNE_QUERY_ID_FALLBACK", "")
+DUNE_KEY_QUERY_PAIRS = [
+    (k, q) for k, q in [
+        (DUNE_API_KEY, DUNE_QUERY_ID),
+        (DUNE_API_KEY_FALLBACK, DUNE_QUERY_ID_FALLBACK or DUNE_QUERY_ID),
+    ] if k and q
+]
 DUNE_CACHE_TTL = 300  # 5 min — short so we pick up Dune-side re-executions promptly
 DUNE_MAX_AGE_HOURS = 1  # trigger fresh execution if Dune's last result is older than 1h
 DUNE_POLL_MAX_ATTEMPTS = 6  # 30s ceiling (6×5s) — fits Vercel maxDuration=60s budget
 DUNE_PAGE_LIMIT = 200  # rows per /results call. 200 × 7 cols = 1400 datapoints, under Dune per-request cap.
-DUNE_KEY_EXHAUSTED_BACKOFF_S = 6 * 3600  # remember a 402'd key for 6h before retrying it
-_dune_key_exhausted_until: dict = {}  # key -> epoch_ts when we'll consider it again
+DUNE_KEY_EXHAUSTED_BACKOFF_S = 6 * 3600  # remember a 402'd (key, method) for 6h before retrying it
+_dune_key_exhausted_until: dict = {}  # (key, method) -> epoch_ts when we'll consider it again
 
 # DefiLlama — CEX ETH reserves (absolute stock)
 DEFILLAMA_CEX_SLUGS = {
@@ -1321,104 +1331,97 @@ async def _dune_request(
     client: httpx.AsyncClient,
     method: str,
     url: str,
+    key: str,
     *,
     timeout: float = 30.0,
 ) -> Optional[httpx.Response]:
-    """HTTP request to Dune with key rotation on HTTP 402.
+    """One key, one HTTP call. Returns Response on success, None on 402 (after
+    marking the (key, method) pair as backed-off for DUNE_KEY_EXHAUSTED_BACKOFF_S).
+    Raises on other HTTP errors so the caller can decide whether to swallow.
 
-    Tries each non-empty key in DUNE_API_KEYS in order. If a key is currently
-    inside its exhausted-backoff window, it's skipped. On 402, marks the key
-    as exhausted (DUNE_KEY_EXHAUSTED_BACKOFF_S) and tries the next.
-
-    Returns the first successful Response, or None if every key is either
-    backed-off or returned 402. Non-402 errors are raised so the caller can
-    distinguish quota issues from real failures.
+    Backoff is scoped to (key, method): a key that 402'd on POST /execute
+    (write quota) might still serve GET /results (free read of cached data).
     """
-    if not DUNE_API_KEYS:
+    if not key:
         return None
-    # Backoff is scoped to (key, method) — a key that 402'd on POST /execute
-    # (write quota) might still serve GET /results (already-cached read).
     now = time.time()
-    last_402: Optional[httpx.Response] = None
-    for key in DUNE_API_KEYS:
-        backoff_key = (key, method.upper())
-        if _dune_key_exhausted_until.get(backoff_key, 0) > now:
-            continue
-        try:
-            resp = await client.request(
-                method, url,
-                headers={"X-DUNE-API-KEY": key},
-                timeout=timeout,
-            )
-        except httpx.HTTPError as e:
-            logger.warning(f"Dune {method} {url.split('?')[0]} network error on key …{key[-6:]}: {e}")
-            raise
-        if resp.status_code == 402:
-            _dune_key_exhausted_until[backoff_key] = now + DUNE_KEY_EXHAUSTED_BACKOFF_S
-            logger.warning(
-                f"Dune key …{key[-6:]} 402 on {method} {url.split('?')[0]}; "
-                f"backed-off ({method}) until ts={int(_dune_key_exhausted_until[backoff_key])}"
-            )
-            last_402 = resp
-            continue
-        resp.raise_for_status()
-        return resp
-    if last_402 is not None:
-        logger.warning(f"Dune: all keys 402 / in backoff for {method} {url.split('?')[0]}")
-    return None
+    backoff_key = (key, method.upper())
+    if _dune_key_exhausted_until.get(backoff_key, 0) > now:
+        return None
+    resp = await client.request(
+        method, url,
+        headers={"X-DUNE-API-KEY": key},
+        timeout=timeout,
+    )
+    if resp.status_code == 402:
+        _dune_key_exhausted_until[backoff_key] = now + DUNE_KEY_EXHAUSTED_BACKOFF_S
+        logger.warning(
+            f"Dune key …{key[-6:]} 402 on {method} {url.split('?')[0]}; "
+            f"backed-off ({method}) for {DUNE_KEY_EXHAUSTED_BACKOFF_S//3600}h"
+        )
+        return None
+    resp.raise_for_status()
+    return resp
 
 
-async def _dune_trigger_and_poll(client: httpx.AsyncClient) -> Optional[dict]:
-    """Trigger a fresh Dune execution and poll until complete (max ~30s).
-
-    Returns None on any failure (402 over quota, 404 if the key doesn't own /
-    can't trigger the query, timeout, failed state) — caller should fall back
-    to whatever cached/paginated result it already has.
+async def _dune_trigger_and_poll(
+    client: httpx.AsyncClient, key: str, query_id: str,
+) -> Optional[dict]:
+    """Trigger a fresh Dune execution using (key, query_id) and poll until
+    complete (max ~30s). Returns None on any failure (402, 404, timeout, bad
+    state). Caller should fall back to cached/paginated data or try next pair.
     """
-    # Step 1: trigger execution (rotates keys via _dune_request on 402)
+    # Step 1: trigger execution
     try:
         exec_resp = await _dune_request(
             client, "POST",
-            f"https://api.dune.com/api/v1/query/{DUNE_QUERY_ID}/execute",
-            timeout=15.0,
+            f"https://api.dune.com/api/v1/query/{query_id}/execute",
+            key, timeout=15.0,
         )
     except Exception as e:
-        logger.warning(f"Dune execute trigger failed: {e}")
+        logger.warning(f"Dune execute trigger failed (key …{key[-6:]} q={query_id}): {e}")
         return None
     if exec_resp is None:
         return None
     execution_id = exec_resp.json().get("execution_id")
     if not execution_id:
-        logger.warning("Dune execute returned no execution_id")
         return None
-    logger.info(f"Dune execution triggered: {execution_id}")
+    logger.info(f"Dune execution triggered (key …{key[-6:]} q={query_id}): {execution_id}")
 
     # Step 2: poll status (capped by DUNE_POLL_MAX_ATTEMPTS, 5s intervals)
-    for attempt in range(DUNE_POLL_MAX_ATTEMPTS):
+    for _ in range(DUNE_POLL_MAX_ATTEMPTS):
         await asyncio.sleep(5)
-        status_resp = await _dune_request(
-            client, "GET",
-            f"https://api.dune.com/api/v1/execution/{execution_id}/status",
-            timeout=10.0,
-        )
+        try:
+            status_resp = await _dune_request(
+                client, "GET",
+                f"https://api.dune.com/api/v1/execution/{execution_id}/status",
+                key, timeout=10.0,
+            )
+        except Exception as e:
+            logger.warning(f"Dune status poll failed: {e}")
+            return None
         if status_resp is None:
             return None
         state = status_resp.json().get("state", "")
         if state == "QUERY_STATE_COMPLETED":
             break
         if state in ("QUERY_STATE_FAILED", "QUERY_STATE_CANCELLED", "QUERY_STATE_EXPIRED"):
-            logger.warning(f"Dune execution {execution_id} ended with state: {state}")
+            logger.warning(f"Dune execution {execution_id} ended state={state}")
             return None
     else:
-        logger.warning(f"Dune execution {execution_id} did not finish within {DUNE_POLL_MAX_ATTEMPTS*5}s — next request will pick it up")
+        logger.warning(f"Dune execution {execution_id} did not finish within budget")
         return None
 
-    # Step 3: fetch results of this execution
-    res_resp = await _dune_request(
-        client, "GET",
-        f"https://api.dune.com/api/v1/execution/{execution_id}/results",
-        timeout=30.0,
-    )
+    # Step 3: fetch results
+    try:
+        res_resp = await _dune_request(
+            client, "GET",
+            f"https://api.dune.com/api/v1/execution/{execution_id}/results",
+            key, timeout=30.0,
+        )
+    except Exception as e:
+        logger.warning(f"Dune fresh-results fetch failed: {e}")
+        return None
     if res_resp is None:
         return None
     data = res_resp.json()
@@ -1426,16 +1429,15 @@ async def _dune_trigger_and_poll(client: httpx.AsyncClient) -> Optional[dict]:
     return data
 
 
-async def _fetch_dune_all_pages(client: httpx.AsyncClient) -> Optional[dict]:
-    """GET /query/{id}/results paginated. Returns full payload with merged rows.
-
-    The unbounded /results call returns 402 ("datapoint limit per billing cycle")
-    when total_row_count × column_count exceeds the per-request cap. We page with
-    limit=DUNE_PAGE_LIMIT and parallel-fetch the rest via execution_id.
-    Each request rotates keys via _dune_request on 402.
+async def _fetch_dune_all_pages(
+    client: httpx.AsyncClient, key: str, query_id: str,
+) -> Optional[dict]:
+    """GET /query/{id}/results paginated using a single (key, query_id) pair.
+    Returns full payload with merged rows or None if the key can't access this
+    query (404) or 402'd on read.
     """
-    url = f"https://api.dune.com/api/v1/query/{DUNE_QUERY_ID}/results?limit={DUNE_PAGE_LIMIT}"
-    resp = await _dune_request(client, "GET", url, timeout=30.0)
+    url = f"https://api.dune.com/api/v1/query/{query_id}/results?limit={DUNE_PAGE_LIMIT}"
+    resp = await _dune_request(client, "GET", url, key, timeout=30.0)
     if resp is None:
         return None
     data = resp.json()
@@ -1449,7 +1451,10 @@ async def _fetch_dune_all_pages(client: httpx.AsyncClient) -> Optional[dict]:
         offsets = list(range(len(rows), total_rows, DUNE_PAGE_LIMIT))
         async def _fetch_page(off: int) -> list:
             pg_url = f"https://api.dune.com/api/v1/execution/{exec_id}/results?limit={DUNE_PAGE_LIMIT}&offset={off}"
-            pg_resp = await _dune_request(client, "GET", pg_url, timeout=30.0)
+            try:
+                pg_resp = await _dune_request(client, "GET", pg_url, key, timeout=30.0)
+            except Exception:
+                return []
             if pg_resp is None:
                 return []
             return ((pg_resp.json().get("result") or {}).get("rows") or [])
@@ -1474,16 +1479,24 @@ async def fetch_dune_cex_netflows(client: httpx.AsyncClient) -> Optional[dict]:
          then re-page those results. Falls back to stale data on timeout.
     """
     global dune_cache, dune_cache_ts
-    if not DUNE_API_KEYS:
+    if not DUNE_KEY_QUERY_PAIRS:
         return None
     now = time.time()
     if dune_cache and (now - dune_cache_ts) < DUNE_CACHE_TTL:
         return dune_cache
 
-    try:
-        data = await _fetch_dune_all_pages(client)
+    # Iterate (key, query_id) pairs. The first pair that returns data wins;
+    # we still try to refresh that pair's cached data with a fresh execution
+    # before returning. If a pair can't read its query (404/402 on GET), we
+    # move on to the next pair.
+    for key, query_id in DUNE_KEY_QUERY_PAIRS:
+        try:
+            data = await _fetch_dune_all_pages(client, key, query_id)
+        except Exception as e:
+            logger.warning(f"Dune read failed (key …{key[-6:]} q={query_id}): {e}")
+            continue
         if not data:
-            return None
+            continue  # try next pair
 
         exec_ended = data.get("execution_ended_at", "")
         is_stale = False
@@ -1491,7 +1504,7 @@ async def fetch_dune_cex_netflows(client: httpx.AsyncClient) -> Optional[dict]:
             try:
                 ended_dt = datetime.fromisoformat(exec_ended.replace("Z", "+00:00"))
                 age_hours = (datetime.now(timezone.utc) - ended_dt).total_seconds() / 3600
-                logger.info(f"Dune cached result age: {age_hours:.1f}h (max {DUNE_MAX_AGE_HOURS}h)")
+                logger.info(f"Dune cached result age: {age_hours:.1f}h (max {DUNE_MAX_AGE_HOURS}h, key …{key[-6:]})")
                 if age_hours > DUNE_MAX_AGE_HOURS:
                     is_stale = True
             except Exception:
@@ -1500,24 +1513,23 @@ async def fetch_dune_cex_netflows(client: httpx.AsyncClient) -> Optional[dict]:
             is_stale = True
 
         if is_stale:
-            logger.info("Dune results stale — triggering fresh execution...")
-            fresh = await _dune_trigger_and_poll(client)
+            logger.info(f"Dune results stale — triggering fresh execution (key …{key[-6:]} q={query_id})")
+            fresh = await _dune_trigger_and_poll(client, key, query_id)
             if fresh:
-                # Re-page so we get the full row set, not just whatever the trigger returned.
-                paged = await _fetch_dune_all_pages(client)
+                paged = await _fetch_dune_all_pages(client, key, query_id)
                 if paged:
                     data = paged
             else:
-                logger.info("Fresh execution failed/timed out — using stale results")
+                logger.info("Fresh execution unavailable — using stale results")
 
         dune_cache = data
         dune_cache_ts = now
         row_count = (data.get("result") or {}).get("metadata", {}).get("row_count", 0)
-        logger.info(f"Dune fetch ok: {row_count} rows (paginated)")
+        logger.info(f"Dune fetch ok via key …{key[-6:]} q={query_id}: {row_count} rows")
         return data
-    except Exception as e:
-        logger.warning(f"Dune fetch failed: {e}")
-        return None
+
+    logger.warning("Dune: all (key, query_id) pairs failed — no data this cycle")
+    return None
 
 
 async def fetch_defillama_reserves(client: httpx.AsyncClient) -> Optional[dict]:
