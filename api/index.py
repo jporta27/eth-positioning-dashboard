@@ -1502,10 +1502,10 @@ def process_dune_netflows(
         return {}
 
     HOUR_MS = 3600 * 1000
-    max_ts = max(p["ts"] for p in parsed)
 
     # When did Dune actually run the query? Lets the frontend distinguish
-    # "freshest bucket is naturally lagged" from "Dune cache hasn't refreshed".
+    # "freshest bucket is naturally lagged" from "Dune cache hasn't refreshed",
+    # and is the reference timestamp for detecting in-progress buckets below.
     exec_ended_ms: Optional[int] = None
     exec_ended_str = raw.get("execution_ended_at", "")
     if exec_ended_str:
@@ -1514,11 +1514,32 @@ def process_dune_netflows(
         except (ValueError, TypeError):
             exec_ended_ms = None
 
+    # The most recent hour bucket is in active indexing by Dune (~30-90 min lag),
+    # so its row counts grow with every re-execution. Including it in aggregates
+    # makes consecutive refreshes show different numbers for the same "window".
+    # Detection: bucket is "in progress" if its END time was within INDEXING_LAG_MS
+    # of when Dune ran the query (exec_ended_ms, NOT wall-clock now — by the time we
+    # process the result it may already be older than the lag window).
+    INDEXING_LAG_MS = 90 * 60 * 1000
+    unique_ts_desc = sorted({p["ts"] for p in parsed}, reverse=True)
+    max_bucket_ts = unique_ts_desc[0]
+    ref_ts = exec_ended_ms or int(time.time() * 1000)
+    bucket_end_ms = max_bucket_ts + HOUR_MS
+    if (ref_ts - bucket_end_ms) < INDEXING_LAG_MS and len(unique_ts_desc) >= 2:
+        partial_bucket_ts: Optional[int] = max_bucket_ts
+        max_ts = unique_ts_desc[1]
+        parsed_for_aggregates = [p for p in parsed if p["ts"] != partial_bucket_ts]
+    else:
+        # Old data or only one bucket — nothing in-progress to exclude.
+        partial_bucket_ts = None
+        max_ts = max_bucket_ts
+        parsed_for_aggregates = parsed
+
     windows = {"1h": 1, "6h": 6, "24h": 24, "7d": 168}
     aggregates = {}
     for label, hours in windows.items():
         cutoff = max_ts - (hours - 1) * HOUR_MS
-        subset = [p for p in parsed if p["ts"] >= cutoff]
+        subset = [p for p in parsed_for_aggregates if p["ts"] >= cutoff]
         in_eth_t  = sum(p["in_eth"]  for p in subset)
         out_eth_t = sum(p["out_eth"] for p in subset)
         net_eth_t = sum(p["net_eth"] for p in subset)
@@ -1534,7 +1555,7 @@ def process_dune_netflows(
 
     cutoff_24h = max_ts - 23 * HOUR_MS
     by_cex_dict: dict = {}
-    for p in parsed:
+    for p in parsed_for_aggregates:
         if p["ts"] < cutoff_24h:
             continue
         cex = p["cex"]
@@ -1653,6 +1674,7 @@ def process_dune_netflows(
     return {
         "lastUpdate": max_ts,
         "executionEndedAt": exec_ended_ms,
+        "partialBucketTs": partial_bucket_ts,
         "exchangeCount": len(set(p["cex"] for p in parsed)),
         "aggregates": aggregates,
         "byExchange24h": by_exchange,
