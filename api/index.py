@@ -56,7 +56,7 @@ DUNE_KEY_QUERY_PAIRS = [
         (DUNE_API_KEY_FALLBACK, DUNE_QUERY_ID_FALLBACK or DUNE_QUERY_ID),
     ] if k and q
 ]
-DUNE_CACHE_TTL = 300  # 5 min — short so we pick up Dune-side re-executions promptly
+DUNE_CACHE_TTL = 1800  # 30 min — covers most Vercel cold/warm Lambda variance and matches the indexing-lag granularity, plus ~6x fewer Dune credit hits per cycle
 DUNE_MAX_AGE_HOURS = 1  # trigger fresh execution if Dune's last result is older than 1h
 DUNE_PAGE_LIMIT = 200  # rows per /results call. 200 × 7 cols = 1400 datapoints, under Dune per-request cap.
 DUNE_KEY_EXHAUSTED_BACKOFF_S = 6 * 3600  # remember a 402'd (key, method) for 6h before retrying it

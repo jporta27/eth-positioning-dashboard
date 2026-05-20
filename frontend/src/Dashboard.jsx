@@ -1017,6 +1017,7 @@ function CexNetflowsPanel({ cexNetflows }) {
   const rc = cn.relativeContext || {}
   const lastUpdate = cn.lastUpdate
   const executionEndedAt = cn.executionEndedAt
+  const partialBucketTs = cn.partialBucketTs
 
   const hasData = byEx.length > 0 && Object.keys(aggs).length > 0
 
@@ -1119,6 +1120,11 @@ function CexNetflowsPanel({ cexNetflows }) {
         <div style={S.sectionTitle}>EXCHANGE NETFLOWS · CEX Spot Pressure (vía Dune)</div>
         <div style={{ fontSize: 9, color: '#4a5980', ...S.mono }}>
           {cn.exchangeCount || 0} exchanges · bucket {bucketAgeMin != null ? `${bucketAgeMin}m` : '—'}
+          {partialBucketTs && (
+            <span style={{ color: '#94a3b8', marginLeft: 6 }} title="El bucket más reciente está aún indexándose (Dune lag ~30-90min) y se EXCLUYE de los aggregates para evitar variación entre refreshes. Se muestra en el gráfico como tick parcial.">
+              · live tick excluded
+            </span>
+          )}
           {' · '}
           <span style={{ color: duneStaleColor }} title="Edad de la última ejecución de Dune (no del bucket)">
             Dune {duneAgeMin != null ? `${duneAgeMin}m` : '—'}
