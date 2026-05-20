@@ -5,6 +5,7 @@ No background tasks — each request fetches fresh data.
 """
 
 import os
+import re
 import time
 import math
 import statistics
@@ -1445,6 +1446,293 @@ async def fetch_defi_eth_map(client: httpx.AsyncClient) -> Optional[dict]:
     return result
 
 
+# ── Derived (no network): perp basis, options skew, options expiries ────
+# Ported from backend/main.py so prod Vercel emits these keys too.
+
+def compute_perp_basis(
+    spot_price: Optional[float],
+    perp_prices: dict,
+    front_future_data: Optional[dict] = None,
+) -> Optional[dict]:
+    """Compute spot-perp spread and perp-quarterly basis. No network."""
+    if not spot_price or spot_price <= 0:
+        return None
+    spot_perp = {}
+    for venue, perp in perp_prices.items():
+        try:
+            perp_val = float(perp) if perp is not None else None
+        except (TypeError, ValueError):
+            perp_val = None
+        if not perp_val or perp_val <= 0:
+            continue
+        spread    = perp_val - spot_price
+        basis_pct = (spread / spot_price) * 100
+        spot_perp[venue] = {
+            "perp":     round(perp_val, 2),
+            "spread":   round(spread, 4),
+            "basisPct": round(basis_pct, 4),
+        }
+
+    perp_quarterly = None
+    if front_future_data and spot_perp:
+        perp_values = [v["perp"] for v in spot_perp.values()]
+        if perp_values:
+            perp_avg = sum(perp_values) / len(perp_values)
+            future   = front_future_data.get("mark")
+            dte      = front_future_data.get("dte")
+            if future and dte and dte > 0:
+                spread_q    = future - perp_avg
+                basis_pct_q = (spread_q / perp_avg) * 100
+                basis_ann_q = basis_pct_q * (365.0 / dte)
+                perp_quarterly = {
+                    "perpAvg":   round(perp_avg, 2),
+                    "quarterly": round(future, 2),
+                    "dte":       round(dte, 2),
+                    "spread":    round(spread_q, 2),
+                    "basisPct":  round(basis_pct_q, 4),
+                    "basisAnnualizedPct": round(basis_ann_q, 2),
+                }
+
+    max_spread = max((v["spread"] for v in spot_perp.values()), default=None)
+    min_spread = min((v["spread"] for v in spot_perp.values()), default=None)
+
+    return {
+        "spot":          round(spot_price, 2),
+        "spotPerp":      spot_perp,
+        "perpQuarterly": perp_quarterly,
+        "spreadRange":   {
+            "max": round(max_spread, 4) if max_spread is not None else None,
+            "min": round(min_spread, 4) if min_spread is not None else None,
+        },
+        "fetchedAt":     int(time.time() * 1000),
+    }
+
+
+def _bs_delta(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
+    """Black-Scholes delta. T in years, sigma as decimal."""
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    cdf = 0.5 * (1 + math.erf(d1 / math.sqrt(2)))
+    return cdf if is_call else cdf - 1.0
+
+
+def _parse_deribit_option_instrument(name: str):
+    """'ETH-29DEC24-3000-C' → (expiry_dt, strike, is_call) or None."""
+    m = re.match(r"^ETH-(\d{1,2})([A-Z]{3})(\d{2})-(\d+(?:\.\d+)?)-([CP])$", name)
+    if not m:
+        return None
+    day, mon, yr, strike, cp = m.groups()
+    months = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+              "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+    if mon not in months:
+        return None
+    try:
+        exp_dt = datetime(2000 + int(yr), months[mon], int(day), 8, 0, tzinfo=timezone.utc)
+        return (exp_dt, float(strike), cp == "C")
+    except ValueError:
+        return None
+
+
+def _interp_iv_at_delta(opts_sorted_by_strike: list, target_delta: float) -> Optional[float]:
+    """Linear interp of IV between two strikes bracketing the target delta."""
+    if not opts_sorted_by_strike:
+        return None
+    opts = opts_sorted_by_strike
+    for i in range(len(opts) - 1):
+        d0, d1 = opts[i]["delta"], opts[i + 1]["delta"]
+        if (d0 >= target_delta >= d1) or (d0 <= target_delta <= d1):
+            if d1 == d0:
+                return opts[i]["iv"]
+            w = (target_delta - d0) / (d1 - d0)
+            return opts[i]["iv"] + w * (opts[i + 1]["iv"] - opts[i]["iv"])
+    nearest = min(opts, key=lambda x: abs(x["delta"] - target_delta))
+    if abs(nearest["delta"] - target_delta) > 0.12:
+        return None
+    return nearest["iv"]
+
+
+def compute_options_skew(
+    deribit_book_summary: list,
+    spot: Optional[float],
+    r: Optional[float] = None,
+    strike_filter_pct: float = 0.30,
+) -> Optional[dict]:
+    """RR25 and BF25 per expiry from Deribit book_summary.
+
+    NOTE: in this Vercel mirror we don't have fetch_risk_free_rate yet, so we
+    fall back to 0.04 (hardcoded) when r is not passed. Once the risk-free
+    fetcher is ported this can read from a cache like backend/main.py.
+    """
+    if not deribit_book_summary or not spot or spot <= 0:
+        return None
+    if r is None:
+        r = 0.04  # TODO: read from risk_free_cache once fetcher is ported
+
+    low_bound  = spot * (1 - strike_filter_pct)
+    high_bound = spot * (1 + strike_filter_pct)
+
+    now_dt = datetime.now(timezone.utc)
+    by_expiry: dict = {}
+    for s in deribit_book_summary:
+        name = s.get("instrument_name", "")
+        parsed = _parse_deribit_option_instrument(name)
+        if not parsed:
+            continue
+        exp_dt, strike, is_call = parsed
+        if strike < low_bound or strike > high_bound:
+            continue
+        iv_pct = s.get("mark_iv")
+        try:
+            iv = float(iv_pct) / 100.0 if iv_pct is not None else None
+        except (TypeError, ValueError):
+            iv = None
+        if not iv or iv <= 0:
+            continue
+        T = (exp_dt - now_dt).total_seconds() / (365.25 * 86400)
+        if T <= 0:
+            continue
+        by_expiry.setdefault(exp_dt, {"calls": [], "puts": []})
+        entry = {"strike": strike, "iv": iv, "T": T}
+        (by_expiry[exp_dt]["calls"] if is_call else by_expiry[exp_dt]["puts"]).append(entry)
+
+    term = []
+    for exp_dt, groups in by_expiry.items():
+        calls = sorted(groups["calls"], key=lambda x: x["strike"])
+        puts  = sorted(groups["puts"],  key=lambda x: x["strike"])
+        if not calls or not puts:
+            continue
+        for c in calls:
+            c["delta"] = _bs_delta(spot, c["strike"], c["T"], r, c["iv"], True)
+        for p in puts:
+            p["delta"] = _bs_delta(spot, p["strike"], p["T"], r, p["iv"], False)
+        iv_call25 = _interp_iv_at_delta(calls, target_delta=0.25)
+        iv_put25  = _interp_iv_at_delta(puts,  target_delta=-0.25)
+
+        all_strikes = calls + puts
+        atm = min(all_strikes, key=lambda x: abs(x["strike"] - spot))
+        iv_atm = atm["iv"]
+
+        rr25 = bf25 = None
+        if iv_call25 is not None and iv_put25 is not None:
+            rr25 = iv_call25 - iv_put25
+            bf25 = 0.5 * (iv_call25 + iv_put25) - iv_atm
+
+        dte_days = (exp_dt - now_dt).total_seconds() / 86400
+        term.append({
+            "expiry":         exp_dt.strftime("%Y-%m-%d"),
+            "expiryTs":       int(exp_dt.timestamp() * 1000),
+            "dte":            round(dte_days, 2),
+            "ivAtm":          round(iv_atm, 5),
+            "ivCall25":       round(iv_call25, 5) if iv_call25 is not None else None,
+            "ivPut25":        round(iv_put25, 5)  if iv_put25  is not None else None,
+            "rr25":           round(rr25, 5) if rr25 is not None else None,
+            "bf25":           round(bf25, 5) if bf25 is not None else None,
+            "strikesInScope": len(all_strikes),
+        })
+
+    term.sort(key=lambda x: x["dte"])
+
+    def _pick(target):
+        return min(term, key=lambda x: abs(x["dte"] - target)) if term else None
+
+    return {
+        "spot":             round(spot, 2),
+        "riskFreeRate":     round(r, 5),
+        "strikeFilterPct":  strike_filter_pct,
+        "term":             term,
+        "canonical": {
+            "t7d":  _pick(7),
+            "t30d": _pick(30),
+            "t60d": _pick(60),
+            "t90d": _pick(90),
+        },
+        "source":    "deribit",
+        "fetchedAt": int(time.time() * 1000),
+    }
+
+
+def compute_options_expiries(
+    deribit_book_summary: list,
+    spot: Optional[float],
+    max_expiries: int = 8,
+    pin_strike_range_pct: float = 0.02,
+) -> Optional[dict]:
+    """Next N expiries with notional USD, put/call ratio, pin risk (OI in ±2%/√DTE)."""
+    if not deribit_book_summary or not spot or spot <= 0:
+        return None
+
+    now_dt = datetime.now(timezone.utc)
+    by_expiry: dict = {}
+    for s in deribit_book_summary:
+        name = s.get("instrument_name", "")
+        parsed = _parse_deribit_option_instrument(name)
+        if not parsed:
+            continue
+        exp_dt, strike, is_call = parsed
+        dte = (exp_dt - now_dt).total_seconds() / 86400
+        if dte <= 0:
+            continue
+        oi = s.get("open_interest")
+        try:
+            oi_val = float(oi) if oi is not None else 0.0
+        except (TypeError, ValueError):
+            oi_val = 0.0
+        slot = by_expiry.setdefault(exp_dt, {"callOi": 0.0, "putOi": 0.0, "strikes": [], "dte": dte})
+        if is_call:
+            slot["callOi"] += oi_val
+        else:
+            slot["putOi"]  += oi_val
+        slot["strikes"].append({"strike": strike, "is_call": is_call, "oi": oi_val})
+
+    pin_low  = spot * (1 - pin_strike_range_pct)
+    pin_high = spot * (1 + pin_strike_range_pct)
+
+    upcoming = []
+    for exp_dt, info in by_expiry.items():
+        total_oi = info["callOi"] + info["putOi"]
+        if total_oi <= 0:
+            continue
+        notional_usd = total_oi * spot
+        pc = (info["putOi"] / info["callOi"]) if info["callOi"] > 0 else None
+        pin_oi = sum(x["oi"] for x in info["strikes"]
+                     if pin_low <= x["strike"] <= pin_high)
+        dte_clamped = max(info["dte"], 0.25)
+        pin_risk = pin_oi / math.sqrt(dte_clamped)
+        upcoming.append({
+            "expiry":        exp_dt.strftime("%Y-%m-%d"),
+            "expiryTs":      int(exp_dt.timestamp() * 1000),
+            "dte":           round(info["dte"], 2),
+            "callOi":        round(info["callOi"], 2),
+            "putOi":         round(info["putOi"], 2),
+            "totalOi":       round(total_oi, 2),
+            "notionalUsd":   round(notional_usd, 0),
+            "putCallRatio":  round(pc, 4) if pc is not None else None,
+            "pinOi":         round(pin_oi, 2),
+            "pinRisk":       round(pin_risk, 2),
+        })
+
+    upcoming.sort(key=lambda x: x["dte"])
+    upcoming = upcoming[:max_expiries]
+
+    total_notional = sum(x["notionalUsd"] for x in upcoming)
+    total_call_oi  = sum(x["callOi"] for x in upcoming)
+    total_put_oi   = sum(x["putOi"]  for x in upcoming)
+    agg_pc = (total_put_oi / total_call_oi) if total_call_oi > 0 else None
+    largest = max(upcoming, key=lambda x: x["notionalUsd"]) if upcoming else None
+
+    return {
+        "spot":                    round(spot, 2),
+        "upcoming":                upcoming,
+        "totalNotionalUsd":        total_notional,
+        "aggregatePutCallRatio":   round(agg_pc, 4) if agg_pc is not None else None,
+        "largestExpiry":           largest,
+        "pinStrikeRangePct":       pin_strike_range_pct,
+        "source":                  "deribit",
+        "fetchedAt":               int(time.time() * 1000),
+    }
+
+
 def process_dune_netflows(
     raw: Optional[dict],
     current_eth_price: Optional[float],
@@ -2165,6 +2453,32 @@ async def fetch_all_data() -> dict:
     options_analytics = calculate_options_analytics(all_instruments, spot)
     iv_term_structure = calculate_iv_term_structure(all_instruments, spot)
 
+    # Derived (no extra network): perp basis + RR25/BF25 + expiries calendar.
+    # These keys were emitted by backend/main.py but were missing in api/index.py
+    # so the corresponding panels rendered empty in prod.
+    perp_prices_for_basis = {
+        "binance":     safe_float(bn_ticker, "lastPrice"),
+        "okx":         safe_float(okx_perp_ticker, "last") if isinstance(okx_perp_ticker, dict) else None,
+        "bybit":       (lambda lst: float(lst[0].get("lastPrice") or 0) if lst else None)(
+                            (bybit_perp_ticker.get("result", {}) or {}).get("list", [])
+                            if isinstance(bybit_perp_ticker, dict) else []),
+    }
+    try:
+        perp_basis_computed = compute_perp_basis(spot, perp_prices_for_basis, front_future_data=None)
+    except Exception as e:
+        logger.warning(f"compute_perp_basis failed: {e}")
+        perp_basis_computed = None
+    try:
+        options_skew_computed = compute_options_skew(all_instruments, spot)
+    except Exception as e:
+        logger.warning(f"compute_options_skew failed: {e}")
+        options_skew_computed = None
+    try:
+        options_expiries_computed = compute_options_expiries(all_instruments, spot)
+    except Exception as e:
+        logger.warning(f"compute_options_expiries failed: {e}")
+        options_expiries_computed = None
+
     vol_bn_perp = safe_float(bn_ticker, "quoteVolume") or 0
     vol_bn_spot = safe_float(bn_spot_ticker, "quoteVolume") or 0
 
@@ -2377,6 +2691,9 @@ async def fetch_all_data() -> dict:
         "stochastics": stochastics_data,
         "moneyQuality": money_quality,
         "cutAnchoredMq": cut_anchored_mq,
+        "perpBasis": perp_basis_computed,
+        "optionsSkew": options_skew_computed,
+        "optionsExpiries": options_expiries_computed,
         "cexNetflows": process_dune_netflows(
             dune_cex_raw if isinstance(dune_cex_raw, dict) else None,
             current_price,
