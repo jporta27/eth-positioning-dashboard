@@ -597,9 +597,14 @@ def compute_cut_anchored_mq(
         return out
 
     def lookup_oi_pair(oi_series: list, minutes_back: int, granularity_min: int):
+        """Return (anchor_oi, current_oi). None,None when anchor is within the
+        current OI bar — otherwise the caller would compare a bar against itself
+        and get a fake "OI plano" / Long Capitulation upgrade signal."""
         if not oi_series or len(oi_series) < 2:
             return None, None
         steps_back = max(0, round(minutes_back / granularity_min))
+        if steps_back == 0:
+            return None, None
         now_idx = len(oi_series) - 1
         past_idx = now_idx - steps_back
         if past_idx < 0:
@@ -1606,11 +1611,24 @@ def process_dune_netflows(
     # Exclude the most recent 24h window from the comparison distribution.
     hist_distribution = rolling_24h_list[:-1] if len(rolling_24h_list) > 1 else rolling_24h_list
 
-    mean_24h = statistics.fmean(hist_distribution) if hist_distribution else 0.0
-    stdev_24h = statistics.stdev(hist_distribution) if len(hist_distribution) > 1 else 0.0
-    z_score = (net_24h_eth - mean_24h) / stdev_24h if stdev_24h > 0 else 0.0
+    # Z-score / magnitude reliability gates (see main.py for full rationale):
+    #   - MIN_DIST_SAMPLES: with <24 rolling 24h windows the stdev is noise.
+    #   - MIN_STDEV_ETH: floor the denominator so a flat regime doesn't blow up |z|.
+    MIN_DIST_SAMPLES = 24
+    MIN_STDEV_ETH = 500.0
+    if len(hist_distribution) >= MIN_DIST_SAMPLES:
+        mean_24h = statistics.fmean(hist_distribution)
+        stdev_24h = statistics.stdev(hist_distribution)
+        z_denom = max(stdev_24h, MIN_STDEV_ETH)
+        z_score = (net_24h_eth - mean_24h) / z_denom
+        z_score_reliable = True
+    else:
+        mean_24h = statistics.fmean(hist_distribution) if hist_distribution else 0.0
+        stdev_24h = statistics.stdev(hist_distribution) if len(hist_distribution) > 1 else 0.0
+        z_score = 0.0
+        z_score_reliable = False
 
-    if hist_distribution:
+    if len(hist_distribution) >= MIN_DIST_SAMPLES:
         rank = sum(1 for v in hist_distribution if v <= net_24h_eth)
         percentile = rank / len(hist_distribution) * 100.0
     else:
@@ -1621,7 +1639,9 @@ def process_dune_netflows(
         flow_vol_ratio_pct = abs(net_24h_usd) / spot_volume_usd_24h * 100.0
 
     abs_z = abs(z_score)
-    if abs_z >= 2.0:
+    if not z_score_reliable:
+        magnitude = "NOISE"
+    elif abs_z >= 2.0:
         magnitude = "EXTREME"
     elif abs_z >= 1.0:
         magnitude = "ELEVATED"
