@@ -13,3 +13,5 @@ data/
 .vercel
 
 .claude/settings.local.json
+
+backend/.env
