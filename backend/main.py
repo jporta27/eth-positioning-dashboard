@@ -139,6 +139,13 @@ ETHERSCAN_API_URL = "https://api.etherscan.io/v2/api"
 ETHERSCAN_CHAIN_ID = 1
 ETHERSCAN_BATCH_LIMIT = 20  # `balancemulti` supports up to 20 addrs/call
 
+# Hedge label thresholds — used in process_hyperliquid_whales to classify a
+# perp position by how much of its size is covered by physical spot ETH
+# (HL UETH + Ethereum L1 mainnet). Mirrored in api/index.py — keep both in sync.
+HEDGE_FULL_THRESHOLD = 0.8        # SHORT perp: ≥80% spot coverage → FULLY_HEDGED (neutral)
+HEDGE_PARTIAL_THRESHOLD = 0.3     # SHORT perp: 30-80% coverage    → PARTIAL_HEDGE
+DOUBLE_BULL_SPOT_FRACTION = 0.3   # LONG perp:  spot ≥30% of size  → DOUBLE_BULL concentration
+
 # ── New data sources (Fase 1) ─────────────────────────────────────────
 # Farside ETF flows (primary) → scrape HTML → SoSoValue (tertiary) → stale
 FARSIDE_CSV_URL  = "https://farside.co.uk/wp-content/uploads/ETH.csv"
@@ -3702,11 +3709,11 @@ def process_hyperliquid_whales(
                 hedge_label = None
                 if side == "SHORT" and size_eth > 0:
                     hedge_ratio = round(min(total_spot_eth / size_eth, 1.0), 3)
-                    if hedge_ratio >= 0.8: hedge_label = "FULLY_HEDGED"
-                    elif hedge_ratio >= 0.3: hedge_label = "PARTIAL_HEDGE"
+                    if hedge_ratio >= HEDGE_FULL_THRESHOLD: hedge_label = "FULLY_HEDGED"
+                    elif hedge_ratio >= HEDGE_PARTIAL_THRESHOLD: hedge_label = "PARTIAL_HEDGE"
                     else: hedge_label = "DIRECTIONAL_BET"
                 elif side == "LONG" and size_eth > 0:
-                    if total_spot_eth >= size_eth * 0.3:
+                    if total_spot_eth >= size_eth * DOUBLE_BULL_SPOT_FRACTION:
                         hedge_label = "DOUBLE_BULL"  # perp long + spot long = concentration
                     else:
                         hedge_label = "DIRECTIONAL_BET"

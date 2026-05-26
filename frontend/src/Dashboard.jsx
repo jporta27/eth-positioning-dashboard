@@ -2697,6 +2697,10 @@ function LongShortPanel({ longShort, signal }) {
 }
 
 // ── Hyperliquid Whales (on-chain positions, curated address list) ────
+// Below this threshold (ETH) we render mainnet balance as "~0 (dust)" — these
+// are operational gas amounts on HL trading wallets, not real custody.
+const DUST_ETH_THRESHOLD = 0.01
+
 function HyperliquidWhalesPanel({ hyperliquidWhales, spotPrice }) {
   const hl = hyperliquidWhales
   if (!hl) return <div style={{ ...S.mono, color: '#5a6a8a', fontSize: 11 }}>Sin datos de Hyperliquid</div>
@@ -2829,10 +2833,11 @@ function HyperliquidWhalesPanel({ hyperliquidWhales, spotPrice }) {
                     {p.spotUethEth > 0 ? `${p.spotUethEth.toLocaleString(undefined, { maximumFractionDigits: 2 })} (${fmtUsd(p.spotUethUsd)})` : '—'}
                   </td>
                   <td style={{ padding: '6px 8px', textAlign: 'right',
-                               color: p.mainnetEth > 0.01 ? '#c8d6e5' : '#3a4a6a' }}
+                               color: p.mainnetEth > DUST_ETH_THRESHOLD ? '#c8d6e5' : '#3a4a6a' }}
                       title="ETH balance on Ethereum mainnet (via Etherscan). Dust = operational gas. Real custody is usually a separate wallet you'd need to add to HYPERLIQUID_WHALE_ADDRESSES.">
-                    {p.mainnetEth > 0.01 ? `${p.mainnetEth.toLocaleString(undefined, { maximumFractionDigits: 2 })} (${fmtUsd(p.mainnetEthUsd)})` :
-                     p.mainnetEth > 0 ? `~0 (dust)` : '—'}
+                    {p.mainnetEth > DUST_ETH_THRESHOLD
+                      ? `${p.mainnetEth.toLocaleString(undefined, { maximumFractionDigits: 2 })} (${fmtUsd(p.mainnetEthUsd)})`
+                      : p.mainnetEth > 0 ? `~0 (dust)` : '—'}
                   </td>
                   <td style={{ padding: '6px 8px', textAlign: 'center' }}>
                     {p.hedgeLabel && (

@@ -2034,6 +2034,13 @@ ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
 ETHERSCAN_API_URL = "https://api.etherscan.io/v2/api"
 ETHERSCAN_CHAIN_ID = 1
 ETHERSCAN_BATCH_LIMIT = 20  # `balancemulti` supports up to 20 addrs/call
+
+# Hedge label thresholds — used in process_hyperliquid_whales to classify a
+# perp position by how much of its size is covered by physical spot ETH
+# (HL UETH + Ethereum L1 mainnet). Mirrored in backend/main.py — keep in sync.
+HEDGE_FULL_THRESHOLD = 0.8        # SHORT perp: ≥80% spot coverage → FULLY_HEDGED (neutral)
+HEDGE_PARTIAL_THRESHOLD = 0.3     # SHORT perp: 30-80% coverage    → PARTIAL_HEDGE
+DOUBLE_BULL_SPOT_FRACTION = 0.3   # LONG perp:  spot ≥30% of size  → DOUBLE_BULL concentration
 hl_whales_cache: dict = {}
 hl_whales_cache_ts: float = 0
 
@@ -2168,9 +2175,12 @@ def process_hyperliquid_whales(raw, eth_spot_price):
                 hedge_ratio = None; hedge_label = None
                 if side == "SHORT" and size_eth > 0:
                     hedge_ratio = round(min(total_spot_eth / size_eth, 1.0), 3)
-                    hedge_label = "FULLY_HEDGED" if hedge_ratio >= 0.8 else "PARTIAL_HEDGE" if hedge_ratio >= 0.3 else "DIRECTIONAL_BET"
+                    hedge_label = ("FULLY_HEDGED" if hedge_ratio >= HEDGE_FULL_THRESHOLD
+                                   else "PARTIAL_HEDGE" if hedge_ratio >= HEDGE_PARTIAL_THRESHOLD
+                                   else "DIRECTIONAL_BET")
                 elif side == "LONG" and size_eth > 0:
-                    hedge_label = "DOUBLE_BULL" if total_spot_eth >= size_eth * 0.3 else "DIRECTIONAL_BET"
+                    hedge_label = ("DOUBLE_BULL" if total_spot_eth >= size_eth * DOUBLE_BULL_SPOT_FRACTION
+                                   else "DIRECTIONAL_BET")
 
                 positions.append({
                     "address": addr, "addressShort": addr[:6] + "…" + addr[-4:],
