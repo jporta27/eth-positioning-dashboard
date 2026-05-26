@@ -2027,10 +2027,13 @@ HYPERLIQUID_WHALE_ADDRESSES = [
     (os.getenv("HYPERLIQUID_WHALE_ADDRESSES") or ",".join(HYPERLIQUID_DEFAULT_WHALES)).split(",")
     if a.strip().startswith("0x")
 ]
-# Etherscan — mainnet ETH balance per whale wallet. Lets hedge_ratio reflect
-# real spot holdings (most whales park ETH on L1 cold wallets, not on HL).
+# Etherscan — mainnet ETH balance per whale wallet. Lets the hedge_ratio calc
+# include mainnet spot ETH (where most whales actually hold), not just UETH HL.
+# Without this, a whale short on HL perps with 10k ETH on mainnet looks like a
+# pure directional bet (wrong), when really it's a partial hedge.
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
-# V2 unified multichain endpoint — V1 was deprecated. Requires chainid=1.
+# V2 unified multichain endpoint — V1 (api.etherscan.io/api) was deprecated.
+# Requires `chainid=1` (Ethereum mainnet) as a query param.
 ETHERSCAN_API_URL = "https://api.etherscan.io/v2/api"
 ETHERSCAN_CHAIN_ID = 1
 ETHERSCAN_BATCH_LIMIT = 20  # `balancemulti` supports up to 20 addrs/call
@@ -2046,7 +2049,18 @@ hl_whales_cache_ts: float = 0
 
 
 async def fetch_etherscan_eth_balances(client, addresses):
-    """Batch mainnet ETH balances. Free-tier safe (5 req/s, 20 addrs/batch)."""
+    """Fetch mainnet ETH balance for many addresses via Etherscan `balancemulti`.
+
+    Returns dict {address_lower: balance_eth_float}. Missing/failed addresses
+    are omitted (caller treats as 0).
+
+    Why batch: Etherscan free tier is 5 req/s. With 5–20 whales we'd otherwise
+    burn the per-second quota; `balancemulti` does up to 20 addrs in 1 call.
+
+    Why this matters: most whales hold their actual ETH on mainnet, not on HL.
+    The HL UETH balance we already track is usually 0 for these wallets. Without
+    mainnet, the hedge_ratio is wrong (always says DIRECTIONAL_BET).
+    """
     if not ETHERSCAN_API_KEY or not addresses:
         return {}
     out = {}
@@ -2077,11 +2091,17 @@ async def fetch_etherscan_eth_balances(client, addresses):
 
 
 async def fetch_hyperliquid_whales(client: httpx.AsyncClient) -> Optional[dict]:
-    """Poll HL perps + HL spot + mainnet ETH for each curated whale address.
+    """Poll clearinghouseState + spotClearinghouseState + mainnet ETH balance
+    for each curated whale address. Cached HYPERLIQUID_WHALES_CACHE_TTL.
 
-    Each bundle: {perp, spot, mainnetEth}. Mainnet is critical — most whales
-    hold spot ETH on L1, not on HL. Without it the hedge calc gives false
-    DIRECTIONAL_BET labels for what are actually hedged positions.
+    Each address bundle contains:
+      - perp:        HL perps state (positions, margin, leverage)
+      - spot:        HL spot state (UETH/USDC/HYPE balances on Hyperliquid)
+      - mainnetEth:  ETH balance on Ethereum L1 (via Etherscan)
+
+    The mainnet number is critical: most whales hold their spot ETH on mainnet
+    cold wallets, not on HL. Without it, hedge_ratio gives false negatives
+    (whales are flagged DIRECTIONAL_BET when they're actually hedged).
     """
     global hl_whales_cache, hl_whales_cache_ts
     now = time.time()
