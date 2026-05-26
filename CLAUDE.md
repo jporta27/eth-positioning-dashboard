@@ -80,8 +80,14 @@ When `|z| >= 1.0`, trust the z-sign (`z > 0` → BEARISH inflow regime). When `|
 
 ### Secrets
 - `backend/.env` is **gitignored** (was accidentally tracked historically — the legacy `DUNE_API_KEY` value is in git history of commit `9b8b119`)
-- Vercel needs the same env vars set in Project Settings → Environment Variables: `DUNE_API_KEY`, `DUNE_API_KEY_FALLBACK`, `DUNE_QUERY_ID`
+- Vercel needs the same env vars set in Project Settings → Environment Variables: `DUNE_API_KEY`, `DUNE_API_KEY_FALLBACK`, `DUNE_QUERY_ID`, `ETHERSCAN_API_KEY`, `HYPERLIQUID_WHALE_ADDRESSES` (optional)
 - Never `git add -A` near `backend/.env` — use specific paths
+
+### Etherscan (mainnet ETH balance for HL whales)
+- Free tier: 5 req/s, 100k req/day — plenty for ≤20 whales every 5 min
+- **Must use V2 API**: `https://api.etherscan.io/v2/api?chainid=1&...` — V1 (`/api?...`) returns "deprecated V1 endpoint" status=0
+- `balancemulti` action returns up to 20 balances in one call
+- Used by `fetch_etherscan_eth_balances` to enrich the HL whales bundle with `mainnetEth` — feeds `hedge_ratio` calc together with HL UETH so a SHORT perp + spot ETH on L1 is correctly labelled `FULLY_HEDGED` instead of `DIRECTIONAL_BET`
 
 ### Known bugs (from audit, not yet fixed)
 - `process_dune_netflows` builds the 24h rolling distribution from `hourly_series` (which still includes the partial bucket) → z-score / percentile / magnitude are computed against a contaminated denominator. The "exclude partial" path only drops aggregates, not the comparator.

@@ -2027,12 +2027,55 @@ HYPERLIQUID_WHALE_ADDRESSES = [
     (os.getenv("HYPERLIQUID_WHALE_ADDRESSES") or ",".join(HYPERLIQUID_DEFAULT_WHALES)).split(",")
     if a.strip().startswith("0x")
 ]
+# Etherscan — mainnet ETH balance per whale wallet. Lets hedge_ratio reflect
+# real spot holdings (most whales park ETH on L1 cold wallets, not on HL).
+ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
+# V2 unified multichain endpoint — V1 was deprecated. Requires chainid=1.
+ETHERSCAN_API_URL = "https://api.etherscan.io/v2/api"
+ETHERSCAN_CHAIN_ID = 1
+ETHERSCAN_BATCH_LIMIT = 20  # `balancemulti` supports up to 20 addrs/call
 hl_whales_cache: dict = {}
 hl_whales_cache_ts: float = 0
 
 
+async def fetch_etherscan_eth_balances(client, addresses):
+    """Batch mainnet ETH balances. Free-tier safe (5 req/s, 20 addrs/batch)."""
+    if not ETHERSCAN_API_KEY or not addresses:
+        return {}
+    out = {}
+    for i in range(0, len(addresses), ETHERSCAN_BATCH_LIMIT):
+        chunk = addresses[i:i + ETHERSCAN_BATCH_LIMIT]
+        try:
+            r = await client.get(ETHERSCAN_API_URL, params={
+                "chainid": ETHERSCAN_CHAIN_ID,
+                "module": "account", "action": "balancemulti",
+                "address": ",".join(chunk), "tag": "latest",
+                "apikey": ETHERSCAN_API_KEY,
+            }, timeout=8.0)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("status") != "1":
+                continue
+            for row in data.get("result") or []:
+                try:
+                    addr = (row.get("account") or "").lower()
+                    bal_wei = int(row.get("balance") or 0)
+                    if addr:
+                        out[addr] = bal_wei / 1e18
+                except (ValueError, TypeError):
+                    continue
+        except Exception:
+            continue
+    return out
+
+
 async def fetch_hyperliquid_whales(client: httpx.AsyncClient) -> Optional[dict]:
-    """Poll clearinghouseState for each curated HL whale address in parallel."""
+    """Poll HL perps + HL spot + mainnet ETH for each curated whale address.
+
+    Each bundle: {perp, spot, mainnetEth}. Mainnet is critical — most whales
+    hold spot ETH on L1, not on HL. Without it the hedge calc gives false
+    DIRECTIONAL_BET labels for what are actually hedged positions.
+    """
     global hl_whales_cache, hl_whales_cache_ts
     now = time.time()
     if hl_whales_cache and (now - hl_whales_cache_ts) < HYPERLIQUID_WHALES_CACHE_TTL:
@@ -2040,8 +2083,7 @@ async def fetch_hyperliquid_whales(client: httpx.AsyncClient) -> Optional[dict]:
     if not HYPERLIQUID_WHALE_ADDRESSES:
         return None
 
-    async def _fetch_one(addr):
-        """Fetch perp + spot clearinghouseState in parallel for one address."""
+    async def _fetch_hl(addr):
         async def _one(req_type):
             try:
                 r = await client.post(f"{HYPERLIQUID_API}/info",
@@ -2052,16 +2094,19 @@ async def fetch_hyperliquid_whales(client: httpx.AsyncClient) -> Optional[dict]:
                 return None
         p, s = await asyncio.gather(_one("clearinghouseState"), _one("spotClearinghouseState"),
                                     return_exceptions=True)
-        return addr, {"perp": p if isinstance(p, dict) else None,
-                      "spot": s if isinstance(s, dict) else None}
+        return addr, p if isinstance(p, dict) else None, s if isinstance(s, dict) else None
 
-    results = await asyncio.gather(*[_fetch_one(a) for a in HYPERLIQUID_WHALE_ADDRESSES], return_exceptions=True)
+    hl_task = asyncio.gather(*[_fetch_hl(a) for a in HYPERLIQUID_WHALE_ADDRESSES], return_exceptions=True)
+    mainnet_task = fetch_etherscan_eth_balances(client, HYPERLIQUID_WHALE_ADDRESSES)
+    hl_results, mainnet_balances = await asyncio.gather(hl_task, mainnet_task)
+
     out = {}
-    for r in results:
-        if isinstance(r, tuple):
-            a, bundle = r
-            if isinstance(bundle, dict) and (bundle.get("perp") or bundle.get("spot")):
-                out[a] = bundle
+    for r in hl_results:
+        if isinstance(r, tuple) and len(r) == 3:
+            addr, perp, spot = r
+            if perp or spot:
+                out[addr] = {"perp": perp, "spot": spot,
+                             "mainnetEth": mainnet_balances.get(addr, 0.0)}
     if out:
         hl_whales_cache = out
         hl_whales_cache_ts = now
@@ -2086,10 +2131,13 @@ def process_hyperliquid_whales(raw, eth_spot_price):
         return out
 
     spot_by_addr = {}
+    mainnet_by_addr = {}
     for addr, bundle in raw.items():
         if not isinstance(bundle, dict): continue
         spot_state = bundle.get("spot") if "perp" in bundle or "spot" in bundle else None
         spot_by_addr[addr] = _parse_spot(spot_state)
+        # Mainnet L1 ETH balance — see fetch_etherscan_eth_balances rationale.
+        mainnet_by_addr[addr] = float(bundle.get("mainnetEth") or 0)
 
     positions = []
     for addr, bundle in raw.items():
@@ -2114,12 +2162,15 @@ def process_hyperliquid_whales(raw, eth_spot_price):
 
                 spot_bal = spot_by_addr.get(addr, {"ueth": 0.0, "usdc": 0.0, "hype": 0.0})
                 ueth_spot = spot_bal["ueth"]; usdc_spot = spot_bal["usdc"]
+                mainnet_eth = mainnet_by_addr.get(addr, 0.0)
+                # Total spot = HL UETH + L1 mainnet. Both are real ETH custody.
+                total_spot_eth = ueth_spot + mainnet_eth
                 hedge_ratio = None; hedge_label = None
                 if side == "SHORT" and size_eth > 0:
-                    hedge_ratio = round(min(ueth_spot / size_eth, 1.0), 3)
+                    hedge_ratio = round(min(total_spot_eth / size_eth, 1.0), 3)
                     hedge_label = "FULLY_HEDGED" if hedge_ratio >= 0.8 else "PARTIAL_HEDGE" if hedge_ratio >= 0.3 else "DIRECTIONAL_BET"
                 elif side == "LONG" and size_eth > 0:
-                    hedge_label = "DOUBLE_BULL" if ueth_spot >= size_eth * 0.3 else "DIRECTIONAL_BET"
+                    hedge_label = "DOUBLE_BULL" if total_spot_eth >= size_eth * 0.3 else "DIRECTIONAL_BET"
 
                 positions.append({
                     "address": addr, "addressShort": addr[:6] + "…" + addr[-4:],
@@ -2131,6 +2182,10 @@ def process_hyperliquid_whales(raw, eth_spot_price):
                     "spotUethEth": round(ueth_spot, 4),
                     "spotUethUsd": round(ueth_spot * spot) if spot else None,
                     "spotUsdc": round(usdc_spot),
+                    "mainnetEth": round(mainnet_eth, 4),
+                    "mainnetEthUsd": round(mainnet_eth * spot) if spot else None,
+                    "totalSpotEth": round(total_spot_eth, 4),
+                    "totalSpotUsd": round(total_spot_eth * spot) if spot else None,
                     "hedgeRatio": hedge_ratio, "hedgeLabel": hedge_label,
                 })
             except (ValueError, TypeError, KeyError):

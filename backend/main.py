@@ -128,6 +128,17 @@ HYPERLIQUID_WHALE_ADDRESSES = [
     if a.strip().startswith("0x")
 ]
 
+# Etherscan — mainnet ETH balance per whale wallet. Lets the hedge_ratio calc
+# include mainnet spot ETH (where most whales actually hold), not just UETH HL.
+# Without this, a whale short on HL perps with 10k ETH on mainnet looks like a
+# pure directional bet (wrong), when really it's a partial hedge.
+ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
+# V2 unified multichain endpoint — V1 (api.etherscan.io/api) was deprecated.
+# Requires `chainid=1` (Ethereum mainnet) as a query param.
+ETHERSCAN_API_URL = "https://api.etherscan.io/v2/api"
+ETHERSCAN_CHAIN_ID = 1
+ETHERSCAN_BATCH_LIMIT = 20  # `balancemulti` supports up to 20 addrs/call
+
 # ── New data sources (Fase 1) ─────────────────────────────────────────
 # Farside ETF flows (primary) → scrape HTML → SoSoValue (tertiary) → stale
 FARSIDE_CSV_URL  = "https://farside.co.uk/wp-content/uploads/ETH.csv"
@@ -3478,20 +3489,74 @@ def compute_whale_vs_retail(
 
 
 # ── Hyperliquid whale tracker ─────────────────────────────────────────
+async def fetch_etherscan_eth_balances(
+    client: httpx.AsyncClient,
+    addresses: list,
+) -> dict:
+    """Fetch mainnet ETH balance for many addresses via Etherscan `balancemulti`.
+
+    Returns dict {address_lower: balance_eth_float}. Missing/failed addresses
+    are omitted (caller treats as 0).
+
+    Why batch: Etherscan free tier is 5 req/s. With 5–20 whales we'd otherwise
+    burn the per-second quota; `balancemulti` does up to 20 addrs in 1 call.
+
+    Why this matters: most whales hold their actual ETH on mainnet, not on HL.
+    The HL UETH balance we already track is usually 0 for these wallets. Without
+    mainnet, the hedge_ratio is wrong (always says DIRECTIONAL_BET).
+    """
+    if not ETHERSCAN_API_KEY or not addresses:
+        return {}
+    out: dict = {}
+    # Batches of 20 addresses per request
+    for i in range(0, len(addresses), ETHERSCAN_BATCH_LIMIT):
+        chunk = addresses[i:i + ETHERSCAN_BATCH_LIMIT]
+        try:
+            r = await client.get(
+                ETHERSCAN_API_URL,
+                params={
+                    "chainid": ETHERSCAN_CHAIN_ID,
+                    "module": "account",
+                    "action": "balancemulti",
+                    "address": ",".join(chunk),
+                    "tag": "latest",
+                    "apikey": ETHERSCAN_API_KEY,
+                },
+                timeout=10.0,
+            )
+            r.raise_for_status()
+            data = r.json()
+            if data.get("status") != "1":
+                logger.warning(f"Etherscan balancemulti returned status={data.get('status')}: {data.get('message')}")
+                continue
+            for row in data.get("result") or []:
+                try:
+                    addr = (row.get("account") or "").lower()
+                    bal_wei = int(row.get("balance") or 0)
+                    if addr:
+                        out[addr] = bal_wei / 1e18
+                except (ValueError, TypeError):
+                    continue
+        except Exception as e:
+            logger.warning(f"Etherscan balancemulti fetch failed: {e}")
+    return out
+
+
 async def fetch_hyperliquid_whales(
     client: httpx.AsyncClient,
     addresses: Optional[list] = None,
 ) -> Optional[dict]:
-    """Poll clearinghouseState for each curated whale address in parallel.
+    """Poll clearinghouseState + spotClearinghouseState + mainnet ETH balance
+    for each curated whale address. Cached HYPERLIQUID_WHALES_CACHE_TTL.
 
-    Strategy:
-      1. Cache layer (HYPERLIQUID_WHALES_CACHE_TTL) — whale positions don't move
-         that fast and individual address fetches add up.
-      2. Fan-out async POST /info per address, return_exceptions=True.
-      3. Caller (process_hyperliquid_whales) filters to ETH positions + aggregates.
+    Each address bundle contains:
+      - perp:        HL perps state (positions, margin, leverage)
+      - spot:        HL spot state (UETH/USDC/HYPE balances on Hyperliquid)
+      - mainnetEth:  ETH balance on Ethereum L1 (via Etherscan)
 
-    Returns a dict {address: clearinghouseState} for successful fetches; failed
-    ones are dropped silently.
+    The mainnet number is critical: most whales hold their spot ETH on mainnet
+    cold wallets, not on HL. Without it, hedge_ratio gives false negatives
+    (whales are flagged DIRECTIONAL_BET when they're actually hedged).
     """
     global hl_whales_cache, hl_whales_cache_ts
     now = time.time()
@@ -3502,7 +3567,7 @@ async def fetch_hyperliquid_whales(
     if not addrs:
         return None
 
-    async def _fetch_one(addr: str):
+    async def _fetch_hl(addr: str):
         """Fetch BOTH perp clearinghouseState AND spotClearinghouseState in parallel
         for a single address. Spot lets us see if the perp short is hedged by
         physical ETH (UETH wrapped) the wallet holds — totally different read."""
@@ -3523,22 +3588,29 @@ async def fetch_hyperliquid_whales(
             _one("spotClearinghouseState"),
             return_exceptions=True,
         )
-        return addr, {
-            "perp": perp_state if isinstance(perp_state, dict) else None,
-            "spot": spot_state if isinstance(spot_state, dict) else None,
-        }
+        return addr, perp_state if isinstance(perp_state, dict) else None, spot_state if isinstance(spot_state, dict) else None
 
-    results = await asyncio.gather(*[_fetch_one(a) for a in addrs], return_exceptions=True)
+    # Run HL fetches and Etherscan mainnet balances in parallel — Etherscan is
+    # rate-limited (5 req/s free tier) so we batch via balancemulti.
+    hl_task = asyncio.gather(*[_fetch_hl(a) for a in addrs], return_exceptions=True)
+    mainnet_task = fetch_etherscan_eth_balances(client, addrs)
+    hl_results, mainnet_balances = await asyncio.gather(hl_task, mainnet_task)
+
     out = {}
-    for r in results:
-        if isinstance(r, tuple):
-            addr, bundle = r
-            if isinstance(bundle, dict) and (bundle.get("perp") or bundle.get("spot")):
-                out[addr] = bundle
+    for r in hl_results:
+        if isinstance(r, tuple) and len(r) == 3:
+            addr, perp, spot = r
+            if perp or spot:
+                out[addr] = {
+                    "perp": perp,
+                    "spot": spot,
+                    "mainnetEth": mainnet_balances.get(addr, 0.0),
+                }
     if out:
         hl_whales_cache = out
         hl_whales_cache_ts = now
-        logger.info(f"HL whales fetched: {len(out)}/{len(addrs)} addresses (perp+spot)")
+        n_mainnet = sum(1 for v in out.values() if v.get("mainnetEth"))
+        logger.info(f"HL whales fetched: {len(out)}/{len(addrs)} (perp+spot) + {n_mainnet}/{len(addrs)} mainnet ETH")
     return out or None
 
 
@@ -3577,11 +3649,16 @@ def process_hyperliquid_whales(
 
     # Pre-compute spot balances per address so each ETH position knows its spot context
     spot_by_addr = {}
+    mainnet_by_addr = {}
     for addr, bundle in raw.items():
         if not isinstance(bundle, dict): continue
         # Backward-compat: if bundle is the old flat clearinghouseState shape, treat as perp-only
         spot_state = bundle.get("spot") if "perp" in bundle or "spot" in bundle else None
         spot_by_addr[addr] = _parse_spot_balances(spot_state)
+        # mainnetEth is the Ethereum L1 balance fetched from Etherscan. This is
+        # where most whales actually hold spot — the HL UETH is usually 0 for
+        # serious wallets, so without mainnet the hedge calc lies.
+        mainnet_by_addr[addr] = float(bundle.get("mainnetEth") or 0)
 
     positions = []
     for addr, bundle in raw.items():
@@ -3611,21 +3688,25 @@ def process_hyperliquid_whales(
                     dist_to_liq_pct = round((liq_px - spot) / spot * 100, 2)
 
                 # Spot context: is the perp position hedged by physical ETH on spot?
-                # hedge_ratio: % of perp size covered by UETH spot held by same wallet
-                # Only meaningful for SHORT perp (long ETH spot offsets short perp); LONG
-                # perp + UETH spot = double bullish (concentration, not hedge)
+                # Total spot ETH = UETH on HL + mainnet ETH on L1. Mainnet usually
+                # dominates because most whales park their actual ETH there.
+                # hedge_ratio: % of perp size covered by total spot held by same wallet.
+                # Only meaningful for SHORT perp (long ETH spot offsets short perp);
+                # LONG perp + spot ETH = double bullish (concentration, not hedge).
                 spot_bal = spot_by_addr.get(addr, {"ueth": 0.0, "usdc": 0.0, "hype": 0.0})
                 ueth_spot = spot_bal["ueth"]
                 usdc_spot = spot_bal["usdc"]
+                mainnet_eth = mainnet_by_addr.get(addr, 0.0)
+                total_spot_eth = ueth_spot + mainnet_eth  # UETH HL + mainnet L1
                 hedge_ratio = None
                 hedge_label = None
                 if side == "SHORT" and size_eth > 0:
-                    hedge_ratio = round(min(ueth_spot / size_eth, 1.0), 3)
+                    hedge_ratio = round(min(total_spot_eth / size_eth, 1.0), 3)
                     if hedge_ratio >= 0.8: hedge_label = "FULLY_HEDGED"
                     elif hedge_ratio >= 0.3: hedge_label = "PARTIAL_HEDGE"
                     else: hedge_label = "DIRECTIONAL_BET"
                 elif side == "LONG" and size_eth > 0:
-                    if ueth_spot >= size_eth * 0.3:
+                    if total_spot_eth >= size_eth * 0.3:
                         hedge_label = "DOUBLE_BULL"  # perp long + spot long = concentration
                     else:
                         hedge_label = "DIRECTIONAL_BET"
@@ -3642,10 +3723,14 @@ def process_hyperliquid_whales(
                     "marginType": margin_type,
                     "unrealizedPnlUsd": round(unrealized_pnl),
                     "distToLiqPct": dist_to_liq_pct,
-                    # Spot context (HL spot only — mainnet balance is a future addition)
+                    # Spot context: HL UETH + L1 mainnet ETH, plus the combined hedge picture
                     "spotUethEth": round(ueth_spot, 4),
                     "spotUethUsd": round(ueth_spot * spot) if spot else None,
                     "spotUsdc": round(usdc_spot),
+                    "mainnetEth": round(mainnet_eth, 4),
+                    "mainnetEthUsd": round(mainnet_eth * spot) if spot else None,
+                    "totalSpotEth": round(total_spot_eth, 4),
+                    "totalSpotUsd": round(total_spot_eth * spot) if spot else None,
                     "hedgeRatio": hedge_ratio,
                     "hedgeLabel": hedge_label,
                 })

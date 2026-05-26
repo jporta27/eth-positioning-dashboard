@@ -2788,7 +2788,8 @@ function HyperliquidWhalesPanel({ hyperliquidWhales, spotPrice }) {
                 <th style={{ padding: '6px 8px', textAlign: 'right', borderBottom: '1px solid #1a2544' }}>LIQ $</th>
                 <th style={{ padding: '6px 8px', textAlign: 'right', borderBottom: '1px solid #1a2544' }}>DIST LIQ</th>
                 <th style={{ padding: '6px 8px', textAlign: 'right', borderBottom: '1px solid #1a2544' }}>uPnL</th>
-                <th style={{ padding: '6px 8px', textAlign: 'right', borderBottom: '1px solid #1a2544' }}>SPOT UETH</th>
+                <th style={{ padding: '6px 8px', textAlign: 'right', borderBottom: '1px solid #1a2544' }} title="HL spot (UETH wrapped) on Hyperliquid chain">SPOT HL</th>
+                <th style={{ padding: '6px 8px', textAlign: 'right', borderBottom: '1px solid #1a2544' }} title="Ethereum L1 mainnet ETH balance">MAINNET L1</th>
                 <th style={{ padding: '6px 8px', textAlign: 'center', borderBottom: '1px solid #1a2544' }}>EXPOSURE</th>
               </tr>
             </thead>
@@ -2826,6 +2827,12 @@ function HyperliquidWhalesPanel({ hyperliquidWhales, spotPrice }) {
                   <td style={{ padding: '6px 8px', textAlign: 'right',
                                color: p.spotUethEth > 0 ? '#c8d6e5' : '#3a4a6a' }}>
                     {p.spotUethEth > 0 ? `${p.spotUethEth.toLocaleString(undefined, { maximumFractionDigits: 2 })} (${fmtUsd(p.spotUethUsd)})` : '—'}
+                  </td>
+                  <td style={{ padding: '6px 8px', textAlign: 'right',
+                               color: p.mainnetEth > 0.01 ? '#c8d6e5' : '#3a4a6a' }}
+                      title="ETH balance on Ethereum mainnet (via Etherscan). Dust = operational gas. Real custody is usually a separate wallet you'd need to add to HYPERLIQUID_WHALE_ADDRESSES.">
+                    {p.mainnetEth > 0.01 ? `${p.mainnetEth.toLocaleString(undefined, { maximumFractionDigits: 2 })} (${fmtUsd(p.mainnetEthUsd)})` :
+                     p.mainnetEth > 0 ? `~0 (dust)` : '—'}
                   </td>
                   <td style={{ padding: '6px 8px', textAlign: 'center' }}>
                     {p.hedgeLabel && (
