@@ -2696,6 +2696,286 @@ function LongShortPanel({ longShort, signal }) {
   )
 }
 
+// ── Whale vs Retail Deep Dive ─────────────────────────────────────────
+// Multi-exchange L/S aggregate (Binance global + OKX + Bybit) vs Binance Top
+// Traders (whales). Surfaces deltas + divergence + cross-signal confluence.
+function WhaleVsRetailDeep({ whaleVsRetail }) {
+  const [period, setPeriod] = useState('1h')
+  const periods = ['5m', '15m', '1h', '4h', '1d']
+  if (!whaleVsRetail) return <div style={{ ...S.mono, color: '#5a6a8a', fontSize: 11 }}>Sin datos de whale/retail</div>
+
+  const wvr = whaleVsRetail
+  const exch = wvr.exchanges?.[period] || {}
+  const agg  = wvr.aggregate?.[period]
+  const dts  = wvr.deltas?.[period] || {}
+  const div  = wvr.divergence || {}
+  const co   = wvr.confluence || {}
+  const divSeries = wvr.divergenceSeries1h || []
+
+  const fmt3 = (n) => n != null ? n.toFixed(3) : '—'
+  const fmtPct = (n) => n != null ? (n * 100).toFixed(1) + '%' : '—'
+  const fmtDelta = (n) => {
+    if (n == null) return '—'
+    const sign = n > 0 ? '+' : ''
+    return `${sign}${(n * 100).toFixed(2)}%`
+  }
+  const deltaColor = (n) => n == null ? '#5a6a8a' : n > 0.02 ? '#22c55e' : n > 0 ? '#86efac' : n < -0.02 ? '#ef4444' : '#fca5a5'
+
+  // Whale vs retail gap
+  const whaleLp = exch.binance_whale?.longPct
+  const aggLp = agg?.longPct
+  const gap = (whaleLp != null && aggLp != null) ? aggLp - whaleLp : null
+
+  // Whale series for sparkline (longPct over time)
+  const whaleSeries = exch.binance_whale?.history || []
+
+  // Confluence color
+  const readingColor = {
+    'CONFIRMED_BULL': '#22c55e',
+    'CONFIRMED_BEAR': '#ef4444',
+    'DIVERGENT_WHALE_WRONG_SIDE': '#f59e0b',
+    'OVERHEATED_LONG': '#fb923c',
+    'OVERHEATED_SHORT': '#fb923c',
+    'WHALES_UNDECIDED': '#8a9ac0',
+    'MIXED': '#8a9ac0',
+  }[co.reading] || '#8a9ac0'
+
+  return (
+    <div>
+      {/* Period selector */}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 12, flexWrap: 'wrap' }}>
+        {periods.map(p => (
+          <button key={p} onClick={() => setPeriod(p)} style={{
+            padding: '3px 10px', borderRadius: 5,
+            border: `1px solid ${period === p ? '#a78bfa' : '#1a2544'}`,
+            background: period === p ? '#1a1040' : 'transparent',
+            color: period === p ? '#a78bfa' : '#4a5980',
+            cursor: 'pointer', fontSize: 10, fontFamily: "'IBM Plex Mono', monospace",
+            fontWeight: period === p ? 700 : 400,
+          }}>{p}</button>
+        ))}
+      </div>
+
+      {/* Per-exchange grid */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 12 }}>
+        {[
+          { key: 'binance_retail', label: 'Binance retail', tag: 'global L/S' },
+          { key: 'okx_retail',     label: 'OKX retail',     tag: 'account ratio' },
+          { key: 'bybit_retail',   label: 'Bybit retail',   tag: 'account ratio' },
+          { key: 'binance_whale',  label: 'Binance whales', tag: 'top 20% por size' },
+        ].map(({ key, label, tag }) => {
+          const b = exch[key] || {}
+          const lp = b.longPct
+          const isWhale = key === 'binance_whale'
+          return (
+            <div key={key} style={{
+              padding: '8px 10px', borderRadius: 6,
+              border: `1px solid ${isWhale ? '#a78bfa' : '#1a2544'}`,
+              background: isWhale ? '#0f0820' : '#0a1020',
+            }}>
+              <div style={{ fontSize: 9, color: isWhale ? '#a78bfa' : '#5a6a8a', letterSpacing: 1, marginBottom: 2 }}>{label}</div>
+              <div style={{ ...S.mono, fontSize: 16, fontWeight: 700, color: lp == null ? '#5a6a8a' : lp >= 0.5 ? '#22c55e' : '#ef4444' }}>
+                {fmtPct(lp)}
+              </div>
+              <div style={{ fontSize: 9, color: '#3a4a6a', marginTop: 2 }}>{tag}</div>
+            </div>
+          )
+        })}
+      </div>
+
+      {/* Aggregate + Whale headline + Gap */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8, marginBottom: 12 }}>
+        <div style={{ padding: '10px 12px', borderRadius: 6, background: '#0a1020', border: '1px solid #1a2544' }}>
+          <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1 }}>RETAIL AGREGADO</div>
+          <div style={{ ...S.mono, fontSize: 22, fontWeight: 700, color: '#c8d6e5' }}>{fmtPct(aggLp)}</div>
+          <div style={{ fontSize: 9, color: '#5a6a8a' }}>longs · n={agg?.exchangeCount || 0} exchanges</div>
+        </div>
+        <div style={{ padding: '10px 12px', borderRadius: 6, background: '#0f0820', border: '1px solid #a78bfa' }}>
+          <div style={{ fontSize: 9, color: '#a78bfa', letterSpacing: 1 }}>WHALES (BINANCE TOP)</div>
+          <div style={{ ...S.mono, fontSize: 22, fontWeight: 700, color: '#c8d6e5' }}>{fmtPct(whaleLp)}</div>
+          <div style={{ fontSize: 9, color: '#5a6a8a' }}>longs · top 20% por posición</div>
+        </div>
+        <div style={{ padding: '10px 12px', borderRadius: 6, background: '#0a1020',
+                      border: `1px solid ${gap != null && Math.abs(gap) > 0.05 ? '#f59e0b' : '#1a2544'}` }}>
+          <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1 }}>GAP (RETAIL − WHALES)</div>
+          <div style={{ ...S.mono, fontSize: 22, fontWeight: 700,
+                        color: gap == null ? '#5a6a8a' : Math.abs(gap) > 0.05 ? '#f59e0b' : '#c8d6e5' }}>
+            {gap != null ? (gap > 0 ? '+' : '') + (gap * 100).toFixed(1) + '%' : '—'}
+          </div>
+          <div style={{ fontSize: 9, color: '#5a6a8a' }}>
+            {gap == null ? '—' : gap > 0.05 ? 'retail más bullish que whales' :
+             gap < -0.05 ? 'whales más bullish que retail' : 'alineados'}
+          </div>
+        </div>
+      </div>
+
+      {/* USD Exposure block — Binance only, Pareto estimated */}
+      {wvr.exposure && (() => {
+        const exp = wvr.exposure
+        const fmtUsd = (n) => {
+          if (n == null) return '—'
+          const sign = n < 0 ? '−' : ''
+          const v = Math.abs(n)
+          if (v >= 1e9) return `${sign}$${(v / 1e9).toFixed(2)}B`
+          if (v >= 1e6) return `${sign}$${(v / 1e6).toFixed(1)}M`
+          return `${sign}$${(v / 1e3).toFixed(0)}k`
+        }
+        const w = exp.whale || {}
+        const r = exp.retail || {}
+        return (
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6 }}>
+              <div style={{ fontSize: 10, color: '#5a6a8a', letterSpacing: 1 }}>EXPOSURE USD (estimado)</div>
+              <div style={{ fontSize: 9, color: '#f59e0b', fontStyle: 'italic' }}
+                   title={exp.paretoAssumption?.note || ''}>
+                ⚠ Pareto 75/25 — Binance no publica el split real de OI por cohorte
+              </div>
+            </div>
+
+            {/* OI per exchange tape */}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8,
+                          padding: '6px 10px', background: '#0a1020', borderRadius: 6,
+                          border: '1px solid #1a2544' }}>
+              <div style={{ fontSize: 9, color: '#5a6a8a', alignSelf: 'center', letterSpacing: 1 }}>OI ETH REAL ·</div>
+              {Object.entries(exp.oiByExchange || {}).map(([k, v]) => (
+                <div key={k} style={{ ...S.mono, fontSize: 11, color: '#c8d6e5' }}>
+                  <span style={{ color: '#5a6a8a' }}>{k}:</span> {fmtUsd(v)}
+                </div>
+              ))}
+              <div style={{ ...S.mono, fontSize: 11, color: '#a78bfa', marginLeft: 'auto' }}>
+                Σ {fmtUsd(exp.totalOiUsd)}
+              </div>
+            </div>
+
+            {/* Whale + Retail exposure cards side-by-side */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+              {[
+                { lbl: 'WHALES (Binance top 20% acc.)', data: w, color: '#a78bfa' },
+                { lbl: 'RETAIL (Binance bottom 80% acc.)', data: r, color: '#8a9ac0' },
+              ].map(({ lbl, data, color }) => (
+                <div key={lbl} style={{ padding: '10px 12px', borderRadius: 6,
+                                        background: '#0a1020', border: `1px solid ${color}` }}>
+                  <div style={{ fontSize: 9, color, letterSpacing: 1, marginBottom: 4 }}>{lbl}</div>
+                  <div style={{ fontSize: 9, color: '#5a6a8a', marginBottom: 8 }}>
+                    OI cohorte: <span style={{ ...S.mono, color: '#c8d6e5' }}>{fmtUsd(data.oiUsd)}</span>
+                    {data.longPct != null && <> · longPct <span style={{ ...S.mono, color: '#c8d6e5' }}>{(data.longPct * 100).toFixed(1)}%</span></>}
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
+                    <div>
+                      <div style={{ fontSize: 9, color: '#22c55e', letterSpacing: 1 }}>LONG $</div>
+                      <div style={{ ...S.mono, fontSize: 14, fontWeight: 700, color: '#22c55e' }}>{fmtUsd(data.longUsd)}</div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 9, color: '#ef4444', letterSpacing: 1 }}>SHORT $</div>
+                      <div style={{ ...S.mono, fontSize: 14, fontWeight: 700, color: '#ef4444' }}>{fmtUsd(data.shortUsd)}</div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1 }}>NET $</div>
+                      <div style={{ ...S.mono, fontSize: 14, fontWeight: 700,
+                                    color: data.netUsd == null ? '#5a6a8a' : data.netUsd > 0 ? '#22c55e' : '#ef4444' }}>
+                        {data.netUsd != null && data.netUsd > 0 ? '+' : ''}{fmtUsd(data.netUsd)}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )
+      })()}
+
+      {/* Deltas grid: retail vs whale, 1h/4h/24h */}
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 10, color: '#5a6a8a', letterSpacing: 1, marginBottom: 6 }}>VARIACIÓN longPct (período {period})</div>
+        <div style={{ display: 'grid', gridTemplateColumns: '120px repeat(3, 1fr)', gap: 6, alignItems: 'center' }}>
+          <div style={{ fontSize: 10, color: '#5a6a8a' }}></div>
+          <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1 }}>Δ 1H</div>
+          <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1 }}>Δ 4H</div>
+          <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1 }}>Δ 24H</div>
+
+          <div style={{ fontSize: 11, color: '#c8d6e5' }}>Retail aggr.</div>
+          <div style={{ ...S.mono, fontSize: 14, fontWeight: 700, color: deltaColor(dts.retail?.delta1h) }}>{fmtDelta(dts.retail?.delta1h)}</div>
+          <div style={{ ...S.mono, fontSize: 14, fontWeight: 700, color: deltaColor(dts.retail?.delta4h) }}>{fmtDelta(dts.retail?.delta4h)}</div>
+          <div style={{ ...S.mono, fontSize: 14, fontWeight: 700, color: deltaColor(dts.retail?.delta24h) }}>{fmtDelta(dts.retail?.delta24h)}</div>
+
+          <div style={{ fontSize: 11, color: '#a78bfa' }}>Whales</div>
+          <div style={{ ...S.mono, fontSize: 14, fontWeight: 700, color: deltaColor(dts.whale?.delta1h) }}>{fmtDelta(dts.whale?.delta1h)}</div>
+          <div style={{ ...S.mono, fontSize: 14, fontWeight: 700, color: deltaColor(dts.whale?.delta4h) }}>{fmtDelta(dts.whale?.delta4h)}</div>
+          <div style={{ ...S.mono, fontSize: 14, fontWeight: 700, color: deltaColor(dts.whale?.delta24h) }}>{fmtDelta(dts.whale?.delta24h)}</div>
+        </div>
+        <div style={{ fontSize: 9, color: '#3a4a6a', marginTop: 6 }}>
+          + = shift hacia long (más cuentas long) · − = shift hacia short · verde/rojo si |Δ| &gt; 2pp
+        </div>
+      </div>
+
+      {/* Sparklines side-by-side */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+        <div>
+          <div style={S.label}>Whales longPct (historial {period})</div>
+          <div style={{ marginTop: 4 }}>
+            <Spark data={whaleSeries} color="#a78bfa" valueKey="longPct" />
+          </div>
+        </div>
+        <div>
+          <div style={S.label}>Divergencia retail − whales (1h, últimas {divSeries.length}h)</div>
+          <div style={{ marginTop: 4 }}>
+            <Spark data={divSeries} color="#f59e0b" valueKey="value" />
+          </div>
+        </div>
+      </div>
+
+      {/* Divergence z-score box */}
+      <div style={{ padding: '10px 12px', borderRadius: 6, background: '#0a1020', border: '1px solid #1a2544', marginBottom: 12 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+          <div style={{ fontSize: 10, color: '#5a6a8a', letterSpacing: 1 }}>DIVERGENCIA HISTÓRICA (1h vs últimas 7d)</div>
+          <div style={{ fontSize: 9, color: '#3a4a6a' }}>n={div.samplesN || 0}</div>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginTop: 6 }}>
+          <div>
+            <div style={S.label}>Gap actual</div>
+            <div style={{ ...S.mono, fontSize: 18, fontWeight: 700 }}>{div.current != null ? (div.current > 0 ? '+' : '') + (div.current * 100).toFixed(1) + '%' : '—'}</div>
+          </div>
+          <div>
+            <div style={S.label}>Z-score</div>
+            <div style={{ ...S.mono, fontSize: 18, fontWeight: 700, color: div.zScore == null ? '#5a6a8a' : Math.abs(div.zScore) >= 2 ? '#ef4444' : Math.abs(div.zScore) >= 1 ? '#f59e0b' : '#c8d6e5' }}>
+              {div.zScore != null ? (div.zScore > 0 ? '+' : '') + div.zScore.toFixed(2) + 'σ' : '—'}
+            </div>
+          </div>
+          <div>
+            <div style={S.label}>Percentil</div>
+            <div style={{ ...S.mono, fontSize: 18, fontWeight: 700, color: div.percentile == null ? '#5a6a8a' : div.percentile >= 90 || div.percentile <= 10 ? '#f59e0b' : '#c8d6e5' }}>
+              {div.percentile != null ? div.percentile.toFixed(0) + '%' : '—'}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Confluence narrative */}
+      <div style={{ padding: '10px 12px', borderRadius: 6, background: '#0a1020', border: `1px solid ${readingColor}` }}>
+        <div style={{ display: 'flex', gap: 16, alignItems: 'baseline', flexWrap: 'wrap' }}>
+          <div>
+            <div style={S.label}>Whales</div>
+            <div style={{ ...S.mono, fontSize: 12, fontWeight: 700, color: co.whaleDirection === 'LONG' ? '#22c55e' : co.whaleDirection === 'SHORT' ? '#ef4444' : '#8a9ac0' }}>{co.whaleDirection || '—'}</div>
+          </div>
+          <div>
+            <div style={S.label}>CEX netflow</div>
+            <div style={{ ...S.mono, fontSize: 12, fontWeight: 700, color: co.netflowDirection === 'BULLISH' ? '#22c55e' : co.netflowDirection === 'BEARISH' ? '#ef4444' : '#8a9ac0' }}>{co.netflowDirection || '—'}</div>
+          </div>
+          <div>
+            <div style={S.label}>Funding</div>
+            <div style={{ ...S.mono, fontSize: 12, fontWeight: 700, color: co.fundingLevel === 'HIGH' ? '#f59e0b' : co.fundingLevel === 'NEGATIVE' ? '#a78bfa' : '#c8d6e5' }}>{co.fundingLevel || '—'}</div>
+          </div>
+          <div style={{ marginLeft: 'auto' }}>
+            <div style={S.label}>Reading</div>
+            <div style={{ ...S.mono, fontSize: 14, fontWeight: 700, color: readingColor }}>{(co.reading || 'MIXED').replace(/_/g, ' ')}</div>
+          </div>
+        </div>
+        <div style={{ fontSize: 11, color: '#8a9ac0', marginTop: 8 }}>{co.interpretation || '—'}</div>
+      </div>
+    </div>
+  )
+}
+
 // ── Taker Flow (cumulative delta by period) ───────────────────────────
 function TakerFlow({ flow }) {
   const [period, setPeriod] = useState('4h')
@@ -3645,10 +3925,10 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
 
   // Panel ordering per time horizon — all panels always shown, just reordered
   const horizonOrders = {
-    scalp:    ['state','taker_grid','orderbook','liqmap','stochastics','setup','mq','funding_grid','options','levels','netflows','iv_grid','ethbtc_grid','vol_vp','takerflow','vp_chart','capitalmap','explanations'],
-    intraday: ['state','setup','mq','funding_grid','netflows','options','liqmap','levels','taker_grid','stochastics','iv_grid','ethbtc_grid','vol_vp','capitalmap','takerflow','orderbook','vp_chart','explanations'],
-    swing:    ['state','netflows','mq','options','setup','levels','capitalmap','iv_grid','ethbtc_grid','liqmap','funding_grid','stochastics','vol_vp','taker_grid','takerflow','orderbook','vp_chart','explanations'],
-    macro:    ['state','capitalmap','netflows','iv_grid','ethbtc_grid','options','mq','levels','setup','funding_grid','vol_vp','liqmap','stochastics','taker_grid','vp_chart','takerflow','orderbook','explanations'],
+    scalp:    ['state','taker_grid','whale_vs_retail','orderbook','liqmap','stochastics','setup','mq','funding_grid','options','levels','netflows','iv_grid','ethbtc_grid','vol_vp','takerflow','vp_chart','capitalmap','explanations'],
+    intraday: ['state','setup','mq','funding_grid','netflows','whale_vs_retail','options','liqmap','levels','taker_grid','stochastics','iv_grid','ethbtc_grid','vol_vp','capitalmap','takerflow','orderbook','vp_chart','explanations'],
+    swing:    ['state','netflows','whale_vs_retail','mq','options','setup','levels','capitalmap','iv_grid','ethbtc_grid','liqmap','funding_grid','stochastics','vol_vp','taker_grid','takerflow','orderbook','vp_chart','explanations'],
+    macro:    ['state','capitalmap','netflows','whale_vs_retail','iv_grid','ethbtc_grid','options','mq','levels','setup','funding_grid','vol_vp','liqmap','stochastics','taker_grid','vp_chart','takerflow','orderbook','explanations'],
   }
   const panelOrder = horizonOrders[horizon] || horizonOrders.intraday
   const signals = useMemo(() => computeSignals(data, statePeriod, stochTf), [data, statePeriod, stochTf])
@@ -4081,6 +4361,12 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
           ethBtcRotation={data?.ethBtcRotation}
           cexReserves={data?.cexNetflows?.relativeContext || {}}
         />
+      </div>),
+
+      whale_vs_retail: (
+      <div style={{ ...S.card, marginBottom: 10 }}>
+        <div style={S.sectionTitle}>Whales vs Retail — Multi-exchange + Confluencia</div>
+        <WhaleVsRetailDeep whaleVsRetail={data?.whaleVsRetail} />
       </div>),
 
       iv_grid: (

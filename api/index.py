@@ -2013,6 +2013,209 @@ def process_dune_netflows(
     }
 
 
+def compute_whale_vs_retail(
+    binance_global_by_period: dict,
+    binance_top_by_period: dict,
+    okx_by_period: dict,
+    bybit_by_period: dict,
+    cn_data: Optional[dict] = None,
+    binance_funding_rate: Optional[float] = None,
+    oi_by_exchange: Optional[dict] = None,
+) -> dict:
+    """Multi-exchange retail vs Binance whales (top traders). See backend/main.py
+    docstring for full design rationale."""
+    periods = ["5m", "15m", "1h", "4h", "1d"]
+    period_minutes = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+
+    def _latest(s): return s[-1] if s else None
+
+    def _delta_long_pct(series, hours_back):
+        if not series or len(series) < 2: return None
+        latest = series[-1]
+        target_ts = latest["ts"] - int(hours_back * 3600 * 1000)
+        prev = None
+        for s in reversed(series[:-1]):
+            if s["ts"] <= target_ts:
+                prev = s; break
+        if prev is None: prev = series[0]
+        return round(latest["longPct"] - prev["longPct"], 4)
+
+    def _bucket(series):
+        latest = _latest(series)
+        return {"longPct": latest["longPct"] if latest else None,
+                "shortPct": latest["shortPct"] if latest else None,
+                "ratio": latest["ratio"] if latest else None,
+                "history": series}
+
+    exchanges = {}
+    for period in periods:
+        exchanges[period] = {
+            "binance_retail": _bucket(binance_global_by_period.get(period, [])),
+            "okx_retail":     _bucket(okx_by_period.get(period, [])),
+            "bybit_retail":   _bucket(bybit_by_period.get(period, [])),
+            "binance_whale":  _bucket(binance_top_by_period.get(period, [])),
+        }
+
+    def _aggregate_retail(period):
+        b = binance_global_by_period.get(period, [])
+        o = okx_by_period.get(period, [])
+        y = bybit_by_period.get(period, [])
+        if not (b or o or y): return None, []
+        half_ms = period_minutes[period] * 30_000
+        all_ts = sorted({s["ts"] for series in (b, o, y) for s in series})
+        agg_series = []
+        for ts in all_ts:
+            vals = []
+            for series in (b, o, y):
+                best = None
+                for s in series:
+                    if abs(s["ts"] - ts) <= half_ms:
+                        if best is None or abs(s["ts"] - ts) < abs(best["ts"] - ts):
+                            best = s
+                if best is not None: vals.append(best["longPct"])
+            if vals:
+                lp = sum(vals) / len(vals)
+                agg_series.append({"ts": ts, "longPct": lp, "shortPct": 1.0 - lp,
+                                   "ratio": lp / (1.0 - lp) if lp < 1 else None,
+                                   "exchangeCount": len(vals)})
+        latest = _latest(agg_series)
+        cur = None
+        if latest:
+            cur = {"longPct": round(latest["longPct"], 4),
+                   "shortPct": round(latest["shortPct"], 4),
+                   "ratio": round(latest["ratio"], 4) if latest["ratio"] else None,
+                   "exchangeCount": latest["exchangeCount"]}
+        return cur, agg_series
+
+    aggregate, aggregate_series_by_period = {}, {}
+    for period in periods:
+        cur, series = _aggregate_retail(period)
+        aggregate[period] = cur
+        aggregate_series_by_period[period] = series
+
+    deltas = {}
+    for period in periods:
+        agg_series = aggregate_series_by_period[period]
+        whale_series = binance_top_by_period.get(period, [])
+        deltas[period] = {
+            "retail": {"delta1h":  _delta_long_pct(agg_series, 1),
+                       "delta4h":  _delta_long_pct(agg_series, 4),
+                       "delta24h": _delta_long_pct(agg_series, 24)},
+            "whale":  {"delta1h":  _delta_long_pct(whale_series, 1),
+                       "delta4h":  _delta_long_pct(whale_series, 4),
+                       "delta24h": _delta_long_pct(whale_series, 24)},
+        }
+
+    div_series_1h = []
+    agg_1h = aggregate_series_by_period["1h"]
+    whale_1h = binance_top_by_period.get("1h", [])
+    whale_ts_to_pct = {s["ts"]: s["longPct"] for s in whale_1h}
+    for s in agg_1h:
+        wpct = whale_ts_to_pct.get(s["ts"])
+        if wpct is None:
+            best = None
+            for w in whale_1h:
+                if abs(w["ts"] - s["ts"]) <= 30 * 60 * 1000:
+                    if best is None or abs(w["ts"] - s["ts"]) < abs(best["ts"] - s["ts"]):
+                        best = w
+            wpct = best["longPct"] if best else None
+        if wpct is not None:
+            div_series_1h.append({"ts": s["ts"], "value": s["longPct"] - wpct})
+
+    div_current = div_series_1h[-1]["value"] if div_series_1h else None
+    div_history = [d["value"] for d in div_series_1h[:-1]]
+    div_z, div_pct = None, None
+    if len(div_history) >= 12:
+        mu = statistics.fmean(div_history)
+        sd = statistics.stdev(div_history) if len(div_history) > 1 else 0.0
+        if sd > 0:
+            div_z = round((div_current - mu) / sd, 2)
+        rank = sum(1 for v in div_history if v <= div_current)
+        div_pct = round(rank / len(div_history) * 100, 1)
+
+    whale_latest = _latest(binance_top_by_period.get("1h", []))
+    whale_ratio = whale_latest["ratio"] if whale_latest else None
+    if whale_ratio is None: whale_dir = "NEUTRAL"
+    elif whale_ratio >= 1.15: whale_dir = "LONG"
+    elif whale_ratio <= 0.87: whale_dir = "SHORT"
+    else: whale_dir = "NEUTRAL"
+
+    netflow_dir = (cn_data or {}).get("direction") or "NEUTRAL"
+
+    if binance_funding_rate is None: funding_level = "UNKNOWN"
+    elif binance_funding_rate >= 0.0003: funding_level = "HIGH"
+    elif binance_funding_rate <= -0.0001: funding_level = "NEGATIVE"
+    elif binance_funding_rate <= 0.00005: funding_level = "LOW"
+    else: funding_level = "NORMAL"
+
+    reading = "MIXED"
+    interp = "Señales mezcladas — sin alineamiento claro."
+    if whale_dir == "LONG" and netflow_dir == "BULLISH" and funding_level in ("NORMAL", "LOW"):
+        reading = "CONFIRMED_BULL"
+        interp = "Ballenas long + ETH saliendo de CEX + funding sano = confluencia alcista."
+    elif whale_dir == "SHORT" and netflow_dir == "BEARISH":
+        reading = "CONFIRMED_BEAR"
+        interp = "Ballenas short + ETH entrando a CEX = confluencia bajista."
+    elif whale_dir == "LONG" and netflow_dir == "BEARISH" and funding_level == "HIGH":
+        reading = "DIVERGENT_WHALE_WRONG_SIDE"
+        interp = "Ballenas long pero flows + funding bearish — ballenas podrían estar atrapadas."
+    elif whale_dir == "SHORT" and netflow_dir == "BULLISH":
+        reading = "DIVERGENT_WHALE_WRONG_SIDE"
+        interp = "Ballenas short pero ETH saliendo de CEX — short squeeze posible."
+    elif whale_dir == "LONG" and funding_level == "HIGH":
+        reading = "OVERHEATED_LONG"
+        interp = "Ballenas long con funding caro — posición ya pagada, vulnerable a flush."
+    elif whale_dir == "SHORT" and funding_level == "NEGATIVE":
+        reading = "OVERHEATED_SHORT"
+        interp = "Ballenas short con funding negativo — short crowded, vulnerable a squeeze."
+    elif whale_dir == "NEUTRAL":
+        reading = "WHALES_UNDECIDED"
+        interp = "Ballenas sin sesgo direccional claro."
+
+    # USD exposure (Binance only, Pareto 75/25 assumption documented in payload)
+    WHALE_OI_SHARE = 0.75
+    RETAIL_OI_SHARE = 1.0 - WHALE_OI_SHARE
+    oi_map = oi_by_exchange or {}
+    bn_oi_usd = oi_map.get("binance") or 0
+    whale_lp = (_latest(binance_top_by_period.get("1h", [])) or {}).get("longPct")
+    retail_lp = (_latest(binance_global_by_period.get("1h", [])) or {}).get("longPct")
+    total_oi_all = sum(v for v in oi_map.values() if isinstance(v, (int, float)) and v > 0)
+
+    def _exposure(oi_share, long_pct):
+        if not bn_oi_usd or long_pct is None:
+            return {"oiUsd": None, "longPct": long_pct, "longUsd": None, "shortUsd": None, "netUsd": None}
+        cohort_oi = bn_oi_usd * oi_share
+        long_usd = cohort_oi * long_pct
+        short_usd = cohort_oi * (1.0 - long_pct)
+        return {"oiUsd": round(cohort_oi), "longPct": round(long_pct, 4),
+                "longUsd": round(long_usd), "shortUsd": round(short_usd),
+                "netUsd": round(long_usd - short_usd)}
+
+    exposure = {
+        "binanceOiUsd": round(bn_oi_usd) if bn_oi_usd else None,
+        "totalOiUsd": round(total_oi_all) if total_oi_all else None,
+        "oiByExchange": {k: round(v) for k, v in oi_map.items() if isinstance(v, (int, float)) and v > 0},
+        "paretoAssumption": {
+            "whaleShare": WHALE_OI_SHARE, "retailShare": RETAIL_OI_SHARE,
+            "note": "Top 20% accounts by position size assumed to hold 75% of OI (Pareto heuristic; Binance does not publish per-cohort OI split)",
+        },
+        "whale": _exposure(WHALE_OI_SHARE, whale_lp),
+        "retail": _exposure(RETAIL_OI_SHARE, retail_lp),
+    }
+
+    return {
+        "exchanges": exchanges,
+        "aggregate": aggregate,
+        "deltas": deltas,
+        "divergenceSeries1h": div_series_1h,
+        "divergence": {"current": round(div_current, 4) if div_current is not None else None,
+                       "zScore": div_z, "percentile": div_pct, "samplesN": len(div_history)},
+        "confluence": {"whaleDirection": whale_dir, "netflowDirection": netflow_dir,
+                       "fundingLevel": funding_level, "reading": reading, "interpretation": interp},
+        "exposure": exposure,
+    }
+
+
 async def fetch_all_data() -> dict:
     global cache, cache_ts
     now = time.time()
@@ -2056,6 +2259,26 @@ async def fetch_all_data() -> dict:
                        {"instType": "SWAP", "instId": "ETH-USDT-SWAP"}),
             fetch_json(client, f"{OKX_API}/api/v5/rubik/stat/contracts/long-short-account-ratio",
                        {"ccy": "ETH", "period": "1H"}),
+            # OKX L/S multi-period (5m/15m/4H/1D) for whaleVsRetail aggregate
+            fetch_json(client, f"{OKX_API}/api/v5/rubik/stat/contracts/long-short-account-ratio",
+                       {"ccy": "ETH", "period": "5m"}),
+            fetch_json(client, f"{OKX_API}/api/v5/rubik/stat/contracts/long-short-account-ratio",
+                       {"ccy": "ETH", "period": "15m"}),
+            fetch_json(client, f"{OKX_API}/api/v5/rubik/stat/contracts/long-short-account-ratio",
+                       {"ccy": "ETH", "period": "4H"}),
+            fetch_json(client, f"{OKX_API}/api/v5/rubik/stat/contracts/long-short-account-ratio",
+                       {"ccy": "ETH", "period": "1D"}),
+            # Bybit L/S multi-period — account-weighted, retail-style
+            fetch_json(client, f"{BYBIT_API}/v5/market/account-ratio",
+                       {"category": "linear", "symbol": "ETHUSDT", "period": "5min", "limit": 48}),
+            fetch_json(client, f"{BYBIT_API}/v5/market/account-ratio",
+                       {"category": "linear", "symbol": "ETHUSDT", "period": "15min", "limit": 48}),
+            fetch_json(client, f"{BYBIT_API}/v5/market/account-ratio",
+                       {"category": "linear", "symbol": "ETHUSDT", "period": "1h", "limit": 30}),
+            fetch_json(client, f"{BYBIT_API}/v5/market/account-ratio",
+                       {"category": "linear", "symbol": "ETHUSDT", "period": "4h", "limit": 30}),
+            fetch_json(client, f"{BYBIT_API}/v5/market/account-ratio",
+                       {"category": "linear", "symbol": "ETHUSDT", "period": "1d", "limit": 30}),
             fetch_json(client, f"{BINANCE_FAPI}/fapi/v1/klines",
                        {"symbol": "ETHUSDT", "interval": "1h", "limit": 720}),
             fetch_json(client, f"{BINANCE_FAPI}/fapi/v1/klines",
@@ -2121,6 +2344,8 @@ async def fetch_all_data() -> dict:
         bn_ls_15m, bn_ls_4h, bn_ls_1d,
         bn_top_ls_15m, bn_top_ls_4h, bn_top_ls_1d,
         okx_fund, okx_oi, okx_ls,
+        okx_ls_5m, okx_ls_15m, okx_ls_4h, okx_ls_1d,        # multi-period for whaleVsRetail
+        bybit_ls_5m, bybit_ls_15m, bybit_ls_1h, bybit_ls_4h, bybit_ls_1d,
         bn_klines_vol, bn_klines_vp,
         bn_klines_90d,
         spot_klines_5m, spot_klines_1h,
@@ -2212,13 +2437,45 @@ async def fetch_all_data() -> dict:
                 if not isinstance(d, dict):
                     continue
                 out.append({
-                    "ts": d["timestamp"],
+                    "ts": int(d["timestamp"]),
                     "ratio": float(d["longShortRatio"]),
                     "longPct": float(d["longAccount"]),
                     "shortPct": float(d["shortAccount"]),
                 })
             except (KeyError, ValueError, TypeError):
                 continue
+        out.sort(key=lambda x: x["ts"])
+        return out
+
+    def parse_okx_ls_series(raw):
+        out = []
+        if not isinstance(raw, dict):
+            return out
+        for row in raw.get("data") or []:
+            try:
+                ts = int(row[0]); ratio = float(row[1])
+                if ratio <= 0: continue
+                long_pct = ratio / (1.0 + ratio)
+                out.append({"ts": ts, "ratio": ratio, "longPct": long_pct, "shortPct": 1.0 - long_pct})
+            except (IndexError, ValueError, TypeError):
+                continue
+        out.sort(key=lambda x: x["ts"])
+        return out
+
+    def parse_bybit_ls_series(raw):
+        out = []
+        if not isinstance(raw, dict): return out
+        rows = (raw.get("result") or {}).get("list") or []
+        for r in rows:
+            try:
+                long_pct = float(r["buyRatio"]); short_pct = float(r["sellRatio"])
+                if short_pct <= 0: continue
+                out.append({"ts": int(r["timestamp"]),
+                            "ratio": long_pct / short_pct,
+                            "longPct": long_pct, "shortPct": short_pct})
+            except (KeyError, ValueError, TypeError):
+                continue
+        out.sort(key=lambda x: x["ts"])
         return out
 
     ls_by_period = {
@@ -2227,6 +2484,20 @@ async def fetch_all_data() -> dict:
         "1h": parse_ls_series(bn_ls),
         "4h": parse_ls_series(bn_ls_4h),
         "1d": parse_ls_series(bn_ls_1d),
+    }
+    okx_ls_by_period = {
+        "5m":  parse_okx_ls_series(okx_ls_5m),
+        "15m": parse_okx_ls_series(okx_ls_15m),
+        "1h":  parse_okx_ls_series(okx_ls),
+        "4h":  parse_okx_ls_series(okx_ls_4h),
+        "1d":  parse_okx_ls_series(okx_ls_1d),
+    }
+    bybit_ls_by_period = {
+        "5m":  parse_bybit_ls_series(bybit_ls_5m),
+        "15m": parse_bybit_ls_series(bybit_ls_15m),
+        "1h":  parse_bybit_ls_series(bybit_ls_1h),
+        "4h":  parse_bybit_ls_series(bybit_ls_4h),
+        "1d":  parse_bybit_ls_series(bybit_ls_1d),
     }
     top_ls_by_period = {
         "1h": parse_ls_series(bn_top_ls),
@@ -2694,12 +2965,26 @@ async def fetch_all_data() -> dict:
         "perpBasis": perp_basis_computed,
         "optionsSkew": options_skew_computed,
         "optionsExpiries": options_expiries_computed,
-        "cexNetflows": process_dune_netflows(
+        "cexNetflows": (cn_data_for_payload := process_dune_netflows(
             dune_cex_raw if isinstance(dune_cex_raw, dict) else None,
             current_price,
             spot_volume_usd_24h=vol_bn_spot if vol_bn_spot else None,
             price_change_pct_24h=safe_float(bn_ticker, "priceChangePercent"),
             reserves=defillama_reserves_raw if isinstance(defillama_reserves_raw, dict) else None,
+        )),
+        "whaleVsRetail": compute_whale_vs_retail(
+            ls_by_period,
+            top_ls_by_period,
+            okx_ls_by_period,
+            bybit_ls_by_period,
+            cn_data=cn_data_for_payload,
+            binance_funding_rate=bn_fund_rate,
+            oi_by_exchange={
+                "binance": bn_oi_val,
+                "okx": okx_oi_val,
+                "bybit": bybit_oi_val,
+                "hyperliquid": hl_oi_val,
+            },
         ),
         "ethBtcRotation": ethbtc_taker_raw if isinstance(ethbtc_taker_raw, dict) else None,
         "defiEthMap": defi_eth_map_raw if isinstance(defi_eth_map_raw, dict) else None,
