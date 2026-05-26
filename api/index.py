@@ -2013,6 +2013,108 @@ def process_dune_netflows(
     }
 
 
+HYPERLIQUID_API = "https://api.hyperliquid.xyz"
+HYPERLIQUID_WHALES_CACHE_TTL = 300
+HYPERLIQUID_DEFAULT_WHALES = [
+    "0x50b309f78e774a756a2230e1769729094cac9f20",
+    "0x010461c14e146ac35fe42271bdc1134ee31c703a",
+    "0xeaa400abec7c62d315fd760cbba817fa35e4e0e8",
+    "0xf3f496c9486be5924a93d67e98298733bb47057c",
+    "0xa10ec245b3483f83e8a8a4d40c63d83fec23bbc8",
+]
+HYPERLIQUID_WHALE_ADDRESSES = [
+    a.strip().lower() for a in
+    (os.getenv("HYPERLIQUID_WHALE_ADDRESSES") or ",".join(HYPERLIQUID_DEFAULT_WHALES)).split(",")
+    if a.strip().startswith("0x")
+]
+hl_whales_cache: dict = {}
+hl_whales_cache_ts: float = 0
+
+
+async def fetch_hyperliquid_whales(client: httpx.AsyncClient) -> Optional[dict]:
+    """Poll clearinghouseState for each curated HL whale address in parallel."""
+    global hl_whales_cache, hl_whales_cache_ts
+    now = time.time()
+    if hl_whales_cache and (now - hl_whales_cache_ts) < HYPERLIQUID_WHALES_CACHE_TTL:
+        return hl_whales_cache
+    if not HYPERLIQUID_WHALE_ADDRESSES:
+        return None
+
+    async def _fetch_one(addr):
+        try:
+            r = await client.post(f"{HYPERLIQUID_API}/info",
+                                  json={"type": "clearinghouseState", "user": addr}, timeout=8.0)
+            r.raise_for_status()
+            return addr, r.json()
+        except Exception:
+            return addr, None
+
+    results = await asyncio.gather(*[_fetch_one(a) for a in HYPERLIQUID_WHALE_ADDRESSES], return_exceptions=True)
+    out = {}
+    for r in results:
+        if isinstance(r, tuple):
+            a, s = r
+            if isinstance(s, dict): out[a] = s
+    if out:
+        hl_whales_cache = out
+        hl_whales_cache_ts = now
+    return out or None
+
+
+def process_hyperliquid_whales(raw, eth_spot_price):
+    if not raw or not isinstance(raw, dict):
+        return {"positions": [], "aggregate": {}, "liqClusters": [], "polled": 0}
+    spot = float(eth_spot_price or 0)
+    positions = []
+    for addr, state in raw.items():
+        if not isinstance(state, dict): continue
+        for ap in (state.get("assetPositions") or []):
+            pos = (ap or {}).get("position") or {}
+            if pos.get("coin") != "ETH": continue
+            try:
+                szi = float(pos.get("szi") or 0)
+                if szi == 0: continue
+                entry_px = float(pos.get("entryPx") or 0)
+                liq_px = float(pos.get("liquidationPx") or 0) if pos.get("liquidationPx") else None
+                lev_obj = pos.get("leverage") or {}
+                lev = int(lev_obj.get("value") or 0) or None
+                margin_type = lev_obj.get("type") or "unknown"
+                unrealized = float(pos.get("unrealizedPnl") or 0)
+                size_eth = abs(szi); size_usd = size_eth * (spot or entry_px)
+                side = "LONG" if szi > 0 else "SHORT"
+                dist = round((liq_px - spot) / spot * 100, 2) if liq_px and spot else None
+                positions.append({
+                    "address": addr, "addressShort": addr[:6] + "…" + addr[-4:],
+                    "side": side, "sizeEth": round(size_eth, 4), "sizeUsd": round(size_usd),
+                    "entryPx": round(entry_px, 2) if entry_px else None,
+                    "liqPx": round(liq_px, 2) if liq_px else None,
+                    "leverage": lev, "marginType": margin_type,
+                    "unrealizedPnlUsd": round(unrealized), "distToLiqPct": dist,
+                })
+            except (ValueError, TypeError, KeyError):
+                continue
+    positions.sort(key=lambda p: p["sizeUsd"], reverse=True)
+    longs = [p for p in positions if p["side"] == "LONG"]
+    shorts = [p for p in positions if p["side"] == "SHORT"]
+    total_l = sum(p["sizeUsd"] for p in longs); total_s = sum(p["sizeUsd"] for p in shorts)
+    BIN = 25.0
+    cluster_d = {}
+    for p in positions:
+        if not p.get("liqPx"): continue
+        key = (round(p["liqPx"] / BIN) * BIN, p["side"])
+        c = cluster_d.setdefault(key, {"priceLevel": key[0], "side": p["side"], "sizeUsd": 0, "count": 0})
+        c["sizeUsd"] += p["sizeUsd"]; c["count"] += 1
+    return {
+        "positions": positions,
+        "aggregate": {"totalLongUsd": round(total_l), "totalShortUsd": round(total_s),
+                      "netUsd": round(total_l - total_s), "longCount": len(longs), "shortCount": len(shorts),
+                      "whalesWithEthCount": len({p["address"] for p in positions}),
+                      "totalWhalesPolled": len(raw)},
+        "liqClusters": sorted(cluster_d.values(), key=lambda c: c["priceLevel"]),
+        "polled": len(raw),
+    }
+
+
 def compute_whale_vs_retail(
     binance_global_by_period: dict,
     binance_top_by_period: dict,
@@ -2334,6 +2436,8 @@ async def fetch_all_data() -> dict:
             fetch_ethbtc_taker(client),
             # DeFi ETH distribution (Lido, Aave, Maker, EigenLayer, etc.)
             fetch_defi_eth_map(client),
+            # Hyperliquid whale positions (curated list, cached 5min)
+            fetch_hyperliquid_whales(client),
             return_exceptions=True,
         )
 
@@ -2361,6 +2465,7 @@ async def fetch_all_data() -> dict:
         defillama_reserves_raw,
         ethbtc_taker_raw,
         defi_eth_map_raw,
+        hl_whales_raw,
     ) = results
 
     def safe_float(obj, key, default=None):
@@ -2988,6 +3093,10 @@ async def fetch_all_data() -> dict:
         ),
         "ethBtcRotation": ethbtc_taker_raw if isinstance(ethbtc_taker_raw, dict) else None,
         "defiEthMap": defi_eth_map_raw if isinstance(defi_eth_map_raw, dict) else None,
+        "hyperliquidWhales": process_hyperliquid_whales(
+            hl_whales_raw if isinstance(hl_whales_raw, dict) else None,
+            eth_spot_price=spot,
+        ),
     }
 
     cache = data

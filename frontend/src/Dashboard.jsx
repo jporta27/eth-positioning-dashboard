@@ -2696,6 +2696,152 @@ function LongShortPanel({ longShort, signal }) {
   )
 }
 
+// ── Hyperliquid Whales (on-chain positions, curated address list) ────
+function HyperliquidWhalesPanel({ hyperliquidWhales, spotPrice }) {
+  const hl = hyperliquidWhales
+  if (!hl) return <div style={{ ...S.mono, color: '#5a6a8a', fontSize: 11 }}>Sin datos de Hyperliquid</div>
+
+  const positions = hl.positions || []
+  const agg = hl.aggregate || {}
+  const clusters = hl.liqClusters || []
+
+  const fmtUsd = (n) => {
+    if (n == null) return '—'
+    const sign = n < 0 ? '−' : ''
+    const v = Math.abs(n)
+    if (v >= 1e9) return `${sign}$${(v / 1e9).toFixed(2)}B`
+    if (v >= 1e6) return `${sign}$${(v / 1e6).toFixed(1)}M`
+    if (v >= 1e3) return `${sign}$${(v / 1e3).toFixed(0)}k`
+    return `${sign}$${v.toFixed(0)}`
+  }
+
+  return (
+    <div>
+      {/* Top summary */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 12 }}>
+        <div style={{ padding: '10px 12px', borderRadius: 6, background: '#0a1020', border: '1px solid #1a2544' }}>
+          <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1 }}>WHALES POLLED</div>
+          <div style={{ ...S.mono, fontSize: 18, fontWeight: 700, color: '#c8d6e5' }}>
+            {agg.whalesWithEthCount || 0} / {agg.totalWhalesPolled || hl.polled || 0}
+          </div>
+          <div style={{ fontSize: 9, color: '#5a6a8a' }}>con posición ETH abierta</div>
+        </div>
+        <div style={{ padding: '10px 12px', borderRadius: 6, background: '#0a1020', border: '1px solid #22c55e' }}>
+          <div style={{ fontSize: 9, color: '#22c55e', letterSpacing: 1 }}>TOTAL LONG $</div>
+          <div style={{ ...S.mono, fontSize: 18, fontWeight: 700, color: '#22c55e' }}>{fmtUsd(agg.totalLongUsd)}</div>
+          <div style={{ fontSize: 9, color: '#5a6a8a' }}>{agg.longCount || 0} posiciones</div>
+        </div>
+        <div style={{ padding: '10px 12px', borderRadius: 6, background: '#0a1020', border: '1px solid #ef4444' }}>
+          <div style={{ fontSize: 9, color: '#ef4444', letterSpacing: 1 }}>TOTAL SHORT $</div>
+          <div style={{ ...S.mono, fontSize: 18, fontWeight: 700, color: '#ef4444' }}>{fmtUsd(agg.totalShortUsd)}</div>
+          <div style={{ fontSize: 9, color: '#5a6a8a' }}>{agg.shortCount || 0} posiciones</div>
+        </div>
+        <div style={{ padding: '10px 12px', borderRadius: 6, background: '#0a1020',
+                      border: `1px solid ${agg.netUsd > 0 ? '#22c55e' : agg.netUsd < 0 ? '#ef4444' : '#1a2544'}` }}>
+          <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1 }}>NET $</div>
+          <div style={{ ...S.mono, fontSize: 18, fontWeight: 700,
+                        color: agg.netUsd > 0 ? '#22c55e' : agg.netUsd < 0 ? '#ef4444' : '#c8d6e5' }}>
+            {agg.netUsd > 0 ? '+' : ''}{fmtUsd(agg.netUsd)}
+          </div>
+          <div style={{ fontSize: 9, color: '#5a6a8a' }}>
+            {agg.netUsd > 0 ? 'sesgo LONG' : agg.netUsd < 0 ? 'sesgo SHORT' : 'balanced'}
+          </div>
+        </div>
+      </div>
+
+      {/* Positions table */}
+      {positions.length === 0 ? (
+        <div style={{ padding: '12px', borderRadius: 6, background: '#0a1020', border: '1px solid #1a2544', textAlign: 'center' }}>
+          <div style={{ fontSize: 11, color: '#5a6a8a' }}>
+            Ninguna de las {agg.totalWhalesPolled || 0} wallets curadas tiene posición ETH abierta ahora mismo
+          </div>
+          <div style={{ fontSize: 9, color: '#3a4a6a', marginTop: 4 }}>
+            Agregá addresses via env <code>HYPERLIQUID_WHALE_ADDRESSES</code> (comma-separated)
+          </div>
+        </div>
+      ) : (
+        <div style={{ marginBottom: 12, overflow: 'auto' }}>
+          <table style={{ ...S.mono, width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ color: '#5a6a8a', fontSize: 9, letterSpacing: 1 }}>
+                <th style={{ padding: '6px 8px', textAlign: 'left', borderBottom: '1px solid #1a2544' }}>ADDRESS</th>
+                <th style={{ padding: '6px 8px', textAlign: 'center', borderBottom: '1px solid #1a2544' }}>SIDE</th>
+                <th style={{ padding: '6px 8px', textAlign: 'right', borderBottom: '1px solid #1a2544' }}>SIZE ETH</th>
+                <th style={{ padding: '6px 8px', textAlign: 'right', borderBottom: '1px solid #1a2544' }}>SIZE $</th>
+                <th style={{ padding: '6px 8px', textAlign: 'right', borderBottom: '1px solid #1a2544' }}>LEV</th>
+                <th style={{ padding: '6px 8px', textAlign: 'center', borderBottom: '1px solid #1a2544' }}>MARGIN</th>
+                <th style={{ padding: '6px 8px', textAlign: 'right', borderBottom: '1px solid #1a2544' }}>ENTRY $</th>
+                <th style={{ padding: '6px 8px', textAlign: 'right', borderBottom: '1px solid #1a2544' }}>LIQ $</th>
+                <th style={{ padding: '6px 8px', textAlign: 'right', borderBottom: '1px solid #1a2544' }}>DIST LIQ</th>
+                <th style={{ padding: '6px 8px', textAlign: 'right', borderBottom: '1px solid #1a2544' }}>uPnL</th>
+              </tr>
+            </thead>
+            <tbody>
+              {positions.map((p, i) => (
+                <tr key={i} style={{ borderBottom: '1px solid #0f1830' }}>
+                  <td style={{ padding: '6px 8px', color: '#a78bfa' }}>
+                    <a href={`https://hypurrscan.io/address/${p.address}`} target="_blank" rel="noopener" style={{ color: '#a78bfa', textDecoration: 'none' }}>
+                      {p.addressShort}
+                    </a>
+                  </td>
+                  <td style={{ padding: '6px 8px', textAlign: 'center',
+                               color: p.side === 'LONG' ? '#22c55e' : '#ef4444', fontWeight: 700 }}>{p.side}</td>
+                  <td style={{ padding: '6px 8px', textAlign: 'right' }}>{p.sizeEth.toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
+                  <td style={{ padding: '6px 8px', textAlign: 'right', color: '#c8d6e5' }}>{fmtUsd(p.sizeUsd)}</td>
+                  <td style={{ padding: '6px 8px', textAlign: 'right',
+                               color: p.leverage >= 20 ? '#f59e0b' : '#c8d6e5' }}>{p.leverage ? `${p.leverage}x` : '—'}</td>
+                  <td style={{ padding: '6px 8px', textAlign: 'center',
+                               color: p.marginType === 'isolated' ? '#f59e0b' : '#8a9ac0', fontSize: 10 }}>{p.marginType}</td>
+                  <td style={{ padding: '6px 8px', textAlign: 'right' }}>{p.entryPx ? `$${p.entryPx.toLocaleString()}` : '—'}</td>
+                  <td style={{ padding: '6px 8px', textAlign: 'right',
+                               color: p.liqPx == null ? '#5a6a8a' : '#c8d6e5' }}>
+                    {p.liqPx ? `$${p.liqPx.toLocaleString()}` : '— (cross)'}
+                  </td>
+                  <td style={{ padding: '6px 8px', textAlign: 'right',
+                               color: p.distToLiqPct == null ? '#5a6a8a' :
+                                      Math.abs(p.distToLiqPct) < 3 ? '#ef4444' :
+                                      Math.abs(p.distToLiqPct) < 10 ? '#f59e0b' : '#5a6a8a' }}>
+                    {p.distToLiqPct != null ? `${p.distToLiqPct > 0 ? '+' : ''}${p.distToLiqPct}%` : '—'}
+                  </td>
+                  <td style={{ padding: '6px 8px', textAlign: 'right',
+                               color: p.unrealizedPnlUsd > 0 ? '#22c55e' : p.unrealizedPnlUsd < 0 ? '#ef4444' : '#5a6a8a' }}>
+                    {p.unrealizedPnlUsd > 0 ? '+' : ''}{fmtUsd(p.unrealizedPnlUsd)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Liq clusters overlay (real prices, not heuristic) */}
+      {clusters.length > 0 && (
+        <div style={{ padding: '10px 12px', borderRadius: 6, background: '#0a1020', border: '1px solid #1a2544' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6 }}>
+            <div style={{ fontSize: 10, color: '#5a6a8a', letterSpacing: 1 }}>LIQ CLUSTERS REALES (de las whales curadas)</div>
+            {spotPrice && <div style={{ ...S.mono, fontSize: 10, color: '#5a6a8a' }}>spot ${spotPrice.toLocaleString()}</div>}
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {clusters.map((c, i) => (
+              <div key={i} style={{
+                padding: '4px 8px', borderRadius: 4,
+                background: c.side === 'LONG' ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.12)',
+                border: `1px solid ${c.side === 'LONG' ? '#22c55e' : '#ef4444'}`,
+                fontSize: 10, ...S.mono,
+              }}>
+                ${c.priceLevel.toLocaleString()} <span style={{ color: c.side === 'LONG' ? '#22c55e' : '#ef4444' }}>{c.side}</span> {fmtUsd(c.sizeUsd)} ({c.count})
+              </div>
+            ))}
+          </div>
+          <div style={{ fontSize: 9, color: '#3a4a6a', marginTop: 6 }}>
+            Estos son liq prices REALES de las ballenas curadas (no heurísticos como el liq map general) — sólo de las wallets en la lista hardcoded.
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Whale vs Retail Deep Dive ─────────────────────────────────────────
 // Multi-exchange L/S aggregate (Binance global + OKX + Bybit) vs Binance Top
 // Traders (whales). Surfaces deltas + divergence + cross-signal confluence.
@@ -3925,10 +4071,10 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
 
   // Panel ordering per time horizon — all panels always shown, just reordered
   const horizonOrders = {
-    scalp:    ['state','taker_grid','whale_vs_retail','orderbook','liqmap','stochastics','setup','mq','funding_grid','options','levels','netflows','iv_grid','ethbtc_grid','vol_vp','takerflow','vp_chart','capitalmap','explanations'],
-    intraday: ['state','setup','mq','funding_grid','netflows','whale_vs_retail','options','liqmap','levels','taker_grid','stochastics','iv_grid','ethbtc_grid','vol_vp','capitalmap','takerflow','orderbook','vp_chart','explanations'],
-    swing:    ['state','netflows','whale_vs_retail','mq','options','setup','levels','capitalmap','iv_grid','ethbtc_grid','liqmap','funding_grid','stochastics','vol_vp','taker_grid','takerflow','orderbook','vp_chart','explanations'],
-    macro:    ['state','capitalmap','netflows','whale_vs_retail','iv_grid','ethbtc_grid','options','mq','levels','setup','funding_grid','vol_vp','liqmap','stochastics','taker_grid','vp_chart','takerflow','orderbook','explanations'],
+    scalp:    ['state','taker_grid','whale_vs_retail','hyperliquid_whales','orderbook','liqmap','stochastics','setup','mq','funding_grid','options','levels','netflows','iv_grid','ethbtc_grid','vol_vp','takerflow','vp_chart','capitalmap','explanations'],
+    intraday: ['state','setup','mq','funding_grid','netflows','whale_vs_retail','hyperliquid_whales','options','liqmap','levels','taker_grid','stochastics','iv_grid','ethbtc_grid','vol_vp','capitalmap','takerflow','orderbook','vp_chart','explanations'],
+    swing:    ['state','netflows','whale_vs_retail','hyperliquid_whales','mq','options','setup','levels','capitalmap','iv_grid','ethbtc_grid','liqmap','funding_grid','stochastics','vol_vp','taker_grid','takerflow','orderbook','vp_chart','explanations'],
+    macro:    ['state','capitalmap','netflows','whale_vs_retail','hyperliquid_whales','iv_grid','ethbtc_grid','options','mq','levels','setup','funding_grid','vol_vp','liqmap','stochastics','taker_grid','vp_chart','takerflow','orderbook','explanations'],
   }
   const panelOrder = horizonOrders[horizon] || horizonOrders.intraday
   const signals = useMemo(() => computeSignals(data, statePeriod, stochTf), [data, statePeriod, stochTf])
@@ -4367,6 +4513,15 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
       <div style={{ ...S.card, marginBottom: 10 }}>
         <div style={S.sectionTitle}>Whales vs Retail — Multi-exchange + Confluencia</div>
         <WhaleVsRetailDeep whaleVsRetail={data?.whaleVsRetail} />
+      </div>),
+
+      hyperliquid_whales: (
+      <div style={{ ...S.card, marginBottom: 10 }}>
+        <div style={S.sectionTitle}>Hyperliquid Whales — Posiciones on-chain reales</div>
+        <HyperliquidWhalesPanel
+          hyperliquidWhales={data?.hyperliquidWhales}
+          spotPrice={data?.binance?.spotPrice}
+        />
       </div>),
 
       iv_grid: (

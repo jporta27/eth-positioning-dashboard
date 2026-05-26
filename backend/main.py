@@ -104,6 +104,30 @@ DEFILLAMA_CACHE_TTL = 3600  # 1h — reserves change slowly
 DEFILLAMA_ETH_KEYS = {"ETH", "WETH", "STETH", "BETH", "CBETH", "EETH", "WEETH", "RETH"}
 DEFILLAMA_STABLE_KEYS = {"USDT", "USDC", "DAI", "FDUSD", "BUSD", "TUSD", "USDD", "PYUSD", "USDE"}
 
+# ── Hyperliquid whale tracker ──────────────────────────────────────────
+# Curated list of known whale wallets to poll. Hyperliquid doesn't expose a
+# public leaderboard endpoint via `info`, and aggregators (hypurrscan, hyperdash)
+# are Cloudflare-protected. We poll a curated list of known whales individually
+# via clearinghouseState and aggregate their ETH positions.
+#
+# Override with env var HYPERLIQUID_WHALE_ADDRESSES (comma-separated 0x... list).
+# Each address: free, no rate limit issues at reasonable poll cadence.
+HYPERLIQUID_API = "https://api.hyperliquid.xyz"
+HYPERLIQUID_WHALES_CACHE_TTL = 300  # 5 min — whale positions don't move that fast
+HYPERLIQUID_DEFAULT_WHALES = [
+    # Seed list. Extend via env. The user can add more via Settings.
+    "0x50b309f78e774a756a2230e1769729094cac9f20",  # large position seen on Onchain Lens
+    "0x010461c14e146ac35fe42271bdc1134ee31c703a",  # Hyperliquid top trader (public)
+    "0xeaa400abec7c62d315fd760cbba817fa35e4e0e8",  # large vault leader
+    "0xf3f496c9486be5924a93d67e98298733bb47057c",  # known active trader
+    "0xa10ec245b3483f83e8a8a4d40c63d83fec23bbc8",  # high-leverage trader
+]
+HYPERLIQUID_WHALE_ADDRESSES = [
+    a.strip().lower() for a in
+    (os.getenv("HYPERLIQUID_WHALE_ADDRESSES") or ",".join(HYPERLIQUID_DEFAULT_WHALES)).split(",")
+    if a.strip().startswith("0x")
+]
+
 # ── New data sources (Fase 1) ─────────────────────────────────────────
 # Farside ETF flows (primary) → scrape HTML → SoSoValue (tertiary) → stale
 FARSIDE_CSV_URL  = "https://farside.co.uk/wp-content/uploads/ETH.csv"
@@ -192,6 +216,9 @@ deribit_basis_cache_ts: float = 0
 
 deribit_futures_raw: list = []  # shared between basis + expiry calendar
 deribit_futures_raw_ts: float = 0
+
+hl_whales_cache: dict = {}
+hl_whales_cache_ts: float = 0
 
 # ── Order Book State ──────────────────────────────────────────────────
 current_depth: dict = {}
@@ -3450,6 +3477,153 @@ def compute_whale_vs_retail(
     }
 
 
+# ── Hyperliquid whale tracker ─────────────────────────────────────────
+async def fetch_hyperliquid_whales(
+    client: httpx.AsyncClient,
+    addresses: Optional[list] = None,
+) -> Optional[dict]:
+    """Poll clearinghouseState for each curated whale address in parallel.
+
+    Strategy:
+      1. Cache layer (HYPERLIQUID_WHALES_CACHE_TTL) — whale positions don't move
+         that fast and individual address fetches add up.
+      2. Fan-out async POST /info per address, return_exceptions=True.
+      3. Caller (process_hyperliquid_whales) filters to ETH positions + aggregates.
+
+    Returns a dict {address: clearinghouseState} for successful fetches; failed
+    ones are dropped silently.
+    """
+    global hl_whales_cache, hl_whales_cache_ts
+    now = time.time()
+    if hl_whales_cache and (now - hl_whales_cache_ts) < HYPERLIQUID_WHALES_CACHE_TTL:
+        return hl_whales_cache
+
+    addrs = addresses or HYPERLIQUID_WHALE_ADDRESSES
+    if not addrs:
+        return None
+
+    async def _fetch_one(addr: str):
+        try:
+            r = await client.post(
+                f"{HYPERLIQUID_API}/info",
+                json={"type": "clearinghouseState", "user": addr},
+                timeout=10.0,
+            )
+            r.raise_for_status()
+            return addr, r.json()
+        except Exception as e:
+            logger.debug(f"HL whale fetch failed for {addr}: {e}")
+            return addr, None
+
+    results = await asyncio.gather(*[_fetch_one(a) for a in addrs], return_exceptions=True)
+    out = {}
+    for r in results:
+        if isinstance(r, tuple):
+            addr, state = r
+            if isinstance(state, dict):
+                out[addr] = state
+    if out:
+        hl_whales_cache = out
+        hl_whales_cache_ts = now
+        logger.info(f"HL whales fetched: {len(out)}/{len(addrs)} addresses")
+    return out or None
+
+
+def process_hyperliquid_whales(
+    raw: Optional[dict],
+    eth_spot_price: Optional[float],
+) -> dict:
+    """Filter to ETH positions across all whales + aggregate.
+
+    Output:
+      positions: list of {address, side, sizeEth, sizeUsd, entryPx, liqPx,
+                          leverage, marginType, unrealizedPnl, distToLiqPct}
+      aggregate: {totalLongUsd, totalShortUsd, netUsd, longCount, shortCount,
+                  whalesWithEthCount, totalWhalesPolled}
+      liqClusters: list of {priceLevel, sizeUsd, count, side} for liq map overlay
+    """
+    if not raw or not isinstance(raw, dict):
+        return {"positions": [], "aggregate": {}, "liqClusters": [], "polled": 0}
+
+    spot = float(eth_spot_price or 0)
+    positions = []
+    for addr, state in raw.items():
+        if not isinstance(state, dict):
+            continue
+        for ap in (state.get("assetPositions") or []):
+            pos = (ap or {}).get("position") or {}
+            if pos.get("coin") != "ETH":
+                continue
+            try:
+                szi = float(pos.get("szi") or 0)  # negative = short
+                if szi == 0:
+                    continue
+                entry_px = float(pos.get("entryPx") or 0)
+                liq_px = float(pos.get("liquidationPx") or 0) if pos.get("liquidationPx") else None
+                lev_obj = pos.get("leverage") or {}
+                lev = int(lev_obj.get("value") or 0) or None
+                margin_type = lev_obj.get("type") or "unknown"  # 'cross' | 'isolated'
+                unrealized_pnl = float(pos.get("unrealizedPnl") or 0)
+                size_eth = abs(szi)
+                size_usd = size_eth * spot if spot else size_eth * entry_px
+                side = "LONG" if szi > 0 else "SHORT"
+                dist_to_liq_pct = None
+                if liq_px and spot:
+                    dist_to_liq_pct = round((liq_px - spot) / spot * 100, 2)
+                positions.append({
+                    "address": addr,
+                    "addressShort": addr[:6] + "…" + addr[-4:],
+                    "side": side,
+                    "sizeEth": round(size_eth, 4),
+                    "sizeUsd": round(size_usd),
+                    "entryPx": round(entry_px, 2) if entry_px else None,
+                    "liqPx": round(liq_px, 2) if liq_px else None,
+                    "leverage": lev,
+                    "marginType": margin_type,
+                    "unrealizedPnlUsd": round(unrealized_pnl),
+                    "distToLiqPct": dist_to_liq_pct,
+                })
+            except (ValueError, TypeError, KeyError):
+                continue
+
+    # Sort by size desc
+    positions.sort(key=lambda p: p["sizeUsd"], reverse=True)
+
+    longs = [p for p in positions if p["side"] == "LONG"]
+    shorts = [p for p in positions if p["side"] == "SHORT"]
+    total_long_usd = sum(p["sizeUsd"] for p in longs)
+    total_short_usd = sum(p["sizeUsd"] for p in shorts)
+
+    # Liq clusters for overlay — bucket liq prices into $25 bins
+    BIN_SIZE = 25.0
+    cluster_dict: dict = {}
+    for p in positions:
+        if not p.get("liqPx"):
+            continue
+        bucket = round(p["liqPx"] / BIN_SIZE) * BIN_SIZE
+        key = (bucket, p["side"])
+        c = cluster_dict.setdefault(key, {"priceLevel": bucket, "side": p["side"],
+                                          "sizeUsd": 0, "count": 0})
+        c["sizeUsd"] += p["sizeUsd"]
+        c["count"] += 1
+    liq_clusters = sorted(cluster_dict.values(), key=lambda c: c["priceLevel"])
+
+    return {
+        "positions": positions,
+        "aggregate": {
+            "totalLongUsd":       round(total_long_usd),
+            "totalShortUsd":      round(total_short_usd),
+            "netUsd":             round(total_long_usd - total_short_usd),
+            "longCount":          len(longs),
+            "shortCount":         len(shorts),
+            "whalesWithEthCount": len({p["address"] for p in positions}),
+            "totalWhalesPolled":  len(raw),
+        },
+        "liqClusters": liq_clusters,
+        "polled": len(raw),
+    }
+
+
 async def fetch_all_data() -> dict:
     """Fetch all positioning data from Binance + OKX."""
     global cache, cache_ts
@@ -3590,6 +3764,8 @@ async def fetch_all_data() -> dict:
             fetch_risk_free_rate(client),
             # Deribit futures basis (cached 30s) — also stores raw for expiry calendar
             fetch_deribit_basis(client),
+            # Hyperliquid whale positions (curated list, cached 5min)
+            fetch_hyperliquid_whales(client),
             return_exceptions=True,
         )
 
@@ -3619,6 +3795,7 @@ async def fetch_all_data() -> dict:
         defi_eth_map_raw,                                    # 54
         risk_free_raw,                                       # 55
         deribit_basis_raw,                                   # 56
+        hl_whales_raw,                                       # 57
     ) = results
 
     def safe_float(obj, key, default=None):
@@ -4329,6 +4506,10 @@ async def fetch_all_data() -> dict:
                 "bybit": bybit_oi_val,
                 "hyperliquid": hl_oi_val,
             },
+        ),
+        "hyperliquidWhales": process_hyperliquid_whales(
+            hl_whales_raw if isinstance(hl_whales_raw, dict) else None,
+            eth_spot_price=spot,
         ),
         "ethBtcRotation": ethbtc_taker_raw if isinstance(ethbtc_taker_raw, dict) else None,
         "defiEthMap": defi_eth_map_raw if isinstance(defi_eth_map_raw, dict) else None,
