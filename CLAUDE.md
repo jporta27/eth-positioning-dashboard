@@ -87,3 +87,29 @@ When `|z| >= 1.0`, trust the z-sign (`z > 0` → BEARISH inflow regime). When `|
 - `process_dune_netflows` builds the 24h rolling distribution from `hourly_series` (which still includes the partial bucket) → z-score / percentile / magnitude are computed against a contaminated denominator. The "exclude partial" path only drops aggregates, not the comparator.
 - Z-score can fire with `n=2` samples (post-cold-start), producing fake EXTREME magnitude until the rolling window fills.
 - `lookup_oi_pair` returns `oi_delta=0` (treated as "OI plano") when `steps_back=0` — happens with very recent anchors against coarse OI granularity. Should return `None`.
+
+## Code review standard (based on google/eng-practices)
+
+When reviewing or finishing a CL in this repo, apply this checklist. Invoke via `/review-cl` to get an automated pass over the current `git diff`.
+
+### Blocking (must fix before merge)
+1. **Two-backend sync.** Any change to data logic (fetch / process / response shape) must be mirrored between `backend/main.py` and `api/index.py`. After editing, grep both files and confirm parity. Drift documented in "Known drift today" must shrink, not grow.
+2. **Smoke tests pass.** `python scripts/smoke_tests.py` exits 0 when the CL touches either backend.
+3. **No magic numbers.** Hardcoded thresholds (z-scores, hedge ratios, cache TTLs, lookback windows, etc.) live as named constants at module top, not inline.
+4. **Comments explain WHY.** Comments restating what the code does are noise. Comments explaining a non-obvious decision, a known gotcha, or the rationale for a threshold are mandatory. Model: the existing comments in `process_dune_netflows` and the CEX netflow `direction` logic.
+5. **Mirror file comments.** If a function exists in both `backend/main.py` and `api/index.py`, the explanatory comments must be in both, not just one.
+
+### Important (fix in this CL or as immediate follow-up)
+6. **CL size.** A CL doing more than one logical thing should be split. Natural splits in this repo: (a) new data source fetch + propagation, (b) processing logic + constants + test, (c) frontend rendering. Target: <200 net lines per CL.
+7. **API response field naming.** Response fields are `camelCase`. Backend internals are `snake_case`. Don't mix at the boundary.
+8. **New derived metrics need coverage.** Any new computed field (basis, skew, hedge ratio, regime label) needs either a `smoke_tests.py` assertion or a unit test demonstrating expected behavior on known inputs.
+
+### Nits (non-blocking)
+- PEP8. No semicolon-joined statements.
+- Frontend: `useMemo` for derived arrays/objects inside panels. Class-level constants (color maps, label maps) live outside the component function.
+- Colors via theme constants, not hex inline.
+- Commit subject ≤ 70 chars. Body explains the *why* when the subject can't.
+
+### Reviewer's mantra
+> Approve once the CL definitely improves overall code health, even if imperfect.
+> Push back on design or scope, not on style preferences covered by these rules.
