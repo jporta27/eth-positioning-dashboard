@@ -222,6 +222,42 @@ def check_etf_total(host):
     return True, f"{checked} days consistent; source={d.get('source')} issuers={len(d.get('issuers', []))}"
 
 
+@check("hl_whales_shape")
+def check_hl_whales(host):
+    """The hyperliquidWhales response must include positions with the spot
+    context fields wired in CL `ea7f365`: `mainnetEth`, `totalSpotEth`, `hedgeLabel`.
+    Without these the frontend table renders garbage. We do NOT assert the
+    mainnet value is > 0 (depends on whether ETHERSCAN_API_KEY is set in env);
+    we only assert the field is present and is the right type."""
+    d = _get(host, "/api/data")
+    if not d:
+        return False, "no response"
+    hl = d.get("hyperliquidWhales") or {}
+    polled = hl.get("polled")
+    if polled is None:
+        return False, "hyperliquidWhales.polled missing"
+    positions = hl.get("positions") or []
+    if not positions:
+        return True, f"no open ETH positions among {polled} polled whales (acceptable — depends on market)"
+    required = {"mainnetEth", "totalSpotEth", "spotUethEth", "hedgeLabel", "side", "sizeEth"}
+    missing_by_pos = []
+    for i, p in enumerate(positions):
+        missing = required - set(p.keys())
+        if missing:
+            missing_by_pos.append(f"pos[{i}] missing {sorted(missing)}")
+    if missing_by_pos:
+        return False, "; ".join(missing_by_pos[:3])
+    # Type sanity: mainnetEth must be numeric (could be 0.0 if env key not set)
+    if not all(isinstance(p.get("mainnetEth"), (int, float)) for p in positions):
+        return False, "mainnetEth is not numeric on at least one position"
+    # hedgeLabel must be one of the documented enum values
+    valid_labels = {"FULLY_HEDGED", "PARTIAL_HEDGE", "DIRECTIONAL_BET", "DOUBLE_BULL", None}
+    bad_label = [p["hedgeLabel"] for p in positions if p.get("hedgeLabel") not in valid_labels]
+    if bad_label:
+        return False, f"unknown hedgeLabel values: {bad_label[:3]}"
+    return True, f"{len(positions)} positions, all fields present, labels valid"
+
+
 # ── Runner ───────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
@@ -249,6 +285,7 @@ def main():
     check_stables(args.host)
     check_basis_deribit(args.host)
     check_etf_total(args.host)
+    check_hl_whales(args.host)
 
     print()
     print("=" * 60)
