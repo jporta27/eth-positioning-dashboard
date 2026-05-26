@@ -2041,20 +2041,27 @@ async def fetch_hyperliquid_whales(client: httpx.AsyncClient) -> Optional[dict]:
         return None
 
     async def _fetch_one(addr):
-        try:
-            r = await client.post(f"{HYPERLIQUID_API}/info",
-                                  json={"type": "clearinghouseState", "user": addr}, timeout=8.0)
-            r.raise_for_status()
-            return addr, r.json()
-        except Exception:
-            return addr, None
+        """Fetch perp + spot clearinghouseState in parallel for one address."""
+        async def _one(req_type):
+            try:
+                r = await client.post(f"{HYPERLIQUID_API}/info",
+                                      json={"type": req_type, "user": addr}, timeout=8.0)
+                r.raise_for_status()
+                return r.json()
+            except Exception:
+                return None
+        p, s = await asyncio.gather(_one("clearinghouseState"), _one("spotClearinghouseState"),
+                                    return_exceptions=True)
+        return addr, {"perp": p if isinstance(p, dict) else None,
+                      "spot": s if isinstance(s, dict) else None}
 
     results = await asyncio.gather(*[_fetch_one(a) for a in HYPERLIQUID_WHALE_ADDRESSES], return_exceptions=True)
     out = {}
     for r in results:
         if isinstance(r, tuple):
-            a, s = r
-            if isinstance(s, dict): out[a] = s
+            a, bundle = r
+            if isinstance(bundle, dict) and (bundle.get("perp") or bundle.get("spot")):
+                out[a] = bundle
     if out:
         hl_whales_cache = out
         hl_whales_cache_ts = now
@@ -2063,12 +2070,33 @@ async def fetch_hyperliquid_whales(client: httpx.AsyncClient) -> Optional[dict]:
 
 def process_hyperliquid_whales(raw, eth_spot_price):
     if not raw or not isinstance(raw, dict):
-        return {"positions": [], "aggregate": {}, "liqClusters": [], "polled": 0}
+        return {"positions": [], "spotHoldings": [], "aggregate": {}, "liqClusters": [], "polled": 0}
     spot = float(eth_spot_price or 0)
+
+    def _parse_spot(spot_state):
+        out = {"ueth": 0.0, "usdc": 0.0, "hype": 0.0}
+        if not isinstance(spot_state, dict): return out
+        for b in (spot_state.get("balances") or []):
+            try:
+                coin = (b.get("coin") or "").upper(); total = float(b.get("total") or 0)
+                if coin == "UETH": out["ueth"] = total
+                elif coin == "USDC": out["usdc"] = total
+                elif coin == "HYPE": out["hype"] = total
+            except (ValueError, TypeError): continue
+        return out
+
+    spot_by_addr = {}
+    for addr, bundle in raw.items():
+        if not isinstance(bundle, dict): continue
+        spot_state = bundle.get("spot") if "perp" in bundle or "spot" in bundle else None
+        spot_by_addr[addr] = _parse_spot(spot_state)
+
     positions = []
-    for addr, state in raw.items():
-        if not isinstance(state, dict): continue
-        for ap in (state.get("assetPositions") or []):
+    for addr, bundle in raw.items():
+        if not isinstance(bundle, dict): continue
+        perp_state = bundle.get("perp") if ("perp" in bundle or "spot" in bundle) else bundle
+        if not isinstance(perp_state, dict): continue
+        for ap in (perp_state.get("assetPositions") or []):
             pos = (ap or {}).get("position") or {}
             if pos.get("coin") != "ETH": continue
             try:
@@ -2083,6 +2111,16 @@ def process_hyperliquid_whales(raw, eth_spot_price):
                 size_eth = abs(szi); size_usd = size_eth * (spot or entry_px)
                 side = "LONG" if szi > 0 else "SHORT"
                 dist = round((liq_px - spot) / spot * 100, 2) if liq_px and spot else None
+
+                spot_bal = spot_by_addr.get(addr, {"ueth": 0.0, "usdc": 0.0, "hype": 0.0})
+                ueth_spot = spot_bal["ueth"]; usdc_spot = spot_bal["usdc"]
+                hedge_ratio = None; hedge_label = None
+                if side == "SHORT" and size_eth > 0:
+                    hedge_ratio = round(min(ueth_spot / size_eth, 1.0), 3)
+                    hedge_label = "FULLY_HEDGED" if hedge_ratio >= 0.8 else "PARTIAL_HEDGE" if hedge_ratio >= 0.3 else "DIRECTIONAL_BET"
+                elif side == "LONG" and size_eth > 0:
+                    hedge_label = "DOUBLE_BULL" if ueth_spot >= size_eth * 0.3 else "DIRECTIONAL_BET"
+
                 positions.append({
                     "address": addr, "addressShort": addr[:6] + "…" + addr[-4:],
                     "side": side, "sizeEth": round(size_eth, 4), "sizeUsd": round(size_usd),
@@ -2090,6 +2128,10 @@ def process_hyperliquid_whales(raw, eth_spot_price):
                     "liqPx": round(liq_px, 2) if liq_px else None,
                     "leverage": lev, "marginType": margin_type,
                     "unrealizedPnlUsd": round(unrealized), "distToLiqPct": dist,
+                    "spotUethEth": round(ueth_spot, 4),
+                    "spotUethUsd": round(ueth_spot * spot) if spot else None,
+                    "spotUsdc": round(usdc_spot),
+                    "hedgeRatio": hedge_ratio, "hedgeLabel": hedge_label,
                 })
             except (ValueError, TypeError, KeyError):
                 continue
@@ -2104,12 +2146,29 @@ def process_hyperliquid_whales(raw, eth_spot_price):
         key = (round(p["liqPx"] / BIN) * BIN, p["side"])
         c = cluster_d.setdefault(key, {"priceLevel": key[0], "side": p["side"], "sizeUsd": 0, "count": 0})
         c["sizeUsd"] += p["sizeUsd"]; c["count"] += 1
+
+    spot_only = []
+    for addr, bal in spot_by_addr.items():
+        if bal["ueth"] > 0:
+            spot_only.append({
+                "address": addr, "addressShort": addr[:6] + "…" + addr[-4:],
+                "uethEth": round(bal["ueth"], 4),
+                "uethUsd": round(bal["ueth"] * spot) if spot else None,
+                "usdc": round(bal["usdc"]),
+            })
+    spot_only.sort(key=lambda x: x["uethEth"], reverse=True)
+    total_spot_ueth = sum(s["uethEth"] for s in spot_only)
+
     return {
         "positions": positions,
+        "spotHoldings": spot_only,
         "aggregate": {"totalLongUsd": round(total_l), "totalShortUsd": round(total_s),
                       "netUsd": round(total_l - total_s), "longCount": len(longs), "shortCount": len(shorts),
                       "whalesWithEthCount": len({p["address"] for p in positions}),
-                      "totalWhalesPolled": len(raw)},
+                      "totalWhalesPolled": len(raw),
+                      "totalSpotUethEth": round(total_spot_ueth, 2),
+                      "totalSpotUethUsd": round(total_spot_ueth * spot) if spot else None,
+                      "spotHoldersCount": len(spot_only)},
         "liqClusters": sorted(cluster_d.values(), key=lambda c: c["priceLevel"]),
         "polled": len(raw),
     }

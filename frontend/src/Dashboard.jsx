@@ -2704,6 +2704,20 @@ function HyperliquidWhalesPanel({ hyperliquidWhales, spotPrice }) {
   const positions = hl.positions || []
   const agg = hl.aggregate || {}
   const clusters = hl.liqClusters || []
+  const spotHoldings = hl.spotHoldings || []
+
+  const hedgeColor = {
+    'FULLY_HEDGED': '#22c55e',
+    'PARTIAL_HEDGE': '#f59e0b',
+    'DIRECTIONAL_BET': '#ef4444',
+    'DOUBLE_BULL': '#a78bfa',
+  }
+  const hedgeShort = {
+    'FULLY_HEDGED': 'HEDGE',
+    'PARTIAL_HEDGE': 'PARTIAL',
+    'DIRECTIONAL_BET': 'BET',
+    'DOUBLE_BULL': 'DBL BULL',
+  }
 
   const fmtUsd = (n) => {
     if (n == null) return '—'
@@ -2774,6 +2788,8 @@ function HyperliquidWhalesPanel({ hyperliquidWhales, spotPrice }) {
                 <th style={{ padding: '6px 8px', textAlign: 'right', borderBottom: '1px solid #1a2544' }}>LIQ $</th>
                 <th style={{ padding: '6px 8px', textAlign: 'right', borderBottom: '1px solid #1a2544' }}>DIST LIQ</th>
                 <th style={{ padding: '6px 8px', textAlign: 'right', borderBottom: '1px solid #1a2544' }}>uPnL</th>
+                <th style={{ padding: '6px 8px', textAlign: 'right', borderBottom: '1px solid #1a2544' }}>SPOT UETH</th>
+                <th style={{ padding: '6px 8px', textAlign: 'center', borderBottom: '1px solid #1a2544' }}>EXPOSURE</th>
               </tr>
             </thead>
             <tbody>
@@ -2807,12 +2823,57 @@ function HyperliquidWhalesPanel({ hyperliquidWhales, spotPrice }) {
                                color: p.unrealizedPnlUsd > 0 ? '#22c55e' : p.unrealizedPnlUsd < 0 ? '#ef4444' : '#5a6a8a' }}>
                     {p.unrealizedPnlUsd > 0 ? '+' : ''}{fmtUsd(p.unrealizedPnlUsd)}
                   </td>
+                  <td style={{ padding: '6px 8px', textAlign: 'right',
+                               color: p.spotUethEth > 0 ? '#c8d6e5' : '#3a4a6a' }}>
+                    {p.spotUethEth > 0 ? `${p.spotUethEth.toLocaleString(undefined, { maximumFractionDigits: 2 })} (${fmtUsd(p.spotUethUsd)})` : '—'}
+                  </td>
+                  <td style={{ padding: '6px 8px', textAlign: 'center' }}>
+                    {p.hedgeLabel && (
+                      <span style={{
+                        padding: '2px 6px', borderRadius: 4, fontSize: 9, fontWeight: 700,
+                        background: `${hedgeColor[p.hedgeLabel]}22`,
+                        color: hedgeColor[p.hedgeLabel],
+                        border: `1px solid ${hedgeColor[p.hedgeLabel]}`,
+                      }} title={p.hedgeRatio != null ? `hedge ratio: ${(p.hedgeRatio*100).toFixed(0)}%` : ''}>
+                        {hedgeShort[p.hedgeLabel] || p.hedgeLabel}
+                      </span>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
       )}
+
+      {/* Spot-only holders: wallets with UETH spot but no perp position */}
+      {(() => {
+        const perpAddrs = new Set(positions.map(p => p.address))
+        const spotOnly = spotHoldings.filter(s => !perpAddrs.has(s.address))
+        if (spotOnly.length === 0) return null
+        return (
+          <div style={{ marginBottom: 12, padding: '10px 12px', borderRadius: 6, background: '#0a1020', border: '1px solid #1a2544' }}>
+            <div style={{ fontSize: 10, color: '#5a6a8a', letterSpacing: 1, marginBottom: 6 }}>
+              WALLETS CON SOLO SPOT UETH (sin perp ETH abierto)
+              <span style={{ marginLeft: 8, color: '#3a4a6a' }}>
+                total: {agg.totalSpotUethEth || 0} ETH · {fmtUsd(agg.totalSpotUethUsd)}
+              </span>
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {spotOnly.map((s, i) => (
+                <div key={i} style={{ padding: '4px 8px', borderRadius: 4, background: '#0f1830', fontSize: 10, ...S.mono }}>
+                  <a href={`https://hypurrscan.io/address/${s.address}`} target="_blank" rel="noopener" style={{ color: '#a78bfa', textDecoration: 'none' }}>
+                    {s.addressShort}
+                  </a>
+                  <span style={{ color: '#c8d6e5', marginLeft: 6 }}>
+                    {s.uethEth.toLocaleString(undefined, { maximumFractionDigits: 2 })} UETH ({fmtUsd(s.uethUsd)})
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )
+      })()}
 
       {/* Liq clusters overlay (real prices, not heuristic) */}
       {clusters.length > 0 && (

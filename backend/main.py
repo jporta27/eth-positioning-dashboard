@@ -3503,29 +3503,42 @@ async def fetch_hyperliquid_whales(
         return None
 
     async def _fetch_one(addr: str):
-        try:
-            r = await client.post(
-                f"{HYPERLIQUID_API}/info",
-                json={"type": "clearinghouseState", "user": addr},
-                timeout=10.0,
-            )
-            r.raise_for_status()
-            return addr, r.json()
-        except Exception as e:
-            logger.debug(f"HL whale fetch failed for {addr}: {e}")
-            return addr, None
+        """Fetch BOTH perp clearinghouseState AND spotClearinghouseState in parallel
+        for a single address. Spot lets us see if the perp short is hedged by
+        physical ETH (UETH wrapped) the wallet holds — totally different read."""
+        async def _one(req_type):
+            try:
+                r = await client.post(
+                    f"{HYPERLIQUID_API}/info",
+                    json={"type": req_type, "user": addr},
+                    timeout=10.0,
+                )
+                r.raise_for_status()
+                return r.json()
+            except Exception as e:
+                logger.debug(f"HL {req_type} fetch failed for {addr}: {e}")
+                return None
+        perp_state, spot_state = await asyncio.gather(
+            _one("clearinghouseState"),
+            _one("spotClearinghouseState"),
+            return_exceptions=True,
+        )
+        return addr, {
+            "perp": perp_state if isinstance(perp_state, dict) else None,
+            "spot": spot_state if isinstance(spot_state, dict) else None,
+        }
 
     results = await asyncio.gather(*[_fetch_one(a) for a in addrs], return_exceptions=True)
     out = {}
     for r in results:
         if isinstance(r, tuple):
-            addr, state = r
-            if isinstance(state, dict):
-                out[addr] = state
+            addr, bundle = r
+            if isinstance(bundle, dict) and (bundle.get("perp") or bundle.get("spot")):
+                out[addr] = bundle
     if out:
         hl_whales_cache = out
         hl_whales_cache_ts = now
-        logger.info(f"HL whales fetched: {len(out)}/{len(addrs)} addresses")
+        logger.info(f"HL whales fetched: {len(out)}/{len(addrs)} addresses (perp+spot)")
     return out or None
 
 
@@ -3546,11 +3559,37 @@ def process_hyperliquid_whales(
         return {"positions": [], "aggregate": {}, "liqClusters": [], "polled": 0}
 
     spot = float(eth_spot_price or 0)
+
+    def _parse_spot_balances(spot_state):
+        """Pull (ueth, usdc, hype) balances from spotClearinghouseState. Returns
+        floats (0 if missing). UETH is the wrapped ETH spot token on HL."""
+        out = {"ueth": 0.0, "usdc": 0.0, "hype": 0.0}
+        if not isinstance(spot_state, dict): return out
+        for b in (spot_state.get("balances") or []):
+            try:
+                coin = (b.get("coin") or "").upper()
+                total = float(b.get("total") or 0)
+                if coin == "UETH": out["ueth"] = total
+                elif coin == "USDC": out["usdc"] = total
+                elif coin == "HYPE": out["hype"] = total
+            except (ValueError, TypeError): continue
+        return out
+
+    # Pre-compute spot balances per address so each ETH position knows its spot context
+    spot_by_addr = {}
+    for addr, bundle in raw.items():
+        if not isinstance(bundle, dict): continue
+        # Backward-compat: if bundle is the old flat clearinghouseState shape, treat as perp-only
+        spot_state = bundle.get("spot") if "perp" in bundle or "spot" in bundle else None
+        spot_by_addr[addr] = _parse_spot_balances(spot_state)
+
     positions = []
-    for addr, state in raw.items():
-        if not isinstance(state, dict):
-            continue
-        for ap in (state.get("assetPositions") or []):
+    for addr, bundle in raw.items():
+        if not isinstance(bundle, dict): continue
+        # New shape: {"perp": {...}, "spot": {...}}; fall back to old flat shape
+        perp_state = bundle.get("perp") if ("perp" in bundle or "spot" in bundle) else bundle
+        if not isinstance(perp_state, dict): continue
+        for ap in (perp_state.get("assetPositions") or []):
             pos = (ap or {}).get("position") or {}
             if pos.get("coin") != "ETH":
                 continue
@@ -3570,6 +3609,27 @@ def process_hyperliquid_whales(
                 dist_to_liq_pct = None
                 if liq_px and spot:
                     dist_to_liq_pct = round((liq_px - spot) / spot * 100, 2)
+
+                # Spot context: is the perp position hedged by physical ETH on spot?
+                # hedge_ratio: % of perp size covered by UETH spot held by same wallet
+                # Only meaningful for SHORT perp (long ETH spot offsets short perp); LONG
+                # perp + UETH spot = double bullish (concentration, not hedge)
+                spot_bal = spot_by_addr.get(addr, {"ueth": 0.0, "usdc": 0.0, "hype": 0.0})
+                ueth_spot = spot_bal["ueth"]
+                usdc_spot = spot_bal["usdc"]
+                hedge_ratio = None
+                hedge_label = None
+                if side == "SHORT" and size_eth > 0:
+                    hedge_ratio = round(min(ueth_spot / size_eth, 1.0), 3)
+                    if hedge_ratio >= 0.8: hedge_label = "FULLY_HEDGED"
+                    elif hedge_ratio >= 0.3: hedge_label = "PARTIAL_HEDGE"
+                    else: hedge_label = "DIRECTIONAL_BET"
+                elif side == "LONG" and size_eth > 0:
+                    if ueth_spot >= size_eth * 0.3:
+                        hedge_label = "DOUBLE_BULL"  # perp long + spot long = concentration
+                    else:
+                        hedge_label = "DIRECTIONAL_BET"
+
                 positions.append({
                     "address": addr,
                     "addressShort": addr[:6] + "…" + addr[-4:],
@@ -3582,6 +3642,12 @@ def process_hyperliquid_whales(
                     "marginType": margin_type,
                     "unrealizedPnlUsd": round(unrealized_pnl),
                     "distToLiqPct": dist_to_liq_pct,
+                    # Spot context (HL spot only — mainnet balance is a future addition)
+                    "spotUethEth": round(ueth_spot, 4),
+                    "spotUethUsd": round(ueth_spot * spot) if spot else None,
+                    "spotUsdc": round(usdc_spot),
+                    "hedgeRatio": hedge_ratio,
+                    "hedgeLabel": hedge_label,
                 })
             except (ValueError, TypeError, KeyError):
                 continue
@@ -3608,8 +3674,23 @@ def process_hyperliquid_whales(
         c["count"] += 1
     liq_clusters = sorted(cluster_dict.values(), key=lambda c: c["priceLevel"])
 
+    # Spot-only roster: wallets holding UETH spot (any amount), regardless of perp position
+    spot_only = []
+    for addr, bal in spot_by_addr.items():
+        if bal["ueth"] > 0:
+            spot_only.append({
+                "address": addr,
+                "addressShort": addr[:6] + "…" + addr[-4:],
+                "uethEth": round(bal["ueth"], 4),
+                "uethUsd": round(bal["ueth"] * spot) if spot else None,
+                "usdc": round(bal["usdc"]),
+            })
+    spot_only.sort(key=lambda x: x["uethEth"], reverse=True)
+    total_spot_ueth = sum(s["uethEth"] for s in spot_only)
+
     return {
         "positions": positions,
+        "spotHoldings": spot_only,
         "aggregate": {
             "totalLongUsd":       round(total_long_usd),
             "totalShortUsd":      round(total_short_usd),
@@ -3618,6 +3699,10 @@ def process_hyperliquid_whales(
             "shortCount":         len(shorts),
             "whalesWithEthCount": len({p["address"] for p in positions}),
             "totalWhalesPolled":  len(raw),
+            # Spot aggregates: wallets with any UETH balance, total UETH across all whales
+            "totalSpotUethEth":   round(total_spot_ueth, 2),
+            "totalSpotUethUsd":   round(total_spot_ueth * spot) if spot else None,
+            "spotHoldersCount":   len(spot_only),
         },
         "liqClusters": liq_clusters,
         "polled": len(raw),
