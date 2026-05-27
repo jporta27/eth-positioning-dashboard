@@ -2090,6 +2090,34 @@ async def fetch_etherscan_eth_balances(client, addresses):
     return out
 
 
+# ── Regime classifier snapshot (file-based, see backend/main.py for rationale)
+REGIME_SNAPSHOT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "data", "regime", "latest.json"
+)
+REGIME_CACHE_TTL = 60
+regime_cache: Optional[dict] = None
+regime_cache_ts: float = 0
+
+
+def fetch_regime_snapshot() -> Optional[dict]:
+    """Load HMM K=4 regime snapshot from disk. Refit cadence is weekly via
+    scripts/run_regime_classifier.py — request path just serves the file."""
+    global regime_cache, regime_cache_ts
+    now = time.time()
+    if regime_cache and (now - regime_cache_ts) < REGIME_CACHE_TTL:
+        return regime_cache
+    try:
+        if not os.path.exists(REGIME_SNAPSHOT_PATH):
+            return None
+        with open(REGIME_SNAPSHOT_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        regime_cache = data
+        regime_cache_ts = now
+        return data
+    except Exception:
+        return None
+
+
 async def fetch_hyperliquid_whales(client: httpx.AsyncClient) -> Optional[dict]:
     """Poll clearinghouseState + spotClearinghouseState + mainnet ETH balance
     for each curated whale address. Cached HYPERLIQUID_WHALES_CACHE_TTL.
@@ -3237,6 +3265,7 @@ async def fetch_all_data() -> dict:
         ),
         "ethBtcRotation": ethbtc_taker_raw if isinstance(ethbtc_taker_raw, dict) else None,
         "defiEthMap": defi_eth_map_raw if isinstance(defi_eth_map_raw, dict) else None,
+        "regime": fetch_regime_snapshot(),
         "hyperliquidWhales": process_hyperliquid_whales(
             hl_whales_raw if isinstance(hl_whales_raw, dict) else None,
             eth_spot_price=spot,

@@ -2701,6 +2701,194 @@ function LongShortPanel({ longShort, signal }) {
 // are operational gas amounts on HL trading wallets, not real custody.
 const DUST_ETH_THRESHOLD = 0.01
 
+// ── Regime classifier panel (HMM K=4) ────────────────────────────────
+// Reads the snapshot produced by scripts/run_regime_classifier.py (re-fit
+// weekly). Renders current state, posterior probabilities, expected dwell,
+// transition forecast at 4h/24h/4d/8d horizons.
+const REGIME_COLORS = {
+  CRASH:  '#ef4444',   // red — mid-vol bearish drift
+  STRESS: '#f59e0b',   // amber — high-vol expansion
+  CHOP:   '#8a9ac0',   // gray — calm sideways
+  UP:     '#22c55e',   // green — calm bull grind
+}
+const REGIME_DESC = {
+  CRASH:  'Bear drift con vol moderada',
+  STRESS: 'Vol expansion (cascade/squeeze/melt-up)',
+  CHOP:   'Consolidación calma, vol muy baja',
+  UP:     'Grind alcista, vol baja',
+}
+const MODEL_STALE_DAYS = 14   // warn if model > 14d old (refit cadence is 7d)
+
+function RegimePanel({ regime }) {
+  if (!regime) return (
+    <div style={{ ...S.mono, color: '#5a6a8a', fontSize: 11 }}>
+      Sin snapshot del clasificador. Correr <code>python scripts/run_regime_classifier.py --refit</code>.
+    </div>
+  )
+
+  const labels = ['CRASH', 'STRESS', 'CHOP', 'UP']
+  const cur = regime.currentState
+  const conf = regime.confidence
+  const probs = regime.probabilities || {}
+  const fc = regime.transitionForecast || {}
+  const tm = regime.transitionMatrix || {}
+  const ageDays = regime.modelAgeDays
+  const stale = ageDays != null && ageDays > MODEL_STALE_DAYS
+
+  const fmtPct = (x) => x == null ? '—' : `${(x * 100).toFixed(1)}%`
+
+  return (
+    <div>
+      {/* Headline: current state + confidence */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 12 }}>
+        <div style={{ padding: '10px 12px', borderRadius: 6, background: '#0a1020',
+                      border: `2px solid ${REGIME_COLORS[cur] || '#1a2544'}` }}>
+          <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1 }}>ESTADO ACTUAL</div>
+          <div style={{ ...S.mono, fontSize: 22, fontWeight: 700, color: REGIME_COLORS[cur] || '#c8d6e5' }}>{cur}</div>
+          <div style={{ fontSize: 9, color: '#5a6a8a' }}>{REGIME_DESC[cur] || ''}</div>
+        </div>
+        <div style={{ padding: '10px 12px', borderRadius: 6, background: '#0a1020', border: '1px solid #1a2544' }}>
+          <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1 }}>CONFIANZA</div>
+          <div style={{ ...S.mono, fontSize: 22, fontWeight: 700,
+                        color: conf > 0.85 ? '#22c55e' : conf > 0.6 ? '#f59e0b' : '#ef4444' }}>
+            {fmtPct(conf)}
+          </div>
+          <div style={{ fontSize: 9, color: '#5a6a8a' }}>
+            entropía {regime.entropy != null ? regime.entropy.toFixed(2) : '—'} nat
+          </div>
+        </div>
+        <div style={{ padding: '10px 12px', borderRadius: 6, background: '#0a1020', border: '1px solid #1a2544' }}>
+          <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1 }}>DWELL ESPERADO</div>
+          <div style={{ ...S.mono, fontSize: 22, fontWeight: 700, color: '#c8d6e5' }}>
+            {regime.expectedDwellHours != null ? `${regime.expectedDwellHours.toFixed(0)}h` : '—'}
+          </div>
+          <div style={{ fontSize: 9, color: '#5a6a8a' }}>tiempo medio restante en {cur}</div>
+        </div>
+        <div style={{ padding: '10px 12px', borderRadius: 6, background: '#0a1020',
+                      border: `1px solid ${stale ? '#ef4444' : '#1a2544'}` }}>
+          <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1 }}>MODELO</div>
+          <div style={{ ...S.mono, fontSize: 14, fontWeight: 700,
+                        color: stale ? '#ef4444' : '#c8d6e5' }}>
+            {ageDays != null ? `${ageDays.toFixed(1)}d` : '—'}
+            {stale && <span style={{ marginLeft: 6, fontSize: 10 }}>STALE</span>}
+          </div>
+          <div style={{ fontSize: 9, color: '#5a6a8a' }}>
+            HMM K=4, fit on {regime.modelTrainNObs} bars
+          </div>
+        </div>
+      </div>
+
+      {/* Posterior probability bars */}
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 10, color: '#5a6a8a', letterSpacing: 1, marginBottom: 6 }}>
+          POSTERIOR (forward-backward sobre últimas 2190 barras 4h ≈ 1 año)
+        </div>
+        {labels.map(label => {
+          const p = probs[label] || 0
+          return (
+            <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+              <div style={{ width: 60, fontSize: 11, ...S.mono, color: REGIME_COLORS[label] }}>{label}</div>
+              <div style={{ flex: 1, height: 14, background: '#0a1020', borderRadius: 3, overflow: 'hidden' }}>
+                <div style={{ width: `${p * 100}%`, height: '100%',
+                              background: REGIME_COLORS[label], opacity: 0.75 }} />
+              </div>
+              <div style={{ width: 60, fontSize: 11, ...S.mono, textAlign: 'right', color: '#c8d6e5' }}>
+                {fmtPct(p)}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+
+      {/* Transition forecast at multiple horizons */}
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 10, color: '#5a6a8a', letterSpacing: 1, marginBottom: 6 }}>
+          PRONÓSTICO DE TRANSICIÓN — P(estado dentro de H bars | estado actual = {cur})
+        </div>
+        <div style={{ overflow: 'auto' }}>
+          <table style={{ ...S.mono, width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ color: '#5a6a8a', fontSize: 9, letterSpacing: 1 }}>
+                <th style={{ padding: '6px 8px', textAlign: 'left', borderBottom: '1px solid #1a2544' }}>HORIZONTE</th>
+                {labels.map(l => (
+                  <th key={l} style={{ padding: '6px 8px', textAlign: 'right',
+                                        borderBottom: '1px solid #1a2544', color: REGIME_COLORS[l] }}>{l}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {[['1bar', '+1 bar (+4h)'], ['6bar', '+6 bars (+24h)'],
+                ['24bar', '+24 bars (+4d)'], ['48bar', '+48 bars (+8d)']].map(([key, label]) => {
+                const row = fc[key] || {}
+                return (
+                  <tr key={key} style={{ borderBottom: '1px solid #0f1830' }}>
+                    <td style={{ padding: '6px 8px', color: '#8a9ac0' }}>{label}</td>
+                    {labels.map(l => {
+                      const v = row[l] || 0
+                      const isMax = Object.values(row).every(x => v >= x)
+                      return (
+                        <td key={l} style={{ padding: '6px 8px', textAlign: 'right',
+                                              fontWeight: isMax ? 700 : 400,
+                                              color: isMax ? REGIME_COLORS[l] : '#c8d6e5' }}>
+                          {fmtPct(v)}
+                        </td>
+                      )
+                    })}
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Transition matrix (full) */}
+      <div style={{ padding: '10px 12px', borderRadius: 6, background: '#0a1020', border: '1px solid #1a2544' }}>
+        <div style={{ fontSize: 10, color: '#5a6a8a', letterSpacing: 1, marginBottom: 6 }}>
+          MATRIZ DE TRANSICIÓN (1 bar = 4h, diagonal = persistencia)
+        </div>
+        <table style={{ ...S.mono, width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
+          <thead>
+            <tr style={{ color: '#5a6a8a', fontSize: 9, letterSpacing: 1 }}>
+              <th style={{ padding: '4px 6px', textAlign: 'left' }}>desde \ a</th>
+              {labels.map(l => (
+                <th key={l} style={{ padding: '4px 6px', textAlign: 'right', color: REGIME_COLORS[l] }}>{l}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {labels.map(from => {
+              const row = tm[from] || {}
+              return (
+                <tr key={from}>
+                  <td style={{ padding: '4px 6px', color: REGIME_COLORS[from] }}>{from}</td>
+                  {labels.map(to => {
+                    const v = row[to] || 0
+                    const isDiag = from === to
+                    return (
+                      <td key={to} style={{ padding: '4px 6px', textAlign: 'right',
+                                             color: isDiag ? '#c8d6e5' : '#5a6a8a',
+                                             fontWeight: isDiag ? 700 : 400 }}>
+                        {(v * 100).toFixed(2)}%
+                      </td>
+                    )
+                  })}
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <div style={{ fontSize: 9, color: '#3a4a6a', marginTop: 8 }}>
+        Estados: vol primero, dirección segundo. CRASH = vol moderada + drift bearish; STRESS = vol muy alta (cascade/melt-up);
+        CHOP = consolidación muy calma; UP = grind alcista vol baja. Re-fit semanal del HMM.
+        Validación: {regime.modelTrainNObs} barras de entrenamiento, fit logL captura {regime.modelTrainEnd}.
+      </div>
+    </div>
+  )
+}
+
 function HyperliquidWhalesPanel({ hyperliquidWhales, spotPrice }) {
   const hl = hyperliquidWhales
   if (!hl) return <div style={{ ...S.mono, color: '#5a6a8a', fontSize: 11 }}>Sin datos de Hyperliquid</div>
@@ -4144,10 +4332,10 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
 
   // Panel ordering per time horizon — all panels always shown, just reordered
   const horizonOrders = {
-    scalp:    ['state','taker_grid','whale_vs_retail','hyperliquid_whales','orderbook','liqmap','stochastics','setup','mq','funding_grid','options','levels','netflows','iv_grid','ethbtc_grid','vol_vp','takerflow','vp_chart','capitalmap','explanations'],
-    intraday: ['state','setup','mq','funding_grid','netflows','whale_vs_retail','hyperliquid_whales','options','liqmap','levels','taker_grid','stochastics','iv_grid','ethbtc_grid','vol_vp','capitalmap','takerflow','orderbook','vp_chart','explanations'],
-    swing:    ['state','netflows','whale_vs_retail','hyperliquid_whales','mq','options','setup','levels','capitalmap','iv_grid','ethbtc_grid','liqmap','funding_grid','stochastics','vol_vp','taker_grid','takerflow','orderbook','vp_chart','explanations'],
-    macro:    ['state','capitalmap','netflows','whale_vs_retail','hyperliquid_whales','iv_grid','ethbtc_grid','options','mq','levels','setup','funding_grid','vol_vp','liqmap','stochastics','taker_grid','vp_chart','takerflow','orderbook','explanations'],
+    scalp:    ['state','regime','taker_grid','whale_vs_retail','hyperliquid_whales','orderbook','liqmap','stochastics','setup','mq','funding_grid','options','levels','netflows','iv_grid','ethbtc_grid','vol_vp','takerflow','vp_chart','capitalmap','explanations'],
+    intraday: ['state','regime','setup','mq','funding_grid','netflows','whale_vs_retail','hyperliquid_whales','options','liqmap','levels','taker_grid','stochastics','iv_grid','ethbtc_grid','vol_vp','capitalmap','takerflow','orderbook','vp_chart','explanations'],
+    swing:    ['state','regime','netflows','whale_vs_retail','hyperliquid_whales','mq','options','setup','levels','capitalmap','iv_grid','ethbtc_grid','liqmap','funding_grid','stochastics','vol_vp','taker_grid','takerflow','orderbook','vp_chart','explanations'],
+    macro:    ['state','regime','capitalmap','netflows','whale_vs_retail','hyperliquid_whales','iv_grid','ethbtc_grid','options','mq','levels','setup','funding_grid','vol_vp','liqmap','stochastics','taker_grid','vp_chart','takerflow','orderbook','explanations'],
   }
   const panelOrder = horizonOrders[horizon] || horizonOrders.intraday
   const signals = useMemo(() => computeSignals(data, statePeriod, stochTf), [data, statePeriod, stochTf])
@@ -4580,6 +4768,12 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
           ethBtcRotation={data?.ethBtcRotation}
           cexReserves={data?.cexNetflows?.relativeContext || {}}
         />
+      </div>),
+
+      regime: (
+      <div style={{ ...S.card, marginBottom: 10 }}>
+        <div style={S.sectionTitle}>Régimen actual — HMM K=4 (clasificador estructural)</div>
+        <RegimePanel regime={data?.regime} />
       </div>),
 
       whale_vs_retail: (

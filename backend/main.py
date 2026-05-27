@@ -3549,6 +3549,46 @@ async def fetch_etherscan_eth_balances(
     return out
 
 
+# ── Regime classifier (HMM K=4) — see docs/obsidian/03-metrics/ ─────
+# Cheap file-read of the snapshot produced by scripts/run_regime_classifier.py.
+# That script refits the HMM weekly + re-classifies; we just expose its output.
+REGIME_SNAPSHOT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "data", "regime", "latest.json"
+)
+REGIME_CACHE_TTL = 60  # 1 min — file change is rare, no need to re-read often
+regime_cache: Optional[dict] = None
+regime_cache_ts: float = 0
+
+
+def fetch_regime_snapshot() -> Optional[dict]:
+    """Load the regime classifier snapshot from disk.
+
+    Why file-based: the HMM fit + 1-year forward-backward pass is expensive
+    (~30-60s) and runs at refit cadence (weekly). The runtime hot path just
+    serves the most recent snapshot. This decouples model maintenance from
+    request serving.
+
+    The snapshot file gets stale only when:
+      - Cron hasn't run scripts/run_regime_classifier.py --refit-if-stale recently
+      - In which case `modelAgeDays` will be high — frontend can surface that.
+    """
+    global regime_cache, regime_cache_ts
+    now = time.time()
+    if regime_cache and (now - regime_cache_ts) < REGIME_CACHE_TTL:
+        return regime_cache
+    try:
+        if not os.path.exists(REGIME_SNAPSHOT_PATH):
+            return None
+        with open(REGIME_SNAPSHOT_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        regime_cache = data
+        regime_cache_ts = now
+        return data
+    except Exception as e:
+        logger.warning(f"Regime snapshot read failed: {e}")
+        return None
+
+
 async def fetch_hyperliquid_whales(
     client: httpx.AsyncClient,
     addresses: Optional[list] = None,
@@ -4688,6 +4728,7 @@ async def fetch_all_data() -> dict:
             hl_whales_raw if isinstance(hl_whales_raw, dict) else None,
             eth_spot_price=spot,
         ),
+        "regime": fetch_regime_snapshot(),
         "ethBtcRotation": ethbtc_taker_raw if isinstance(ethbtc_taker_raw, dict) else None,
         "defiEthMap": defi_eth_map_raw if isinstance(defi_eth_map_raw, dict) else None,
         # ── Fase 1 · new sources ──────────────────────────────────────

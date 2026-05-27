@@ -3,7 +3,13 @@ dist/
 __pycache__/
 *.pyc
 # Fase 2 persistence output + Fase 3 backfill parquets (large, reproducible)
-data/
+# Trailing slash would also block subdirectory re-inclusion; use /* instead.
+/data/*
+# Regime classifier snapshot is small (~2KB JSON) and needs to ride along with
+# Vercel deploys so the serverless API can serve it. Pickle model stays out.
+!/data/regime/
+/data/regime/*
+!/data/regime/latest.json
 # .env is intentionally tracked — repo is private and keys are needed for backend to work
 .venv
 .DS_Store
