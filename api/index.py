@@ -2113,18 +2113,34 @@ def fetch_regime_snapshot() -> Optional[dict]:
     now = time.time()
     if regime_cache and (now - regime_cache_ts) < REGIME_CACHE_TTL:
         return regime_cache
+    debug_attempts = []
     for path in REGIME_SNAPSHOT_CANDIDATES:
         try:
-            if not os.path.exists(path):
+            exists = os.path.exists(path)
+            debug_attempts.append({"path": path, "exists": exists})
+            if not exists:
                 continue
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             regime_cache = data
             regime_cache_ts = now
             return data
-        except Exception:
+        except Exception as e:
+            debug_attempts.append({"path": path, "exists": False, "error": str(e)})
             continue
-    return None
+    # Surface diagnostic so we can see what Vercel sees at runtime.
+    try:
+        api_dir_listing = os.listdir(_API_DIR)
+    except Exception as e:
+        api_dir_listing = [f"listdir_err: {e}"]
+    return {
+        "_debug": True,
+        "_message": "regime snapshot file not found at any candidate path",
+        "_attempts": debug_attempts,
+        "_api_dir": _API_DIR,
+        "_api_dir_listing": api_dir_listing,
+        "_cwd": os.getcwd(),
+    }
 
 
 async def fetch_hyperliquid_whales(client: httpx.AsyncClient) -> Optional[dict]:
