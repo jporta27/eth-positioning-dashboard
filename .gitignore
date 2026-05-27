@@ -21,3 +21,9 @@ __pycache__/
 .claude/settings.local.json
 
 backend/.env
+
+# Obsidian local UI state — per-user, no need to track
+docs/obsidian/.obsidian/workspace.json
+docs/obsidian/.obsidian/appearance.json
+docs/obsidian/.obsidian/core-plugins.json
+docs/obsidian/.obsidian/graph.json
