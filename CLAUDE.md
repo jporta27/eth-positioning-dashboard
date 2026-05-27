@@ -60,7 +60,7 @@ The parquets are intentionally retained for any future analysis even though the 
 
 ### Deploy targets
 
-- **Vercel** (primary): `vercel.json` rewrites `/api/*` → `api/index.py`, everything else → `frontend/dist/index.html`. Region `sin1`. **`maxDuration: 60s`** — fan-out fetches must fit in this budget.
+- **Vercel** (primary): `vercel.json` rewrites `/api/*` → `api/index.py`, everything else → `frontend/dist/index.html`. Region `sin1`. **`maxDuration: 60s`** — fan-out fetches must fit in this budget. **Any data file the serverless function needs to read at runtime (e.g. `data/regime/latest.json`) must be listed in `functions["api/*.py"].includeFiles`** — Vercel's Python builder only bundles the function file + requirements by default, NOT the rest of the repo.
 - **Railway** (backup): `Dockerfile` builds frontend + serves with uvicorn from `backend.main:app`. Healthcheck at `/api/health`.
 
 ## Project-specific gotchas
