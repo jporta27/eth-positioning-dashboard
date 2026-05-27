@@ -42,6 +42,10 @@ FUNDING_PATH = os.path.join(REPO_ROOT, "data", "backfill", "binance_funding.parq
 MACRO_PATH = os.path.join(REPO_ROOT, "data", "backfill", "macro.parquet")
 MODEL_PATH = os.path.join(REPO_ROOT, "data", "regime", "model.pkl")
 SNAPSHOT_PATH = os.path.join(REPO_ROOT, "data", "regime", "latest.json")
+# Mirror copy adjacent to api/index.py so Vercel's Python builder auto-bundles
+# it with the serverless function (the canonical data/regime/latest.json is
+# outside the function's bundle root).
+API_SNAPSHOT_PATH = os.path.join(REPO_ROOT, "api", "regime_snapshot.json")
 
 
 def load_klines_4h() -> pd.DataFrame:
@@ -118,8 +122,12 @@ def cmd_classify(refit_if_stale: bool = False, save_json: bool = True,
         os.makedirs(os.path.dirname(SNAPSHOT_PATH), exist_ok=True)
         with open(SNAPSHOT_PATH, "w", encoding="utf-8") as f:
             json.dump(out, f, indent=2)
+        # Also write the Vercel-bundleable mirror copy
+        with open(API_SNAPSHOT_PATH, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2)
         if not quiet:
             print(f"[classify] Snapshot written to {SNAPSHOT_PATH}", file=sys.stderr)
+            print(f"[classify] Mirror copy: {API_SNAPSHOT_PATH}", file=sys.stderr)
     if not quiet:
         print(json.dumps(out, indent=2))
     return out

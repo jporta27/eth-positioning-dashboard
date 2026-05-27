@@ -2091,9 +2091,16 @@ async def fetch_etherscan_eth_balances(client, addresses):
 
 
 # ── Regime classifier snapshot (file-based, see backend/main.py for rationale)
-REGIME_SNAPSHOT_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "data", "regime", "latest.json"
-)
+# Vercel's Python builder bundles api/*.py + sibling files automatically, but
+# NOT the rest of the repo. So we keep a snapshot copy at api/regime_snapshot.json
+# (next to this file). The canonical write target of the CLI is still
+# data/regime/latest.json — the CLI mirrors it into api/ for Vercel.
+# Fallback to data/regime/latest.json for local dev when run from repo root.
+_API_DIR = os.path.dirname(os.path.abspath(__file__))
+REGIME_SNAPSHOT_CANDIDATES = [
+    os.path.join(_API_DIR, "regime_snapshot.json"),
+    os.path.join(_API_DIR, "..", "data", "regime", "latest.json"),
+]
 REGIME_CACHE_TTL = 60
 regime_cache: Optional[dict] = None
 regime_cache_ts: float = 0
@@ -2106,16 +2113,18 @@ def fetch_regime_snapshot() -> Optional[dict]:
     now = time.time()
     if regime_cache and (now - regime_cache_ts) < REGIME_CACHE_TTL:
         return regime_cache
-    try:
-        if not os.path.exists(REGIME_SNAPSHOT_PATH):
-            return None
-        with open(REGIME_SNAPSHOT_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        regime_cache = data
-        regime_cache_ts = now
-        return data
-    except Exception:
-        return None
+    for path in REGIME_SNAPSHOT_CANDIDATES:
+        try:
+            if not os.path.exists(path):
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            regime_cache = data
+            regime_cache_ts = now
+            return data
+        except Exception:
+            continue
+    return None
 
 
 async def fetch_hyperliquid_whales(client: httpx.AsyncClient) -> Optional[dict]:
