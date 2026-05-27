@@ -45,6 +45,8 @@ There are **two backend entry points serving the same logic** and they must be k
 
 When changing data logic (signal computation, processing functions like `process_dune_netflows`, `process_options_skew`, etc.) you **must update both files**. `api/index.py` typically lags or simplifies; check both with `grep -n` after editing.
 
+**Import drift trap**: when porting a function from `backend/main.py` to `api/index.py`, verify EVERY stdlib/3rd-party name the function uses is imported at the top of the target file. `backend/main.py` has accumulated more imports than `api/index.py` over time. A function that uses `json.load(...)` will silently return None in production if `import json` is missing — most exception handlers are `except Exception: continue` and won't surface a NameError. Always `grep -n "^import\|^from" api/index.py` after porting.
+
 Known drift today (per audit): `api/index.py` does NOT yet emit `etfFlows`, `stablesSupply`, `macro`, `riskFreeRate`, `deribitBasis`, `perpBasis`, `optionsSkew`, `optionsExpiries`. Those panels render in dev but stay empty in prod.
 
 ### Frontend
