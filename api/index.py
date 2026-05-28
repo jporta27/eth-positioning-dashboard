@@ -3324,7 +3324,7 @@ app = FastAPI(title="ETH Positioning Dashboard", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],   # POST for /api/log/state-snapshot
     allow_headers=["*"],
 )
 
