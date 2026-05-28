@@ -133,15 +133,42 @@ def cmd_classify(refit_if_stale: bool = False, save_json: bool = True,
     return out
 
 
+def cmd_refresh_data() -> None:
+    """Re-run backfill for the 3 data sources the classifier consumes.
+
+    Without this, the classifier sees frozen historical features even after a
+    refit — the parquets only update when scripts/backfill.py runs. The user
+    discovered this when the panel showed regime=UP while live price was
+    dropping 2.59%; the model was trained on data 29 days stale.
+    """
+    import subprocess
+    backfill_script = os.path.join(REPO_ROOT, "scripts", "backfill.py")
+    print(f"[refresh] Running backfill (klines, funding, macro, 5y) ...", file=sys.stderr)
+    result = subprocess.run(
+        [sys.executable, backfill_script, "--sources",
+         "binance_klines_1h,binance_funding,macro", "--years", "5"],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=600,
+    )
+    if result.returncode != 0:
+        print(f"[refresh] backfill failed:\n{result.stderr[-2000:]}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"[refresh] Backfill OK.", file=sys.stderr)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--refit", action="store_true", help="Full retrain on latest window")
     p.add_argument("--refit-if-stale", action="store_true",
                    help="Refit only if model is older than REFIT_EVERY_DAYS")
+    p.add_argument("--refresh-data", action="store_true",
+                   help="Re-run backfill for klines/funding/macro before fit. "
+                        "Use this for the weekly cron — otherwise the parquets go stale.")
     p.add_argument("--no-save", action="store_true",
                    help="Don't write the snapshot JSON (default: write to data/regime/latest.json)")
     p.add_argument("--quiet", action="store_true", help="Suppress JSON stdout (still writes file)")
     args = p.parse_args()
+    if args.refresh_data:
+        cmd_refresh_data()
     if args.refit:
         cmd_refit()
         # Always re-classify after a refit so the snapshot reflects the new model

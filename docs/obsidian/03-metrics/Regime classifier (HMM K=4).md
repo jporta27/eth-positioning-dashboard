@@ -220,13 +220,22 @@ If the snapshot file is older than `MODEL_STALE_DAYS = 14` (2× the cadence), th
 
 ```bash
 cd C:/Users/Jorge/Downloads/setup-eth/eth-positioning-dashboard
-python scripts/run_regime_classifier.py --refit
-git add data/regime/latest.json
+python scripts/run_regime_classifier.py --refresh-data --refit
+git add data/regime/latest.json api/regime_snapshot.json
 git commit -m "regime: weekly refit YYYY-MM-DD"
 git push origin master
 ```
 
+`--refresh-data` re-runs the backfill for klines + funding + macro BEFORE
+fitting. Without it, the parquets stay frozen at the date of the last manual
+backfill — the model would be re-trained on stale data and the classification
+won't reflect current market.
+
 Vercel auto-deploys, snapshot is live in production within ~2 min.
+
+**Symptom you'll see if you forget --refresh-data**: panel shows regime=UP
+when price is clearly dropping. Cause: `modelTrainEnd` is weeks-old; the
+quick stats bar shows LIVE price but the regime is from the stale parquets.
 
 ### When the model fails to fit
 
