@@ -3352,3 +3352,12 @@ async def health():
         "runtime": "vercel-serverless",
         "cache_age": round(time.time() - cache_ts, 1) if cache_ts else None,
     }
+
+
+# ── Market State Score logging — Vercel no-op mirror ─────────────────
+# The local backend persists to data/state_log/YYYY-MM-DD.jsonl. Vercel's
+# serverless filesystem is ephemeral, so this mirror just returns ok=false
+# silently — the frontend's fire-and-forget POST won't error.
+@app.post("/api/log/state-snapshot")
+async def log_state_snapshot():
+    return {"ok": False, "reason": "vercel-ephemeral-fs"}

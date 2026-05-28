@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect } from 'react'
+import { useMemo, useState, useEffect, useRef } from 'react'
 
 // ── Helpers ──────────────────────────────────────────────────────────
 const fmt = (n, d = 2) => {
@@ -4013,6 +4013,32 @@ function computeSignals(data, period = '1h', stochTf = '1h') {
   }
   const w = W[period] || W['1h']
 
+  // ── P1: Intensity modulator (quant review — Prioridad 1) ──────────
+  // For flow-based factors (taker, L/S), we scale the base contribution by
+  // how INTENSE the current reading is relative to its typical magnitude.
+  // The review's design constraint: "centered at 1.0 for typical so it's
+  // neutral on average — only deviates at extremes". This closes the gap
+  // where weak imbalances were getting the same score as strong ones.
+  //
+  // TYPICAL_* values are calibration constants (priors). To replace with
+  // measured posteriors once the validation pipeline has ~1 month of data:
+  // run scripts/validate_score_magnitude.py with --calibrate-typicals.
+  const TYPICAL_TAKER_LOG_INTENSITY = 0.05  // |log(ratio)|; 1.05/0.95 ≈ 0.05
+  const TYPICAL_LS_DIVERGENCE       = 0.30  // |retailRatio − topRatio|
+  const MOD_CLIP_LO = 0.5
+  const MOD_CLIP_HI = 1.5
+  const clip = (v, lo, hi) => Math.max(lo, Math.min(hi, v))
+  const intensityModulator = (current, typical) => {
+    if (typical <= 0 || !Number.isFinite(current)) return 1.0
+    return clip(current / typical, MOD_CLIP_LO, MOD_CLIP_HI)
+  }
+
+  // For the validation log we want to compare score WITH and WITHOUT modulator.
+  // Rather than running the whole 12-factor pipeline twice, we track only the
+  // DELTA introduced by the modulator on the affected factors (taker, L/S).
+  // scorePreModulator = score (final) − modulatorDelta. Computed at the end.
+  let modulatorDelta = 0
+
   const states = []
   let score = 0
 
@@ -4045,21 +4071,45 @@ function computeSignals(data, period = '1h', stochTf = '1h') {
     else if (oiChange < -5 && priceChg24h > 2)  states.push('OI↓ + Precio↑ → shorts liquidándose')
   }
 
-  // ── 3. Taker flow (peso: w.taker) ──
+  // ── 3. Taker flow (peso: w.taker, MODULADO POR INTENSIDAD — P1) ──
+  // Base contribution = period-weighted thresholds (1.15 = full, 1.05 = half).
+  // Modulator scales by current intensity (|log(ratio)|) vs typical.
+  // At typical intensity the modulator is 1.0 → no change vs the old behavior.
+  // Strong imbalance multiplies up to ×1.5; weak imbalance multiplies down to ×0.5.
   if (takerRatio != null && w.taker > 0) {
-    if (takerRatio > 1.15)      { states.push(`Flujo comprador (×${w.taker})`); score += w.taker }
-    else if (takerRatio > 1.05) { states.push(`Sesgo comprador (×${Math.ceil(w.taker/2)})`); score += Math.ceil(w.taker / 2) }
-    else if (takerRatio < 0.85) { states.push(`Flujo vendedor (×${w.taker})`);  score -= w.taker }
-    else if (takerRatio < 0.95) { states.push(`Sesgo vendedor (×${Math.ceil(w.taker/2)})`);  score -= Math.ceil(w.taker / 2) }
+    let base = 0, magnitude = ''
+    if (takerRatio > 1.15)      { base = +w.taker;             magnitude = 'Flujo comprador' }
+    else if (takerRatio > 1.05) { base = +Math.ceil(w.taker/2); magnitude = 'Sesgo comprador' }
+    else if (takerRatio < 0.85) { base = -w.taker;             magnitude = 'Flujo vendedor' }
+    else if (takerRatio < 0.95) { base = -Math.ceil(w.taker/2); magnitude = 'Sesgo vendedor' }
+    if (base !== 0) {
+      const intensity = Math.abs(Math.log(takerRatio))
+      const m = intensityModulator(intensity, TYPICAL_TAKER_LOG_INTENSITY)
+      const modulated = Math.round(base * m)
+      modulatorDelta += (modulated - base)
+      score += modulated
+      states.push(`${magnitude} (×${Math.abs(modulated)}${m !== 1.0 ? ` · mod ${m.toFixed(2)}` : ''})`)
+    }
   } else if (takerRatio != null && w.taker === 0) {
     if (takerRatio > 1.15) states.push('Flujo comprador (—)')
     else if (takerRatio < 0.85) states.push('Flujo vendedor (—)')
   }
 
-  // ── 4. Divergencia retail/smart money (peso: w.ls) ──
+  // ── 4. Divergencia retail/smart money (peso: w.ls, MODULADO — P1) ──
+  // Base contribution = w.ls when triggered. Modulator scales by the size of
+  // the divergence (|retail−top|) vs its typical magnitude.
   if (retailRatio != null && topRatio != null && w.ls > 0) {
-    if (retailRatio > 1.4 && topRatio < 1.15)       { states.push(`Retail long / Smart money neutra (×${w.ls})`); score -= w.ls }
-    else if (retailRatio < 0.7 && topRatio > 0.85)   { states.push(`Retail short / Smart money neutra (×${w.ls})`); score += w.ls }
+    let base = 0, magnitude = ''
+    if (retailRatio > 1.4 && topRatio < 1.15)        { base = -w.ls; magnitude = 'Retail long / Smart money neutra' }
+    else if (retailRatio < 0.7 && topRatio > 0.85)   { base = +w.ls; magnitude = 'Retail short / Smart money neutra' }
+    if (base !== 0) {
+      const intensity = Math.abs(retailRatio - topRatio)
+      const m = intensityModulator(intensity, TYPICAL_LS_DIVERGENCE)
+      const modulated = Math.round(base * m)
+      modulatorDelta += (modulated - base)
+      score += modulated
+      states.push(`${magnitude} (×${Math.abs(modulated)}${m !== 1.0 ? ` · mod ${m.toFixed(2)}` : ''})`)
+    }
   }
 
   // ── 5. Volatilidad (peso: w.vol) — amplifica convicción, no da dirección ──
@@ -4342,7 +4392,10 @@ function computeSignals(data, period = '1h', stochTf = '1h') {
     regimeWarnings.push('Vol comprimida + OI creciendo — spring cargado, movimiento explosivo inminente')
   }
 
-  return { funding, oi, taker, divergence, marketState: { level: stateLevel, factors: states, conclusion: combustible, subNotes, score, regimeWarnings } }
+  // Pre-modulator score for the validation diagnostic. Clamped to the same
+  // [-10, +10] range so the comparison vs the live `score` is apples-to-apples.
+  const scorePreModulator = Math.max(-10, Math.min(10, score - modulatorDelta))
+  return { funding, oi, taker, divergence, marketState: { level: stateLevel, factors: states, conclusion: combustible, subNotes, score, scorePreModulator, scorePostModulator: score, modulatorDelta, regimeWarnings } }
 }
 
 // ── Main Dashboard ───────────────────────────────────────────────────
@@ -4633,6 +4686,48 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
   const okx = data?.okx || {}
   const bybit = data?.bybit || {}
   const hl = data?.hyperliquid || {}
+
+  // ── P2: Log Market State snapshots for the validation pipeline ────
+  // Throttle: log on score change OR every 5 min, whichever first. Avoids
+  // flooding the disk with ~7200 lines/day (one per 12s render).
+  // Server endpoint is /api/log/state-snapshot (POST). On Vercel it returns
+  // {ok:false} silently — only the local backend persists to data/state_log/.
+  // Consumed by scripts/validate_score_magnitude.py (P3).
+  const LOG_MIN_INTERVAL_MS = 5 * 60 * 1000
+  const lastLoggedRef = useRef({ score: null, ts: 0 })
+  useEffect(() => {
+    const score = signals?.marketState?.score
+    if (score == null) return
+    const now = Date.now()
+    const scoreChanged = lastLoggedRef.current.score !== score
+    const enoughTime = now - lastLoggedRef.current.ts > LOG_MIN_INTERVAL_MS
+    if (!scoreChanged && !enoughTime) return
+    const ms = signals.marketState
+    fetch('/api/log/state-snapshot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        timestamp:        Date.now(),
+        period:           statePeriod,
+        stochTf,
+        horizon,
+        score:            ms.score,
+        scoreLevel:       ms.level,
+        factors:          ms.factors,
+        conclusion:       ms.conclusion,
+        subNotes:         ms.subNotes,
+        regimeWarnings:   ms.regimeWarnings,
+        price:            bn.price,
+        priceChange24h:   bn.priceChange24h,
+        regimeState:      data?.regime?.currentState,
+        regimeConfidence: data?.regime?.confidence,
+        // Modulator diagnostic (P1): pre vs post; null when modulator off.
+        scorePreModulator:  ms.scorePreModulator,
+        scorePostModulator: ms.scorePostModulator,
+      }),
+    }).catch(() => {})  // fire-and-forget; never block UI for logging
+    lastLoggedRef.current = { score, ts: now }
+  }, [signals?.marketState?.score, statePeriod, stochTf, horizon])
 
   const timeToFunding = () => {
     const next = bn.funding?.nextTime

@@ -5104,6 +5104,50 @@ async def health():
     }
 
 
+# ── Market State Score logging (P2 of the quant validation plan) ─────
+# Appends a state snapshot per call to data/state_log/YYYY-MM-DD.jsonl
+# (JSON Lines, append-only). Used downstream by scripts/validate_score_magnitude.py
+# to measure IC, sign-accuracy-conditional-on-|score|, IC decay by horizon, etc.
+#
+# IMPORTANT: this endpoint is LOCAL-ONLY. Vercel's serverless filesystem is
+# ephemeral — the api/index.py mirror returns ok=false silently so the
+# frontend's fire-and-forget POST doesn't error in prod.
+STATE_LOG_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "data", "state_log"
+)
+# Rate limit per browser session is enforced on the frontend (throttled to
+# score-change or 5min, whichever first). We accept whatever arrives — the
+# log volume should be ~hundreds of lines/day per user, not thousands.
+
+
+from fastapi import Request as _FastAPIRequest
+
+
+@app.post("/api/log/state-snapshot")
+async def log_state_snapshot(request: _FastAPIRequest):
+    """Append a Market State Score snapshot to today's JSONL log.
+
+    Body is opaque — we trust the frontend to send {timestamp, period, score,
+    scoreLevel, factors, price, regime, ...}. We add `_loggedAt` server-side
+    so downstream analyzers can deduplicate / detect clock skew.
+    """
+    try:
+        snapshot = await request.json()
+        if not isinstance(snapshot, dict):
+            return {"ok": False, "reason": "not a dict"}
+        snapshot["_loggedAt"] = int(time.time() * 1000)
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        os.makedirs(STATE_LOG_DIR, exist_ok=True)
+        log_path = os.path.join(STATE_LOG_DIR, f"{date_str}.jsonl")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(snapshot, ensure_ascii=False) + "\n")
+        return {"ok": True}
+    except Exception as e:
+        # Logging must never break the dashboard — fire and forget.
+        logger.warning(f"state-snapshot log failed: {e}")
+        return {"ok": False, "reason": str(e)}
+
+
 # ── Fase 1 · Dedicated endpoints (thin readers over cache) ────────────
 # All return {"status": "warming"} if the cache hasn't been populated yet.
 
