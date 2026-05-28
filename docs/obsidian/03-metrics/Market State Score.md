@@ -11,7 +11,7 @@ The headline scoring system on top of the dashboard — the one that shows **ALC
 
 Implemented in `frontend/src/Dashboard.jsx` → `computeSignals(data, period, stochTf)` → returns `signals.marketState`.
 
-Related: [[Regime classifier (HMM K=4)]] (a structural slower signal), [[Z-score (CEX netflows)]] (one of the inputs)
+Related: [[Regime classifier (HMM K=4)]] (a structural slower signal), [[Z-score (CEX netflows)]] (one of the inputs), [[Market State Score - Quant Review]] (validation plan + improvement priorities)
 
 ---
 
