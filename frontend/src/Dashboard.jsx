@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useState, useEffect } from 'react'
 
 // ── Helpers ──────────────────────────────────────────────────────────
 const fmt = (n, d = 2) => {
@@ -4324,11 +4324,279 @@ function computeSignals(data, period = '1h', stochTf = '1h') {
 }
 
 // ── Main Dashboard ───────────────────────────────────────────────────
+// ── Section metadata (titles + grouping for the sidebar nav) ─────────
+// Used by: Sidebar (rendering navigation), CollapsedBar (showing the title
+// when a panel is hidden), and the panelOrder.map render in Dashboard.
+const PANEL_TITLES = {
+  state:              'Market State',
+  regime:             'Régimen actual (HMM K=4)',
+  funding_grid:       'Funding + OI',
+  taker_grid:         'L/S Ratio + Taker',
+  whale_vs_retail:    'Whales vs Retail',
+  hyperliquid_whales: 'Hyperliquid Whales (on-chain)',
+  netflows:           'CEX Netflows',
+  capitalmap:         'Capital Map',
+  iv_grid:            'IV + Skew + Expiries',
+  options:            'Options Heatmap',
+  setup:              'Setup técnico',
+  levels:             'Niveles',
+  stochastics:        'Stochastics',
+  mq:                 'Money Quality',
+  liqmap:             'Liquidation Map',
+  vol_vp:             'Volume Profile',
+  takerflow:          'Flujo Acumulado Taker',
+  vp_chart:           'Volume Profile ±10%',
+  orderbook:          'Order Book',
+  ethbtc_grid:        'ETH/BTC Rotation',
+  explanations:       'Glosario',
+}
+
+const SIDEBAR_CATEGORIES = [
+  { name: 'Estado & Régimen',     sections: ['state', 'regime'] },
+  { name: 'Positioning',          sections: ['whale_vs_retail', 'hyperliquid_whales', 'taker_grid', 'funding_grid'] },
+  { name: 'On-chain',             sections: ['netflows', 'capitalmap'] },
+  { name: 'Volatility & Options', sections: ['iv_grid', 'options'] },
+  { name: 'Estructura técnica',   sections: ['setup', 'levels', 'stochastics', 'mq', 'liqmap'] },
+  { name: 'Volume & Flow',        sections: ['vol_vp', 'takerflow', 'vp_chart', 'orderbook'] },
+  { name: 'Cross-asset',          sections: ['ethbtc_grid'] },
+  { name: 'Info',                 sections: ['explanations'] },
+]
+
+// ── Sidebar (fixed left, navigates between panels) ───────────────────
+function Sidebar({ horizon, setHorizon, activeSection, collapsed, toggleCollapse }) {
+  const horizonInfo = [
+    { id: 'scalp',    label: 'Scalp',    sub: '1m-15m' },
+    { id: 'intraday', label: 'Intraday', sub: '1h-4h' },
+    { id: 'swing',    label: 'Swing',    sub: '1d-7d' },
+    { id: 'macro',    label: 'Macro',    sub: '7d-30d+' },
+  ]
+  return (
+    <div style={{
+      position: 'fixed', left: 0, top: 0, bottom: 0, width: 220,
+      background: '#080d1a', borderRight: '1px solid #14203c',
+      overflowY: 'auto', padding: '14px 10px', zIndex: 100,
+    }}>
+      {/* Logo */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+        <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#22c55e', boxShadow: '0 0 8px #22c55e' }} />
+        <span style={{ fontSize: 14, fontWeight: 700, letterSpacing: -0.3 }}>ETH PERP</span>
+      </div>
+
+      {/* Horizon selector — compact 2x2 grid */}
+      <div style={{ fontSize: 9, color: '#3a4a6a', letterSpacing: 1.5, marginBottom: 6 }}>HORIZONTE</div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4, marginBottom: 14 }}>
+        {horizonInfo.map(h => (
+          <button key={h.id} onClick={() => setHorizon(h.id)} style={{
+            padding: '6px 4px', borderRadius: 4, cursor: 'pointer',
+            border: `1px solid ${horizon === h.id ? '#3b82f6' : '#1a2544'}`,
+            background: horizon === h.id ? '#1a2540' : 'transparent',
+            color: horizon === h.id ? '#60a5fa' : '#4a5980',
+            fontSize: 10, fontWeight: horizon === h.id ? 700 : 400,
+            fontFamily: "'IBM Plex Mono', monospace",
+          }}>{h.label}<div style={{ fontSize: 8, opacity: 0.7 }}>{h.sub}</div></button>
+        ))}
+      </div>
+
+      {/* Section nav — grouped by category */}
+      {SIDEBAR_CATEGORIES.map(cat => (
+        <div key={cat.name} style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: 9, color: '#3a4a6a', letterSpacing: 1.5, marginBottom: 4, paddingLeft: 4 }}>
+            {cat.name.toUpperCase()}
+          </div>
+          {cat.sections.map(sid => {
+            const isActive = activeSection === sid
+            const isCollapsed = collapsed.has(sid)
+            return (
+              <div key={sid} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                <a href={`#section-${sid}`}
+                   onClick={(e) => {
+                     const el = document.getElementById(`section-${sid}`)
+                     if (el) { e.preventDefault(); el.scrollIntoView({ behavior: 'smooth', block: 'start' }) }
+                   }}
+                   style={{
+                     flex: 1, padding: '4px 8px', borderRadius: 3,
+                     fontSize: 11, color: isActive ? '#c8d6e5' : '#5a6a8a',
+                     background: isActive ? '#101a35' : 'transparent',
+                     borderLeft: isActive ? '2px solid #60a5fa' : '2px solid transparent',
+                     textDecoration: 'none', display: 'block',
+                     fontStyle: isCollapsed ? 'italic' : 'normal',
+                     opacity: isCollapsed ? 0.6 : 1,
+                   }}>
+                  {PANEL_TITLES[sid] || sid}
+                </a>
+                <button onClick={() => toggleCollapse(sid)} title={isCollapsed ? 'Mostrar' : 'Ocultar'}
+                        style={{
+                          background: 'transparent', border: 'none', cursor: 'pointer',
+                          color: '#3a4a6a', fontSize: 11, padding: '2px 6px',
+                        }}>
+                  {isCollapsed ? '+' : '−'}
+                </button>
+              </div>
+            )
+          })}
+        </div>
+      ))}
+
+      <div style={{ fontSize: 8, color: '#2a3555', textAlign: 'center', marginTop: 16, paddingTop: 10, borderTop: '1px solid #14203c' }}>
+        v3 · Binance · OKX · Bybit<br/>Hyperliquid · Deribit · Dune
+      </div>
+    </div>
+  )
+}
+
+// ── Quick stats bar (sticky top — 6 critical metrics always visible) ─
+function QuickStatsBar({ data }) {
+  const bn = data?.binance || {}
+  const cn = data?.cexNetflows || {}
+  const fs = data?.fundingSpread || {}
+  const reg = data?.regime
+  const ebr = data?.ethBtcRotation || {}
+  const px = bn.price
+  const dt24 = bn.priceChange24h
+  const nf24 = cn.aggregates?.['24h']?.netInflowEth
+  const fundAvg = fs.mean
+  const ratio = ebr.currentRatio
+  const regimeState = reg?.currentState
+  const regimeConf = reg?.confidence
+
+  const regimeColors = { CRASH: '#ef4444', STRESS: '#f59e0b', CHOP: '#8a9ac0', UP: '#22c55e' }
+  const fmtUsd = (n) => n == null ? '—' : `$${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`
+  const fmtEthCompact = (n) => {
+    if (n == null) return '—'
+    const sign = n >= 0 ? '+' : ''
+    if (Math.abs(n) >= 1e3) return `${sign}${(n / 1e3).toFixed(1)}k`
+    return `${sign}${n.toFixed(0)}`
+  }
+  const fmtPct = (n) => n == null ? '—' : `${(n * 100).toFixed(3)}%`
+
+  const Stat = ({ label, value, color, sub }) => (
+    <div style={{ flex: 1, minWidth: 0, padding: '6px 12px', borderRight: '1px solid #14203c' }}>
+      <div style={{ fontSize: 8, color: '#3a4a6a', letterSpacing: 1.5 }}>{label}</div>
+      <div style={{ ...S.mono, fontSize: 14, fontWeight: 700, color: color || '#c8d6e5', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{value}</div>
+      {sub && <div style={{ fontSize: 9, color: '#5a6a8a' }}>{sub}</div>}
+    </div>
+  )
+
+  return (
+    <div style={{
+      position: 'sticky', top: 0, zIndex: 90,
+      display: 'flex', alignItems: 'stretch',
+      background: 'linear-gradient(180deg, #0a1224 0%, #060b18 100%)',
+      borderBottom: '1px solid #14203c',
+      paddingLeft: 0,
+    }}>
+      <Stat
+        label="RÉGIMEN"
+        value={regimeState || '—'}
+        color={regimeColors[regimeState] || '#5a6a8a'}
+        sub={regimeConf != null ? `${(regimeConf * 100).toFixed(0)}% conf` : ''}
+      />
+      <Stat
+        label="ETH"
+        value={fmtUsd(px)}
+        color={dt24 >= 0 ? '#22c55e' : '#ef4444'}
+        sub={dt24 != null ? `${dt24 >= 0 ? '+' : ''}${dt24.toFixed(2)}% 24h` : ''}
+      />
+      <Stat
+        label="NETFLOW 24H"
+        value={`${fmtEthCompact(nf24)} ETH`}
+        color={nf24 >= 0 ? '#ef4444' : '#22c55e'}
+        sub={nf24 >= 0 ? 'inflow (bearish)' : 'outflow (bullish)'}
+      />
+      <Stat
+        label="FUNDING AVG"
+        value={fmtPct(fundAvg)}
+        color={fundAvg > 0.0003 ? '#f59e0b' : fundAvg < 0 ? '#a78bfa' : '#c8d6e5'}
+        sub={fundAvg > 0.0003 ? 'longs paying' : fundAvg < 0 ? 'shorts paying' : 'normal'}
+      />
+      <Stat
+        label="ETH/BTC"
+        value={ratio != null ? ratio.toFixed(4) : '—'}
+        color="#c8d6e5"
+        sub={ratio != null && ebr.avg24h != null ? (ratio > ebr.avg24h ? 'ETH out-performing' : 'BTC out-performing') : ''}
+      />
+    </div>
+  )
+}
+
+// ── Collapsed panel placeholder (thin bar with title + expand button) ─
+function CollapsedBar({ sectionId, title, onExpand }) {
+  return (
+    <div id={`section-${sectionId}`}
+         style={{
+           ...S.card, padding: '8px 14px', marginBottom: 6,
+           display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+           cursor: 'pointer', opacity: 0.6,
+         }}
+         onClick={onExpand}>
+      <span style={{ fontSize: 11, color: '#5a6a8a', letterSpacing: 1.2, fontFamily: "'IBM Plex Sans', sans-serif", fontWeight: 600 }}>
+        {title}
+      </span>
+      <span style={{ fontSize: 12, color: '#3a4a6a' }}>+ expand</span>
+    </div>
+  )
+}
+
+// ── Chevron overlay for expanded panels (top-right of each card) ─────
+function CollapseChevron({ onClick }) {
+  return (
+    <button onClick={onClick}
+            title="Ocultar este panel"
+            style={{
+              position: 'absolute', top: 8, right: 10, zIndex: 5,
+              background: 'transparent', border: 'none', cursor: 'pointer',
+              color: '#3a4a6a', fontSize: 14, fontWeight: 700,
+              padding: '4px 8px', borderRadius: 3,
+            }}>
+      −
+    </button>
+  )
+}
+
+
 export default function Dashboard({ data, depth, depthHistory, error, lastUpdate }) {
   const [statePeriod, setStatePeriod] = useState('1h')
   const [vpPeriod, setVpPeriod] = useState('8d')
   const [stochTf, setStochTf] = useState('1h')
   const [horizon, setHorizon] = useState('intraday')
+
+  // ── UX state: collapsed panels (persisted) + active section (scroll-tracked)
+  const COLLAPSE_KEY = 'dashboard-collapsed-sections-v1'
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      const raw = typeof window !== 'undefined' && localStorage.getItem(COLLAPSE_KEY)
+      return new Set(raw ? JSON.parse(raw) : [])
+    } catch { return new Set() }
+  })
+  const toggleCollapse = (sid) => {
+    setCollapsed(prev => {
+      const next = new Set(prev)
+      next.has(sid) ? next.delete(sid) : next.add(sid)
+      try { localStorage.setItem(COLLAPSE_KEY, JSON.stringify([...next])) } catch {}
+      return next
+    })
+  }
+  const [activeSection, setActiveSection] = useState(null)
+  useEffect(() => {
+    // Highlight whichever section is currently most-in-view. IntersectionObserver
+    // beats scroll listeners — cheaper + no rAF needed.
+    const targets = document.querySelectorAll('[id^="section-"]')
+    if (!targets.length) return
+    const observer = new IntersectionObserver(
+      (entries) => {
+        // Pick the entry whose top is closest to the viewport top among intersecting ones
+        const visible = entries.filter(e => e.isIntersecting)
+        if (!visible.length) return
+        const best = visible.reduce((a, b) =>
+          (a.boundingClientRect.top < b.boundingClientRect.top ? a : b))
+        const id = best.target.id.replace('section-', '')
+        setActiveSection(id)
+      },
+      { rootMargin: '-80px 0px -60% 0px', threshold: [0, 0.1, 0.5] }
+    )
+    targets.forEach(t => observer.observe(t))
+    return () => observer.disconnect()
+  })
 
   // Panel ordering per time horizon — all panels always shown, just reordered
   const horizonOrders = {
@@ -4353,42 +4621,28 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
   }
 
   return (
-    <div style={{ maxWidth: 1280, margin: '0 auto', padding: '16px 12px' }}>
+    <div>
+      {/* SIDEBAR (fixed left) */}
+      <Sidebar horizon={horizon} setHorizon={setHorizon}
+               activeSection={activeSection}
+               collapsed={collapsed} toggleCollapse={toggleCollapse} />
 
-      {/* HEADER */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10, flexWrap: 'wrap', gap: 8 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <div style={{ width: 8, height: 8, borderRadius: '50%', background: error ? '#ef4444' : '#22c55e', boxShadow: error ? '0 0 10px #ef4444' : '0 0 10px #22c55e' }} />
-          <span style={{ fontSize: 22, fontWeight: 700, letterSpacing: -0.5 }}>ETH PERP</span>
-          <span style={{ fontSize: 10, color: '#5a6a8a', background: '#111a35', padding: '3px 10px', borderRadius: 5, border: '1px solid #1a2544', ...S.mono }}>BINANCE · OKX · BYBIT · HL · DERIBIT</span>
-        </div>
-        <div style={{ fontSize: 10, color: '#3a4a6a', ...S.mono }}>
-          {lastUpdate ? lastUpdate.toLocaleTimeString() : '...'} · 12s refresh
-          {error && <span style={{ color: '#ef4444', marginLeft: 8 }}>⚠ {error}</span>}
-        </div>
-      </div>
+      {/* MAIN AREA (left-margin matches sidebar width) */}
+      <div style={{ marginLeft: 220, minHeight: '100vh' }}>
+        {/* QUICK STATS BAR (sticky top) */}
+        <QuickStatsBar data={data} />
 
-      {/* HORIZON TABS */}
-      <div style={{ display: 'flex', gap: 0, marginBottom: 12, borderRadius: 6, overflow: 'hidden', border: '1px solid #1a2544' }}>
-        {[
-          { id: 'scalp',    label: 'SCALP',    sub: '1m-15m', color: '#ef4444' },
-          { id: 'intraday', label: 'INTRADAY', sub: '1h-4h',  color: '#f59e0b' },
-          { id: 'swing',    label: 'SWING',    sub: '1d-7d',  color: '#22c55e' },
-          { id: 'macro',    label: 'MACRO',    sub: '7d-30d+', color: '#38bdf8' },
-        ].map(h => (
-          <button key={h.id} onClick={() => setHorizon(h.id)} style={{
-            flex: 1, padding: '8px 4px', border: 'none', cursor: 'pointer',
-            background: horizon === h.id ? `${h.color}18` : '#0a1020',
-            borderBottom: horizon === h.id ? `2px solid ${h.color}` : '2px solid transparent',
-            transition: 'all 0.2s',
-          }}>
-            <div style={{ fontSize: 11, fontWeight: 700, color: horizon === h.id ? h.color : '#4a5980',
-              letterSpacing: 1.5, fontFamily: "'IBM Plex Mono', monospace" }}>{h.label}</div>
-            <div style={{ fontSize: 9, color: horizon === h.id ? h.color + 'aa' : '#2a3555',
-              fontFamily: "'IBM Plex Mono', monospace", marginTop: 1 }}>{h.sub}</div>
-          </button>
-        ))}
-      </div>
+        <div style={{ maxWidth: 1280, margin: '0 auto', padding: '12px 14px' }}>
+          {/* Compact header inside main */}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10, flexWrap: 'wrap', gap: 8 }}>
+            <span style={{ fontSize: 10, color: '#5a6a8a', background: '#111a35', padding: '3px 10px', borderRadius: 5, border: '1px solid #1a2544', ...S.mono }}>
+              BINANCE · OKX · BYBIT · HL · DERIBIT · DUNE · ETHERSCAN
+            </span>
+            <div style={{ fontSize: 10, color: '#3a4a6a', ...S.mono }}>
+              {lastUpdate ? lastUpdate.toLocaleTimeString() : '...'} · 12s refresh
+              {error && <span style={{ color: '#ef4444', marginLeft: 8 }}>⚠ {error}</span>}
+            </div>
+          </div>
 
       {/* PRICE — always first */}
       <div style={{ ...S.card, marginBottom: 10, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
@@ -4406,7 +4660,16 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
       </div>
 
       {/* ── Panels rendered in horizon order ── */}
-      {panelOrder.map(id => <div key={id}>{({
+      {panelOrder.map(id => {
+        // Collapsed → thin bar; click to expand
+        if (collapsed.has(id)) {
+          return (
+            <CollapsedBar key={id} sectionId={id}
+                          title={PANEL_TITLES[id] || id}
+                          onExpand={() => toggleCollapse(id)} />
+          )
+        }
+        const panelEl = ({
 
       state: (<div>
       {/* MARKET STATE */}
@@ -5033,10 +5296,19 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
         </div>
       </div>),
 
-      })[id]}</div>)}
+      })[id]
+        return (
+          <div key={id} id={`section-${id}`} style={{ position: 'relative', scrollMarginTop: 80 }}>
+            <CollapseChevron onClick={() => toggleCollapse(id)} />
+            {panelEl}
+          </div>
+        )
+      })}
 
-      <div style={{ textAlign: 'center', marginTop: 14, fontSize: 9, color: '#2a3555', letterSpacing: 0.5 }}>
-        ETH POSITIONING DASHBOARD v3 · BINANCE + OKX + BYBIT + HYPERLIQUID + DERIBIT · NO ES ASESORAMIENTO FINANCIERO
+          <div style={{ textAlign: 'center', marginTop: 14, fontSize: 9, color: '#2a3555', letterSpacing: 0.5 }}>
+            ETH POSITIONING DASHBOARD v3 · BINANCE + OKX + BYBIT + HYPERLIQUID + DERIBIT · NO ES ASESORAMIENTO FINANCIERO
+          </div>
+        </div>
       </div>
     </div>
   )
