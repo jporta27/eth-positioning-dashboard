@@ -1265,22 +1265,44 @@ function CexNetflowsPanel({ cexNetflows }) {
           const a = aggs[w.k]
           if (!a) return null
           const netE = a.netInflowEth
+          // flow/vol ratio per window — color-code by magnitude (>0.5% = material)
+          const fvr = a.flowVolRatioPct
+          const fvrColor = fvr == null ? '#3a4a6a' :
+                            fvr >= 1.0 ? '#f59e0b' :
+                            fvr >= 0.3 ? '#c8d6e5' : '#5a6a8a'
           return (
             <div key={w.k} style={{
               padding: '8px 10px',
               borderRadius: 6,
               border: `1px solid ${netColor(netE)}44`,
               background: `${netColor(netE)}08`,
+              position: 'relative',
             }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-                <div style={{ fontSize: 10, fontWeight: 700, color: '#e2e8f0', ...S.mono }}>{w.k.toUpperCase()}</div>
+                <div style={{ fontSize: 10, fontWeight: 700, color: '#e2e8f0', ...S.mono }}>
+                  {w.k.toUpperCase()}
+                  {a.includesPartial && (
+                    <span title="Incluye el bucket actual aún en indexado por Dune"
+                          style={{ marginLeft: 4, fontSize: 8, color: '#a78bfa' }}>·live</span>
+                  )}
+                </div>
                 <div style={{ fontSize: 8, color: '#4a5980' }}>{w.label}</div>
               </div>
               <div style={{ fontSize: 13, fontWeight: 700, color: netColor(netE), ...S.mono }}>{fmtEth(netE)}</div>
               <div style={{ fontSize: 9, color: netColor(a.netInflowUsd), ...S.mono, marginTop: 1 }}>{fmtUsd(a.netInflowUsd)}</div>
-              <div style={{ borderTop: '1px solid #1a2544', marginTop: 5, paddingTop: 4, display: 'flex', justifyContent: 'space-between', fontSize: 9 }}>
-                <span style={{ color: '#5a6a8a' }}>in <span style={{ color: '#fca5a5', ...S.mono }}>{(a.inflowEth / 1e3).toFixed(1)}k</span></span>
-                <span style={{ color: '#5a6a8a' }}>out <span style={{ color: '#86efac', ...S.mono }}>{(a.outflowEth / 1e3).toFixed(1)}k</span></span>
+              <div style={{ borderTop: '1px solid #1a2544', marginTop: 5, paddingTop: 4 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, marginBottom: 2 }}>
+                  <span style={{ color: '#5a6a8a' }}>in <span style={{ color: '#fca5a5', ...S.mono }}>{(a.inflowEth / 1e3).toFixed(1)}k</span></span>
+                  <span style={{ color: '#5a6a8a' }}>out <span style={{ color: '#86efac', ...S.mono }}>{(a.outflowEth / 1e3).toFixed(1)}k</span></span>
+                </div>
+                {/* Flow / spot vol per window — the contrast that tells you if this flow matters vs trading activity */}
+                {fvr != null && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, marginTop: 1 }}
+                       title={`|Net USD| / Spot vol ${w.k} = ${fvr.toFixed(3)}%`}>
+                    <span style={{ color: '#3a4a6a' }}>flow/vol</span>
+                    <span style={{ color: fvrColor, ...S.mono, fontWeight: fvr >= 1.0 ? 700 : 400 }}>{fvr.toFixed(2)}%</span>
+                  </div>
+                )}
               </div>
             </div>
           )

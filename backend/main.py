@@ -2926,6 +2926,7 @@ def process_dune_netflows(
     spot_volume_usd_24h: Optional[float] = None,
     price_change_pct_24h: Optional[float] = None,
     reserves: Optional[dict] = None,
+    spot_volume_usd_by_window: Optional[dict] = None,
 ) -> dict:
     """Aggregate Dune CEX flows into 1h/6h/24h/7d windows + per-exchange + hourly series,
     plus relative context (z-score, percentile, flow/vol ratio, flow-price divergence).
@@ -3017,29 +3018,56 @@ def process_dune_netflows(
         max_ts = max_bucket_ts
         parsed_for_aggregates = parsed
 
-    # Aggregate by rolling windows (relative to most recent COMPLETE hour)
+    # Aggregate by rolling windows.
+    #
+    # The 1h window EXCLUDES the partial bucket — otherwise the "last 1h" number
+    # would flip every minute as Dune re-indexes (the partial bucket's row count
+    # grows). For 6h/24h/7d the partial bucket is included: its still-indexing
+    # data is a small fraction of the window (~16% for 6h, 0.6% for 7d) and
+    # users want the longer windows to track recent behavior responsively.
+    #
+    # Without this split, users complained the 7d total was missing the last
+    # 1-2 hours of activity (the partial bucket + the anchoring shift). With it,
+    # the 6h/24h/7d aggregates always include up to "now" — at a small cost in
+    # stability that's invisible at those scales.
     windows = {"1h": 1, "6h": 6, "24h": 24, "7d": 168}
     aggregates = {}
     for label, hours in windows.items():
-        cutoff = max_ts - (hours - 1) * HOUR_MS  # inclusive of last `hours` hours
-        subset = [p for p in parsed_for_aggregates if p["ts"] >= cutoff]
+        if label == "1h":
+            anchor = max_ts                # second-most-recent if partial, else most-recent
+            src = parsed_for_aggregates    # excludes the partial bucket
+            includes_partial = False
+        else:
+            anchor = max_bucket_ts         # most recent (possibly partial)
+            src = parsed                   # includes the partial bucket
+            includes_partial = partial_bucket_ts is not None
+        cutoff = anchor - (hours - 1) * HOUR_MS
+        subset = [p for p in src if p["ts"] >= cutoff]
         in_eth_t  = sum(p["in_eth"]  for p in subset)
         out_eth_t = sum(p["out_eth"] for p in subset)
         net_eth_t = sum(p["net_eth"] for p in subset)
         net_usd_t = sum(p["net_usd"] for p in subset)
         tx_t      = sum(p["tx"] for p in subset)
+        vol_for_window = (spot_volume_usd_by_window or {}).get(label)
+        flow_vol_ratio = None
+        if vol_for_window and vol_for_window > 0:
+            flow_vol_ratio = round(abs(net_usd_t) / vol_for_window * 100, 3)
         aggregates[label] = {
-            "inflowEth":    round(in_eth_t,  2),
-            "outflowEth":   round(out_eth_t, 2),
-            "netInflowEth": round(net_eth_t, 2),
-            "netInflowUsd": round(net_usd_t, 2),
-            "txCount":      tx_t,
+            "inflowEth":     round(in_eth_t,  2),
+            "outflowEth":    round(out_eth_t, 2),
+            "netInflowEth":  round(net_eth_t, 2),
+            "netInflowUsd":  round(net_usd_t, 2),
+            "txCount":       tx_t,
+            "includesPartial": includes_partial,
+            "spotVolumeUsd": round(vol_for_window, 0) if vol_for_window else None,
+            "flowVolRatioPct": flow_vol_ratio,
         }
 
-    # Per-exchange breakdown over last 24h
-    cutoff_24h = max_ts - 23 * HOUR_MS
+    # Per-exchange breakdown over last 24h — uses the responsive anchor so the
+    # per-CEX picture reflects up-to-the-minute activity.
+    cutoff_24h = max_bucket_ts - 23 * HOUR_MS
     by_cex_dict: dict = {}
-    for p in parsed_for_aggregates:
+    for p in parsed:
         if p["ts"] < cutoff_24h:
             continue
         cex = p["cex"]
@@ -4709,6 +4737,15 @@ async def fetch_all_data() -> dict:
             spot_volume_usd_24h=vol_bn_spot if vol_bn_spot else None,
             price_change_pct_24h=safe_float(bn_ticker, "priceChangePercent"),
             reserves=defillama_reserves_raw if isinstance(defillama_reserves_raw, dict) else None,
+            # Per-window quote volume (USD) from 1h klines — enables flow/vol ratio
+            # per window. Index 7 of each kline is the USD-denominated quote volume.
+            # Window sizes match the Dune aggregate windows.
+            spot_volume_usd_by_window=(_dune_vols := (lambda kk: {
+                "1h":  sum(float(k[7]) for k in kk[-1:])    if len(kk) >= 1   else None,
+                "6h":  sum(float(k[7]) for k in kk[-6:])    if len(kk) >= 6   else None,
+                "24h": sum(float(k[7]) for k in kk[-24:])   if len(kk) >= 24  else None,
+                "7d":  sum(float(k[7]) for k in kk[-168:])  if len(kk) >= 168 else None,
+            })(bn_klines_vol)) if isinstance(bn_klines_vol, list) else None,
         )),
         "whaleVsRetail": compute_whale_vs_retail(
             ls_by_period,

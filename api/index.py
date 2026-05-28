@@ -1740,6 +1740,7 @@ def process_dune_netflows(
     spot_volume_usd_24h: Optional[float] = None,
     price_change_pct_24h: Optional[float] = None,
     reserves: Optional[dict] = None,
+    spot_volume_usd_by_window: Optional[dict] = None,
 ) -> dict:
     """Aggregate Dune CEX flows into 1h/6h/24h/7d windows + per-exchange + hourly series,
     plus relative context (z-score, percentile, flow/vol ratio, flow-price divergence).
@@ -1829,27 +1830,49 @@ def process_dune_netflows(
         max_ts = max_bucket_ts
         parsed_for_aggregates = parsed
 
+    # Per-window partial-bucket policy:
+    #   - 1h: EXCLUDE the partial bucket. Otherwise the value flips every minute
+    #     as Dune re-indexes — bad UX.
+    #   - 6h/24h/7d: INCLUDE the partial bucket so the window tracks up-to-the-
+    #     minute behavior. The partial's missing rows are a small fraction
+    #     (~16% for 6h, 0.6% for 7d), invisible at scale.
+    # Without this, users saw "last 7d" missing the most recent 1-2 hours.
     windows = {"1h": 1, "6h": 6, "24h": 24, "7d": 168}
     aggregates = {}
     for label, hours in windows.items():
-        cutoff = max_ts - (hours - 1) * HOUR_MS
-        subset = [p for p in parsed_for_aggregates if p["ts"] >= cutoff]
+        if label == "1h":
+            anchor = max_ts
+            src = parsed_for_aggregates
+            includes_partial = False
+        else:
+            anchor = max_bucket_ts
+            src = parsed
+            includes_partial = partial_bucket_ts is not None
+        cutoff = anchor - (hours - 1) * HOUR_MS
+        subset = [p for p in src if p["ts"] >= cutoff]
         in_eth_t  = sum(p["in_eth"]  for p in subset)
         out_eth_t = sum(p["out_eth"] for p in subset)
         net_eth_t = sum(p["net_eth"] for p in subset)
         net_usd_t = sum(p["net_usd"] for p in subset)
         tx_t      = sum(p["tx"] for p in subset)
+        vol_for_window = (spot_volume_usd_by_window or {}).get(label)
+        flow_vol_ratio = None
+        if vol_for_window and vol_for_window > 0:
+            flow_vol_ratio = round(abs(net_usd_t) / vol_for_window * 100, 3)
         aggregates[label] = {
-            "inflowEth":    round(in_eth_t,  2),
-            "outflowEth":   round(out_eth_t, 2),
-            "netInflowEth": round(net_eth_t, 2),
-            "netInflowUsd": round(net_usd_t, 2),
-            "txCount":      tx_t,
+            "inflowEth":       round(in_eth_t,  2),
+            "outflowEth":      round(out_eth_t, 2),
+            "netInflowEth":    round(net_eth_t, 2),
+            "netInflowUsd":    round(net_usd_t, 2),
+            "txCount":         tx_t,
+            "includesPartial": includes_partial,
+            "spotVolumeUsd":   round(vol_for_window, 0) if vol_for_window else None,
+            "flowVolRatioPct": flow_vol_ratio,
         }
 
-    cutoff_24h = max_ts - 23 * HOUR_MS
+    cutoff_24h = max_bucket_ts - 23 * HOUR_MS
     by_cex_dict: dict = {}
-    for p in parsed_for_aggregates:
+    for p in parsed:
         if p["ts"] < cutoff_24h:
             continue
         cex = p["cex"]
@@ -3258,6 +3281,14 @@ async def fetch_all_data() -> dict:
             spot_volume_usd_24h=vol_bn_spot if vol_bn_spot else None,
             price_change_pct_24h=safe_float(bn_ticker, "priceChangePercent"),
             reserves=defillama_reserves_raw if isinstance(defillama_reserves_raw, dict) else None,
+            # Per-window quote volume in USD from 1h klines (index 7).
+            # Mirrors backend/main.py — keep both in sync.
+            spot_volume_usd_by_window=((lambda kk: {
+                "1h":  sum(float(k[7]) for k in kk[-1:])    if len(kk) >= 1   else None,
+                "6h":  sum(float(k[7]) for k in kk[-6:])    if len(kk) >= 6   else None,
+                "24h": sum(float(k[7]) for k in kk[-24:])   if len(kk) >= 24  else None,
+                "7d":  sum(float(k[7]) for k in kk[-168:])  if len(kk) >= 168 else None,
+            })(bn_klines_vol)) if isinstance(bn_klines_vol, list) else None,
         )),
         "whaleVsRetail": compute_whale_vs_retail(
             ls_by_period,
