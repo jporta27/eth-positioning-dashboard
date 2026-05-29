@@ -293,7 +293,7 @@ def report(log: pd.DataFrame, horizons_h: list) -> None:
             ic_post, _, _ = metric_ic(post, log[col].values)
             delta = ic_post - ic_pre if not (np.isnan(ic_post) or np.isnan(ic_pre)) else np.nan
             print(f"  {h:>4}h  IC pre={_fmt(ic_pre, '+.4f'):>10s}  "
-                  f"post={_fmt(ic_post, '+.4f'):>10s}  Δ={_fmt(delta, '+.4f'):>+10s}")
+                  f"post={_fmt(ic_post, '+.4f'):>10s}  Δ={_fmt(delta, '+.4f'):>10s}")
         print("  Reading: Δ > 0 → modulator HELPED. < 0 → it hurt; investigate or roll back.")
 
 
