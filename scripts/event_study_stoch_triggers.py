@@ -333,6 +333,60 @@ def main():
     print("\n  → if mean_ret/hit_rate rise with n_confirm, the confluence filter works:")
     print("    taking only high-confluence triggers beats taking all of them.")
 
+    # ── 4. VOLUME / EFFECTIVE-VOLUME CONTEXT ────────────────────────
+    # The user's confluence centres on FLOW normalised by volume. On-chain
+    # netflow has no history, but volumen operado (total) and volumen efectivo
+    # (taker delta = directional volume) DO. Question: does the volume context
+    # at the trigger bar improve the mean-reversion outcome?
+    #   vol_rel    = volume[t] / median(volume, 90 bars)   → climax vs drift
+    #   taker_imb  = (2*taker_buy − volume) / volume        → effective/total ratio
+    print("\n" + "─" * 78)
+    print("4. VOLUME CONTEXT — does volume at the trigger improve mean-reversion?")
+    print("─" * 78)
+    volume = klines["volume"].values
+    taker_buy = klines["taker_buy_base"].values
+    vol_med = pd.Series(volume).rolling(90).median().values
+    vol_rel = np.where(vol_med > 0, volume / vol_med, np.nan)
+    taker_imb = np.where(volume > 0, (2 * taker_buy - volume) / volume, np.nan)
+
+    pos_arr = triggers["pos"].values
+    side_arr = triggers["side"].values
+    vr_at = vol_rel[pos_arr]
+    ti_at = taker_imb[pos_arr]
+    # effective-volume confirmation: for a long (oversold), aggressive SELLING
+    # at the trigger (taker_imb < 0) = sellers still dominant. Does climax-selling
+    # (high vol + strong negative imb on a long) rebound better, or worse?
+    dir_sign = triggers["dir_sign"].values
+
+    print(f"   (headline horizon = {primary_h}h)\n")
+    print("  A) By volume relative to 90-bar median (climax vs drift):")
+    print(f"  {'vol_rel bucket':>16} {'n':>5} {'mean_ret':>10} {'hit_rate':>9}")
+    for lab, lo, hi in [("low <0.8", 0, 0.8), ("normal 0.8-1.5", 0.8, 1.5),
+                         ("high 1.5-3", 1.5, 3.0), ("climax >3", 3.0, 1e9)]:
+        mask = valid & (vr_at >= lo) & (vr_at < hi)
+        if mask.sum() == 0:
+            print(f"  {lab:>16} {0:>5} {'—':>10} {'—':>9}"); continue
+        r = row_rets[mask]
+        print(f"  {lab:>16} {mask.sum():>5} {r.mean()*100:>9.3f}% {(r > 0).mean()*100:>8.1f}%")
+
+    print("\n  B) By taker imbalance AGAINST the trade at the trigger")
+    print("     (long: sellers still aggressive = imb<0; short: buyers aggressive = imb>0):")
+    print(f"  {'imb vs trade':>16} {'n':>5} {'mean_ret':>10} {'hit_rate':>9}")
+    # imb_against = taker imbalance opposing the trade direction (capitulation proxy)
+    imb_against = -ti_at * dir_sign  # >0 means flow still pushing against the trade
+    # Buckets on the real scale of perp taker imbalance (typically ±0.02-0.08)
+    for lab, lo, hi in [("aligned <0", -1e9, 0), ("mild 0-0.03", 0, 0.03),
+                        ("strong 0.03-0.06", 0.03, 0.06), ("extreme >0.06", 0.06, 1e9)]:
+        mask = valid & (imb_against >= lo) & (imb_against < hi)
+        if mask.sum() == 0:
+            print(f"  {lab:>16} {0:>5} {'—':>10} {'—':>9}"); continue
+        r = row_rets[mask]
+        print(f"  {lab:>16} {mask.sum():>5} {r.mean()*100:>9.3f}% {(r > 0).mean()*100:>8.1f}%")
+    print("\n  → if 'climax' / 'extreme against' rows rebound better, the user's")
+    print("    intuition (enter mean-rev on exhaustion, filtered by volume) holds")
+    print("    for the RECONSTRUCTABLE part. The on-chain netflow is still untested")
+    print("    (no history) — only the logger captures it going forward.")
+
     # ── Verdict ─────────────────────────────────────────────────────
     print("\n" + "=" * 78)
     print("NOTES")
