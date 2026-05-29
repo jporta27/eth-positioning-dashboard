@@ -302,6 +302,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--horizons", type=str, default=",".join(str(h) for h in DEFAULT_HORIZONS),
                     help="Comma-separated forward-return horizons in hours")
+    ap.add_argument("--invert", action="store_true",
+                    help="Negate the score before measuring. Tests the 'score is "
+                         "contrarian' hypothesis — if the score is anti-predictive "
+                         "in normal mode, --invert should produce positive IC.")
+    ap.add_argument("--source", choices=["all", "live", "historical"], default="all",
+                    help="Filter log source. 'historical' = only _historical_backtest "
+                         "snapshots, 'live' = real-time logged snapshots, 'all' = both.")
     args = ap.parse_args()
     horizons_h = [int(h) for h in args.horizons.split(",") if h.strip()]
 
@@ -312,6 +319,26 @@ def main():
         print("  Run the local backend + open the dashboard for at least a few hours")
         print("  to accumulate snapshots, then re-run this script.")
         return
+
+    # Source filter: split historical vs live by the `_historical` flag
+    if args.source != "all":
+        if "_historical" not in log.columns:
+            log["_historical"] = False
+        if args.source == "historical":
+            log = log[log["_historical"] == True].reset_index(drop=True)
+        else:  # live
+            log = log[log["_historical"].isna() | (log["_historical"] == False)].reset_index(drop=True)
+        print(f"  [filter] source={args.source} → {len(log)} snapshots", file=sys.stderr)
+
+    if args.invert:
+        # Negate all score columns. Tests the contrarian hypothesis: if the score
+        # is anti-predictive in the forward direction, inverting it should
+        # produce positive IC. This is a falsifiable test of "interpretation A"
+        # (semantic mapping is reversed) from the empirical findings doc.
+        for col in ("score", "scorePreModulator", "scorePostModulator"):
+            if col in log.columns:
+                log[col] = -log[col]
+        print(f"  [invert] Score sign flipped — testing contrarian hypothesis", file=sys.stderr)
 
     print(f"Loading klines for forward returns ...", file=sys.stderr)
     klines = load_klines_1h()
