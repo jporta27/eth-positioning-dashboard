@@ -4703,6 +4703,17 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
     const enoughTime = now - lastLoggedRef.current.ts > LOG_MIN_INTERVAL_MS
     if (!scoreChanged && !enoughTime) return
     const ms = signals.marketState
+    // ── Flow inputs (the user's REAL confluence factors) ──────────────
+    // CEX netflows + reserves normalisation + spot delta. These are EPHEMERAL
+    // (Dune retains ~3 weeks; we never persisted history) — logging them now is
+    // the only way to ever backtest the flow-based confluence. Store RAW inputs,
+    // not interpretations, so future analysis isn't locked into today's logic.
+    const cn = data?.cexNetflows || {}
+    const cnAgg = cn.aggregates || {}
+    const cnRel = cn.relativeContext || {}
+    const tbs = bn.takerBuySell || {}
+    // ── Stoch raw values for the active TF (lets us reconstruct triggers) ──
+    const stochNow = data?.stochastics?.[stochTf] || {}
     fetch('/api/log/state-snapshot', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -4724,6 +4735,37 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
         // Modulator diagnostic (P1): pre vs post; null when modulator off.
         scorePreModulator:  ms.scorePreModulator,
         scorePostModulator: ms.scorePostModulator,
+        // ── FLOW (real confluence) — raw inputs ──
+        flow: {
+          netflow1hEth:    cnAgg['1h']?.netInflowEth ?? null,
+          netflow6hEth:    cnAgg['6h']?.netInflowEth ?? null,
+          netflow24hEth:   cnAgg['24h']?.netInflowEth ?? null,
+          netflow24hUsd:   cnAgg['24h']?.netInflowUsd ?? null,
+          direction:       cn.direction ?? null,   // BULLISH/BEARISH/NEUTRAL
+          magnitude:       cn.magnitude ?? null,
+          bias:            cn.bias ?? null,
+          zScore:          cnRel.zScore ?? null,           // flow vs 7d regime
+          percentile:      cnRel.percentile ?? null,
+          flowVolRatioPct: cnRel.flowVolRatioPct ?? null,  // flow vs traded volume
+          flowAsReservesPct: cnRel.flowAsReservesPct ?? null, // flow vs liquid supply
+          reservesTotalEth: cnRel.reservesTotalEth ?? null,
+          partialBucketTs: cn.partialBucketTs ?? null,
+          exchangeCount:   cn.exchangeCount ?? null,
+        },
+        // ── SPOT delta / effective volume ──
+        spot: {
+          takerRatio:   tbs.spotRatio ?? null,
+          takerDelta:   tbs.spotDelta ?? null,
+          perpRatio:    tbs.ratio ?? null,
+          volume24hUsd: bn.volume24h ?? null,
+        },
+        // ── STOCH raw (reconstruct mean-rev triggers offline) ──
+        stoch: {
+          slowK: stochNow.slow?.k ?? null,
+          slowD: stochNow.slow?.d ?? null,
+          fastK: stochNow.fast?.k ?? null,
+          fastD: stochNow.fast?.d ?? null,
+        },
       }),
     }).catch(() => {})  // fire-and-forget; never block UI for logging
     lastLoggedRef.current = { score, ts: now }
