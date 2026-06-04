@@ -2151,6 +2151,72 @@ def fetch_regime_snapshot() -> Optional[dict]:
     return None
 
 
+# ── Empirical regime-aware magnitude calibration (mirror of backend/main.py) ──
+# Replaces Gaussian σ / fixed-% magnitude cuts with empirical |return|
+# percentiles conditioned on the HMM regime. The empirical p99 sits at ~4.5σ
+# (not 2.58σ) so a |z|≥2 EXTREME rule fires ~3-8× too often; CRASH p99 is 2.8×
+# CHOP's so the same % move means very different things by regime. Table built
+# by scripts/empirical_magnitude_calibration.py, mirrored to api/ for Vercel.
+_MC_CANDIDATES = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "magnitude_calibration.json"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "regime", "magnitude_calibration.json"),
+]
+magnitude_cal_cache: Optional[dict] = None
+magnitude_cal_cache_ts: float = 0
+
+
+def fetch_magnitude_calibration() -> Optional[dict]:
+    global magnitude_cal_cache, magnitude_cal_cache_ts
+    now = time.time()
+    if magnitude_cal_cache and (now - magnitude_cal_cache_ts) < 300:
+        return magnitude_cal_cache
+    for path in _MC_CANDIDATES:
+        try:
+            if not os.path.exists(path):
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                magnitude_cal_cache = json.load(f)
+            magnitude_cal_cache_ts = now
+            return magnitude_cal_cache
+        except Exception:
+            continue
+    return None
+
+
+def classify_move_magnitude(abs_return_pct: Optional[float], regime: Optional[str],
+                            horizon: str = "24h") -> Optional[dict]:
+    """Label a price move vs THIS regime's empirical |return| percentiles.
+    Cuts: <p50 NOISE, p50-p90 NORMAL, p90-p99 ELEVATED, ≥p99 EXTREME.
+    Falls back to the 'ALL' regime row if the current regime is unknown."""
+    cal = fetch_magnitude_calibration()
+    if not cal or abs_return_pct is None:
+        return None
+    h_table = (cal.get("horizons") or {}).get(horizon)
+    if not h_table:
+        return None
+    regime_used = regime if (regime and regime in h_table) else "ALL"
+    row = h_table.get(regime_used)
+    if not row:
+        return None
+    p50, p75, p90 = row["p50"] * 100, row["p75"] * 100, row["p90"] * 100
+    p95, p99 = row["p95"] * 100, row["p99"] * 100
+    a = abs(abs_return_pct)
+    label = ("EXTREME" if a >= p99 else "ELEVATED" if a >= p90
+             else "NORMAL" if a >= p50 else "NOISE")
+    knots = [(0.0, 0), (p50, 50), (p75, 75), (p90, 90), (p95, 95), (p99, 99), (p99 * 2, 100)]
+    pct = 100.0
+    for (lo_v, lo_p), (hi_v, hi_p) in zip(knots, knots[1:]):
+        if a <= hi_v:
+            span = hi_v - lo_v
+            pct = lo_p + (hi_p - lo_p) * ((a - lo_v) / span if span > 0 else 0)
+            break
+    return {
+        "label": label, "percentile": round(pct, 1), "regimeUsed": regime_used,
+        "horizon": horizon,
+        "cutsPct": {"p50": round(p50, 3), "p90": round(p90, 3), "p99": round(p99, 3)},
+    }
+
+
 async def fetch_hyperliquid_whales(client: httpx.AsyncClient) -> Optional[dict]:
     """Poll clearinghouseState + spotClearinghouseState + mainnet ETH balance
     for each curated whale address. Cached HYPERLIQUID_WHALES_CACHE_TTL.
@@ -3306,7 +3372,12 @@ async def fetch_all_data() -> dict:
         ),
         "ethBtcRotation": ethbtc_taker_raw if isinstance(ethbtc_taker_raw, dict) else None,
         "defiEthMap": defi_eth_map_raw if isinstance(defi_eth_map_raw, dict) else None,
-        "regime": fetch_regime_snapshot(),
+        "regime": (regime_snap := fetch_regime_snapshot()),
+        "priceMoveMagnitude": classify_move_magnitude(
+            safe_float(bn_ticker, "priceChangePercent"),
+            (regime_snap or {}).get("currentState"),
+            horizon="24h",
+        ),
         "hyperliquidWhales": process_hyperliquid_whales(
             hl_whales_raw if isinstance(hl_whales_raw, dict) else None,
             eth_spot_price=spot,

@@ -2741,7 +2741,7 @@ const REGIME_DESC = {
 }
 const MODEL_STALE_DAYS = 14   // warn if model > 14d old (refit cadence is 7d)
 
-function RegimePanel({ regime }) {
+function RegimePanel({ regime, moveMagnitude }) {
   if (!regime) return (
     <div style={{ ...S.mono, color: '#5a6a8a', fontSize: 11 }}>
       Sin snapshot del clasificador. Correr <code>python scripts/run_regime_classifier.py --refit</code>.
@@ -2799,6 +2799,35 @@ function RegimePanel({ regime }) {
           </div>
         </div>
       </div>
+
+      {/* Empirical regime-aware magnitude of the current 24h move */}
+      {moveMagnitude && (() => {
+        const magColor = {
+          EXTREME: '#ef4444', ELEVATED: '#f59e0b', NORMAL: '#c8d6e5', NOISE: '#5a6a8a',
+        }[moveMagnitude.label] || '#8a9ac0'
+        const c = moveMagnitude.cutsPct || {}
+        return (
+          <div style={{ padding: '8px 12px', borderRadius: 6, background: '#0a1020',
+                        border: `1px solid ${magColor}`, marginBottom: 12,
+                        display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+            <div>
+              <div style={{ fontSize: 9, color: '#5a6a8a', letterSpacing: 1 }}>MOVIMIENTO 24H (magnitud empírica)</div>
+              <div style={{ ...S.mono, fontSize: 16, fontWeight: 700, color: magColor }}>
+                {moveMagnitude.label}
+                <span style={{ fontSize: 11, color: '#8a9ac0', marginLeft: 8 }}>
+                  percentil {moveMagnitude.percentile}
+                </span>
+              </div>
+            </div>
+            <div style={{ fontSize: 9, color: '#3a4a6a', ...S.mono }}>
+              cortes en {moveMagnitude.regimeUsed}: p50 {c.p50}% · p90 {c.p90}% · p99 {c.p99}%
+            </div>
+            <div style={{ fontSize: 9, color: '#3a4a6a', marginLeft: 'auto', maxWidth: 260 }}>
+              percentil empírico del régimen, NO σ gaussiano (que sub-estima la cola ~3-8×)
+            </div>
+          </div>
+        )
+      })()}
 
       {/* Posterior probability bars */}
       <div style={{ marginBottom: 12 }}>
@@ -5195,7 +5224,7 @@ export default function Dashboard({ data, depth, depthHistory, error, lastUpdate
       regime: (
       <div style={{ ...S.card, marginBottom: 10 }}>
         <div style={S.sectionTitle}>Régimen actual — HMM K=4 (clasificador estructural)</div>
-        <RegimePanel regime={data?.regime} />
+        <RegimePanel regime={data?.regime} moveMagnitude={data?.priceMoveMagnitude} />
       </div>),
 
       whale_vs_retail: (

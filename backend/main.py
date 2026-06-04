@@ -3617,6 +3617,96 @@ def fetch_regime_snapshot() -> Optional[dict]:
         return None
 
 
+# ── Empirical regime-aware magnitude calibration ────────────────────
+# Replaces Gaussian σ-thresholds / fixed % cuts with empirical percentiles of
+# |return| conditioned on the HMM regime. Built by scripts/empirical_magnitude_
+# calibration.py over 5y. Two findings it encodes:
+#   - The empirical p99 sits at ~4.5σ, not 2.58σ → a |z|≥2 "EXTREME" rule cries
+#     wolf (fires ~3-8× too often).
+#   - CRASH p99 is 2.8× CHOP's → the same % move means very different things by
+#     regime. A fixed ±2% threshold mislabels both.
+# Look for the table next to api/ (Vercel bundles siblings) first, then data/.
+_MC_CANDIDATES = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api", "magnitude_calibration.json"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "regime", "magnitude_calibration.json"),
+]
+magnitude_cal_cache: Optional[dict] = None
+magnitude_cal_cache_ts: float = 0
+
+
+def fetch_magnitude_calibration() -> Optional[dict]:
+    """Load the empirical magnitude calibration table (cached 5 min)."""
+    global magnitude_cal_cache, magnitude_cal_cache_ts
+    now = time.time()
+    if magnitude_cal_cache and (now - magnitude_cal_cache_ts) < 300:
+        return magnitude_cal_cache
+    for path in _MC_CANDIDATES:
+        try:
+            if not os.path.exists(path):
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                magnitude_cal_cache = json.load(f)
+            magnitude_cal_cache_ts = now
+            return magnitude_cal_cache
+        except Exception:
+            continue
+    return None
+
+
+def classify_move_magnitude(abs_return_pct: Optional[float], regime: Optional[str],
+                            horizon: str = "24h") -> Optional[dict]:
+    """Label a price move's magnitude against THIS regime's empirical |return|
+    percentiles, not a fixed σ-multiple or %.
+
+    abs_return_pct: absolute move in PERCENT (e.g. 3.2 for 3.2%).
+    regime: current HMM regime (CRASH/STRESS/CHOP/UP) — falls back to 'ALL' if
+            unknown so we always return something.
+    Returns {label, percentile, regimeUsed, cutsPct} or None if no table.
+
+    Cuts: <p50 NOISE, p50-p90 NORMAL, p90-p99 ELEVATED, ≥p99 EXTREME.
+    """
+    cal = fetch_magnitude_calibration()
+    if not cal or abs_return_pct is None:
+        return None
+    horizons = cal.get("horizons", {})
+    h_table = horizons.get(horizon)
+    if not h_table:
+        return None
+    regime_used = regime if (regime and regime in h_table) else "ALL"
+    row = h_table.get(regime_used)
+    if not row:
+        return None
+    # Percentiles in the table are FRACTIONS of |log-return|; convert to %.
+    p50, p90, p99 = row["p50"] * 100, row["p90"] * 100, row["p99"] * 100
+    p75, p95 = row["p75"] * 100, row["p95"] * 100
+    a = abs(abs_return_pct)
+    if a >= p99:
+        label = "EXTREME"
+    elif a >= p90:
+        label = "ELEVATED"
+    elif a >= p50:
+        label = "NORMAL"
+    else:
+        label = "NOISE"
+    # Approximate empirical percentile by interpolating between known points.
+    knots = [(0.0, 0), (p50, 50), (p75, 75), (p90, 90), (p95, 95), (p99, 99), (p99 * 2, 100)]
+    pct = 0.0
+    for (lo_v, lo_p), (hi_v, hi_p) in zip(knots, knots[1:]):
+        if a <= hi_v:
+            span = hi_v - lo_v
+            pct = lo_p + (hi_p - lo_p) * ((a - lo_v) / span if span > 0 else 0)
+            break
+    else:
+        pct = 100.0
+    return {
+        "label": label,
+        "percentile": round(pct, 1),
+        "regimeUsed": regime_used,
+        "horizon": horizon,
+        "cutsPct": {"p50": round(p50, 3), "p90": round(p90, 3), "p99": round(p99, 3)},
+    }
+
+
 async def fetch_hyperliquid_whales(
     client: httpx.AsyncClient,
     addresses: Optional[list] = None,
@@ -4765,7 +4855,13 @@ async def fetch_all_data() -> dict:
             hl_whales_raw if isinstance(hl_whales_raw, dict) else None,
             eth_spot_price=spot,
         ),
-        "regime": fetch_regime_snapshot(),
+        "regime": (regime_snap := fetch_regime_snapshot()),
+        # Empirical regime-aware magnitude of the 24h move (replaces fixed % / σ).
+        "priceMoveMagnitude": classify_move_magnitude(
+            safe_float(bn_ticker, "priceChangePercent"),
+            (regime_snap or {}).get("currentState"),
+            horizon="24h",
+        ),
         "ethBtcRotation": ethbtc_taker_raw if isinstance(ethbtc_taker_raw, dict) else None,
         "defiEthMap": defi_eth_map_raw if isinstance(defi_eth_map_raw, dict) else None,
         # ── Fase 1 · new sources ──────────────────────────────────────
